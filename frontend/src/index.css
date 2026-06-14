@@ -1,0 +1,33 @@
+:root {
+  --bg: #1f2228;
+  --bg-raised: rgba(255, 255, 255, 0.03);
+  --bg-raised-hover: rgba(255, 255, 255, 0.06);
+  --border: rgba(255, 255, 255, 0.1);
+  --border-strong: rgba(255, 255, 255, 0.2);
+  --text: #ffffff;
+  --text-secondary: rgba(255, 255, 255, 0.7);
+  --text-muted: rgba(255, 255, 255, 0.5);
+  --accent: #3b82f6;
+  --up: #22c55e;
+  --down: #ef4444;
+  --sidebar-width: 200px;
+  --topbar-height: 52px;
+}
+
+* { margin: 0; padding: 0; box-sizing: border-box; }
+
+body {
+  font-family: "Geist", -apple-system, "PingFang SC", sans-serif;
+  background: var(--bg);
+  color: var(--text);
+  height: 100vh;
+  overflow: hidden;
+  -webkit-font-smoothing: antialiased;
+}
+
+/* Monospace for data */
+.mono, .data-table td, .kpi-value, input, button {
+  font-family: "GeistMono", "SF Mono", "Fira Code", monospace;
+}
+
+#root { height: 100%; }

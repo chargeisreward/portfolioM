@@ -1,0 +1,6 @@
+{
+  "name": "portfoliom-frontend",
+  "description": "PortfolioM React + Vite static frontend",
+  "build_command": "npm ci && npm run build",
+  "start_command": "npx --yes serve -s dist -l $PORT"
+}

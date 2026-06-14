@@ -1,0 +1,358 @@
+"""APScheduler 定时任务调度器
+
+负责三类定时任务：
+1. 实时行情抓取（交易时段每15分钟）
+2. 财务基本面数据更新（每日7:00/19:00）
+3. 行业/爬虫数据更新（每日6:00/20:00）
+"""
+import logging
+from datetime import datetime, date, time
+
+from apscheduler.schedulers.background import BackgroundScheduler
+from sqlalchemy.orm import Session
+
+from database import SessionLocal
+from models import Holding, PriceCache, StockInfoCache, AssetType
+
+logger = logging.getLogger(__name__)
+
+scheduler: BackgroundScheduler | None = None
+
+
+# ---------- 工具函数 ----------
+
+def _is_a_share_trading_hours(now: datetime) -> bool:
+    """判断当前是否处于A股交易时段（9:30-15:00 CST）"""
+    t = now.time()
+    return time(9, 30) <= t <= time(15, 0)
+
+
+def _is_us_trading_hours(now: datetime) -> bool:
+    """判断当前是否处于美股交易时段（21:30-次日4:00 CST）
+
+    美股交易时间按北京时间换算：
+    夏令时 21:30 - 次日 4:00
+    冬令时 22:30 - 次日 5:00
+    这里统一使用 21:30 - 次日 4:00 作为简化判断。
+    """
+    t = now.time()
+    return t >= time(21, 30) or t <= time(4, 0)
+
+
+def _is_trading_hours(now: datetime) -> bool:
+    """判断当前是否处于任一市场交易时段"""
+    return _is_a_share_trading_hours(now) or _is_us_trading_hours(now)
+
+
+# ---------- 任务1：实时行情抓取 ----------
+
+def job_fetch_realtime_prices(force: bool = False):
+    """交易时段每15分钟执行：抓取所有持仓的最新价格并更新缓存
+    force=True 时跳过交易时段判断（手动触发用）
+    """
+    now = datetime.now()
+    if not force and not _is_trading_hours(now):
+        logger.debug("当前非交易时段，跳过行情抓取")
+        return
+
+    db: Session = SessionLocal()
+    try:
+        from crawlers.price_data import fetch_tencent_quote
+        from crawlers.exchange_rates import get_rate
+        from services.importer import _fetch_fund_nav
+
+        holdings = db.query(Holding).all()
+        if not holdings:
+            logger.info("无持仓记录，跳过行情抓取")
+            return
+
+        today = date.today()
+        updated = 0
+
+        for h in holdings:
+            try:
+                price = None
+                code = h.security_code
+                quote_info = None
+
+                # 美股/美股ETF：通过腾讯财经API获取实时行情
+                if h.asset_type in (AssetType.US_STOCK.value, AssetType.US_ETF.value):
+                    quote_info = fetch_tencent_quote(code)
+                    if quote_info:
+                        price = quote_info.get("price")
+
+                # 场外基金（.OF后缀）：通过akshare获取最新净值
+                if not price and code.endswith(".OF"):
+                    fund_code = code.replace(".OF", "")
+                    nav = _fetch_fund_nav(fund_code)
+                    if nav and nav > 0:
+                        price = nav
+
+                # A股ETF（.SZ/.SH后缀）及未获取到价格的场外基金：通过腾讯API获取
+                if not price and (
+                    code.endswith(".SZ") or code.endswith(".SH") or code.endswith(".OF")
+                ):
+                    quote_info = fetch_tencent_quote(code)
+                    if quote_info:
+                        price = quote_info.get("price")
+
+                if not price or price <= 0:
+                    continue
+
+                # 更新持仓价格和金额
+                h.price = round(price, 4)
+                h.amount = round(h.quantity * price, 2)
+
+                # 折算人民币金额
+                rate = get_rate(db, h.currency, "CNY")
+                if rate and rate > 0:
+                    h.amount_cny = round(h.amount * rate, 2)
+                else:
+                    h.amount_cny = h.amount
+
+                # 写入价格缓存
+                _save_price_cache(db, code, today, price, quote_info)
+                updated += 1
+
+            except Exception as e:
+                logger.warning("抓取行情失败 [%s]: %s", code, e)
+                continue
+
+        db.commit()
+        logger.info("行情抓取完成，更新 %d/%d 只持仓", updated, len(holdings))
+
+    except Exception as e:
+        logger.error("行情抓取任务异常: %s", e, exc_info=True)
+        db.rollback()
+    finally:
+        db.close()
+
+
+def _save_price_cache(
+    db: Session,
+    stock_code: str,
+    trade_date: date,
+    close_px: float,
+    quote_info: dict | None,
+):
+    """将行情数据写入 price_cache 表"""
+    try:
+        cache = PriceCache(
+            stock_code=stock_code,
+            trade_date=trade_date,
+            open_px=quote_info.get("open") if quote_info else None,
+            close_px=close_px,
+            high_px=quote_info.get("high") if quote_info else None,
+            low_px=quote_info.get("low") if quote_info else None,
+            volume=quote_info.get("volume") if quote_info else None,
+            source=quote_info.get("source", "scheduler") if quote_info else "scheduler",
+        )
+        db.add(cache)
+    except Exception as e:
+        logger.warning("写入价格缓存失败 [%s]: %s", stock_code, e)
+
+
+# ---------- 任务2：财务基本面数据更新 ----------
+
+def job_update_financial_fundamentals():
+    """每日7:00/19:00执行：增量抓取财务基本面数据并运行穿透计算"""
+    db: Session = SessionLocal()
+    try:
+        from crawlers.price_data import get_stock_info, fetch_yfinance_info
+        from services.penetration import PenetrationEngine
+
+        today = date.today()
+
+        # 获取所有美股持仓代码
+        us_holdings = db.query(Holding).filter(
+            Holding.asset_type.in_([
+                AssetType.US_STOCK.value,
+                AssetType.US_ETF.value,
+            ])
+        ).all()
+
+        # 增量过滤：只抓取今日尚未缓存的股票
+        cached_codes = set(
+            row[0] for row in db.query(StockInfoCache.stock_code)
+            .filter(StockInfoCache.updated_at >= today)
+            .all()
+        )
+
+        updated = 0
+        for h in us_holdings:
+            code = h.security_code
+            if code in cached_codes:
+                continue
+
+            try:
+                # 先用腾讯API获取实时行情信息
+                info = get_stock_info(code)
+                # 再用yfinance补充财务数据
+                yf_info = fetch_yfinance_info(code)
+
+                # 合并两个数据源
+                merged = {}
+                if info:
+                    merged.update(info)
+                if yf_info:
+                    # yfinance数据覆盖补充（保留已有字段）
+                    for k, v in yf_info.items():
+                        if k not in merged or merged[k] is None:
+                            merged[k] = v
+
+                if not merged:
+                    continue
+
+                # 写入 stock_info_cache
+                existing = db.query(StockInfoCache).filter(
+                    StockInfoCache.stock_code == code
+                ).first()
+
+                if existing:
+                    existing.stock_name = merged.get("name") or existing.stock_name
+                    existing.data_json = merged
+                    existing.updated_at = datetime.utcnow()
+                else:
+                    db.add(StockInfoCache(
+                        stock_code=code,
+                        stock_name=merged.get("name", ""),
+                        data_json=merged,
+                        updated_at=datetime.utcnow(),
+                    ))
+
+                updated += 1
+
+            except Exception as e:
+                logger.warning("抓取基本面失败 [%s]: %s", code, e)
+                continue
+
+        db.commit()
+        logger.info("基本面数据更新完成，新增/更新 %d 只股票", updated)
+
+        # 基本面更新后运行穿透计算
+        try:
+            engine = PenetrationEngine(db)
+            results = engine.calculate()
+            logger.info("穿透计算完成，生成 %d 条结果", len(results))
+        except Exception as e:
+            logger.error("穿透计算异常: %s", e, exc_info=True)
+
+    except Exception as e:
+        logger.error("基本面数据更新任务异常: %s", e, exc_info=True)
+        db.rollback()
+    finally:
+        db.close()
+
+
+# ---------- 任务3：行业/爬虫数据更新 ----------
+
+def job_update_industry_crawler_data():
+    """每日6:00/20:00执行：更新ETF映射、指数成分股、沪深300基准、汇率"""
+    db: Session = SessionLocal()
+    try:
+        from crawlers.etf_index import crawl_fund_index_map
+        from crawlers.index_constituents import crawl_constituents
+        from crawlers.exchange_rates import update_rates_today
+        from services.csi300 import Csi300Analyzer
+        from config import CSI300_CODE
+
+        # 1. 更新ETF→指数映射
+        try:
+            count = crawl_fund_index_map(db)
+            logger.info("ETF映射更新完成，处理 %d 只基金", count)
+        except Exception as e:
+            logger.error("ETF映射更新失败: %s", e, exc_info=True)
+
+        # 2. 更新沪深300成分股
+        try:
+            constituents = crawl_constituents(CSI300_CODE, db)
+            logger.info("沪深300成分股更新完成，获取 %d 只成分股", len(constituents))
+        except Exception as e:
+            logger.error("沪深300成分股更新失败: %s", e, exc_info=True)
+
+        # 3. 重新计算沪深300基准数据
+        try:
+            analyzer = Csi300Analyzer(db)
+            result = analyzer.recalc_baselines()
+            logger.info("沪深300基准重算完成: %s", result)
+        except Exception as e:
+            logger.error("沪深300基准重算失败: %s", e, exc_info=True)
+
+        # 4. 更新汇率
+        try:
+            count = update_rates_today(db)
+            logger.info("汇率更新完成，更新 %d 条记录", count)
+        except Exception as e:
+            logger.error("汇率更新失败: %s", e, exc_info=True)
+
+    except Exception as e:
+        logger.error("行业/爬虫数据更新任务异常: %s", e, exc_info=True)
+    finally:
+        db.close()
+
+
+# ---------- 调度器启停 ----------
+
+def start_scheduler():
+    """启动后台定时任务调度器"""
+    global scheduler
+
+    if scheduler and scheduler.running:
+        logger.warning("调度器已在运行中，跳过重复启动")
+        return
+
+    scheduler = BackgroundScheduler(timezone="Asia/Shanghai")
+
+    # 任务1：实时行情抓取 — 交易时段每15分钟
+    scheduler.add_job(
+        job_fetch_realtime_prices,
+        "interval",
+        minutes=15,
+        id="realtime_prices",
+        name="实时行情抓取",
+        max_instances=1,
+        misfire_grace_time=60,
+    )
+
+    # 任务2：财务基本面更新 — 每日7:00和19:00
+    scheduler.add_job(
+        job_update_financial_fundamentals,
+        "cron",
+        hour="7,19",
+        minute=0,
+        id="financial_fundamentals",
+        name="财务基本面更新",
+        max_instances=1,
+        misfire_grace_time=300,
+    )
+
+    # 任务3：行业/爬虫数据更新 — 每日6:00和20:00
+    scheduler.add_job(
+        job_update_industry_crawler_data,
+        "cron",
+        hour="6,20",
+        minute=0,
+        id="industry_crawler_data",
+        name="行业/爬虫数据更新",
+        max_instances=1,
+        misfire_grace_time=300,
+    )
+
+    scheduler.start()
+    logger.info(
+        "调度器已启动，注册 %d 个定时任务",
+        len(scheduler.get_jobs()),
+    )
+
+
+def stop_scheduler():
+    """停止后台定时任务调度器"""
+    global scheduler
+
+    if scheduler and scheduler.running:
+        scheduler.shutdown(wait=False)
+        logger.info("调度器已停止")
+    else:
+        logger.info("调度器未在运行，无需停止")
+
+    scheduler = None

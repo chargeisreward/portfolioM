@@ -1,0 +1,42 @@
+# Python
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+.Python
+*.egg-info/
+.venv/
+venv/
+env/
+
+# Node
+node_modules/
+dist/
+build/
+.npm
+.yarn
+
+# Local data
+*.db
+*.db-shm
+*.db-wal
+*.sqlite
+*.sqlite3
+backend/data/
+.env
+.env.local
+.env.*.local
+
+# Local secrets (per localsecrets/DEPLOY_LOCAL_GUIDE.md)
+local_secrets/
+zeabur_cli/
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Editors
+.vscode/
+.idea/
+*.swp
+*.swo

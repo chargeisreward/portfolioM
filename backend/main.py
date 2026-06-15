@@ -767,6 +767,60 @@ def update_table_row(
     return {"status": "ok", "changed": changed, "row": {c: getattr(row, c, None) for c in [pk_col, *editable]}}
 
 
+# ==================== Admin: 本地 SQLite → 云端 Postgres 同步 ====================
+
+class AdminSyncRequest(BaseModel):
+    table: str  # 'holdings' / 'security_master' / 'security_type_config' / 'watchlist'
+    rows: list[dict]
+    truncate: bool = False  # True = 先清空表再插
+
+
+# 允许通过 admin 端点写入的表（白名单，防止任意写）
+_ADMIN_WRITABLE_TABLES = {"holdings", "security_master", "security_type_config", "watchlist"}
+
+
+@app.post("/api/admin/sync-table")
+def admin_sync_table(req: AdminSyncRequest, db: Session = Depends(get_db)):
+    """从本地 SQLite 同步数据到云端 Postgres（白名单表）"""
+    import models
+    if req.table not in _ADMIN_WRITABLE_TABLES:
+        return {"status": "error", "message": f"Table {req.table} not in whitelist"}
+
+    # 模型名 = 表名驼峰: holdings → Holding, security_master → SecurityMaster
+    name_map = {
+        "holdings": "Holding",
+        "security_master": "SecurityMaster",
+        "security_type_config": "SecurityTypeConfig",
+        "watchlist": "Watchlist",
+    }
+    model_cls = getattr(models, name_map[req.table], None)
+    if model_cls is None:
+        return {"status": "error", "message": f"Model for {req.table} not found"}
+
+    from sqlalchemy import inspect
+    insp = inspect(model_cls)
+    valid_cols = {c.key for c in insp.column_attrs}
+
+    if req.truncate:
+        db.query(model_cls).delete()
+        db.commit()
+
+    inserted = 0
+    for row_data in req.rows:
+        clean = {k: v for k, v in row_data.items() if k in valid_cols}
+        if not clean:
+            continue
+        # id 字段：None 则让 DB 自增
+        if "id" in clean and clean["id"] is None:
+            clean.pop("id")
+        obj = model_cls(**clean)
+        db.add(obj)
+        inserted += 1
+
+    db.commit()
+    return {"status": "ok", "table": req.table, "inserted": inserted, "truncated": req.truncate}
+
+
 # ==================== 关注清单 (Watchlist) ====================
 
 class WatchAddRequest(BaseModel):

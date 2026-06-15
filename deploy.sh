@@ -8,13 +8,16 @@ set -euo pipefail
 PROJECT_DIR="$(cd "$(dirname "$0")" && pwd)"
 cd "$PROJECT_DIR"
 
-# Zeabur CLI 路径(可选 — 也可以装到 PATH)
-ZEABUR="${ZEABUR:-zeabur}"
+# Zeabur CLI 路径(优先用项目本地 0.18.0, 避免全局 0.5.4 功能不全)
+# 用法: ZEABUR=path/to/zeabur ./deploy.sh ...
+DEFAULT_ZEABUR="D:/cha_code_project/Teck dashboard for AI chips semiconductor storage/zeabur_cli/zeabur.exe"
+ZEABUR="${ZEABUR:-$DEFAULT_ZEABUR}"
 
 # ⚠️ 在此填入你 Zeabur 项目的 service / environment ID
 # 首次运行 ./deploy.sh setup 后, zeabur CLI 会打印这些 ID
-SVC="${SVC:-}"      # 后端 service id
-ENV="${ENV:-}"      # environment id
+PROJECT_ID="${PROJECT_ID:-6a2f296165b619f3dee7258f}"
+SVC="${SVC:-6a2f2de365b619f3dee72608}"      # 后端 service id
+ENV="${ENV:-}"                              # environment id (run ./deploy.sh env to find)
 VITE_API_URL="${VITE_API_URL:-https://portfoliom-backend.zeabur.app}"
 
 case "${1:-push}" in
@@ -23,6 +26,10 @@ case "${1:-push}" in
     "$ZEABUR" auth status
     echo "=== 列出项目 ==="
     "$ZEABUR" project list
+    echo "=== 当前 project 详情 ==="
+    "$ZEABUR" project get --id "$PROJECT_ID" 2>&1 || true
+    echo "=== 项目下服务 ==="
+    "$ZEABUR" service list --project-id "$PROJECT_ID" 2>&1 || true
     echo
     echo "请把 SERVICE_ID / ENVIRONMENT_ID 写进 shell:"
     echo "  export SVC=<service-id>"

@@ -8,6 +8,33 @@ const baseURL = import.meta.env.VITE_API_URL
 
 const api = axios.create({ baseURL, timeout: 30000 })
 
+// 自动注入 session token（从 localStorage）
+api.interceptors.request.use((config) => {
+  const token = localStorage.getItem('portfoliom_session')
+  if (token) {
+    config.headers['x-session-token'] = token
+  }
+  return config
+})
+
+// 401 拦截：清掉 token 触发 App 跳到登录页
+api.interceptors.response.use(
+  (r) => r,
+  (err) => {
+    if (err?.response?.status === 401) {
+      // 避免无限递归
+      if (!err.config?.url?.includes('/api/auth/')) {
+        localStorage.removeItem('portfoliom_session')
+        // 触发刷新
+        if (!window.location.hash.includes('auth')) {
+          window.location.reload()
+        }
+      }
+    }
+    return Promise.reject(err)
+  }
+)
+
 export const getHoldingsSummary = () => api.get('/holdings/summary').then(r => r.data)
 export const getPenetrationTable = () => api.get('/penetration/table').then(r => r.data)
 export const getPenetrationSummary = () => api.get('/penetration/summary').then(r => r.data)
@@ -41,3 +68,11 @@ export const searchSecurities = (q) => api.get('/watchlist/search', { params: { 
 // Data browser edit
 export const getDataBrowserOptions = () => api.get('/data-browser/options').then(r => r.data)
 export const updateTableRow = (table, pkCol, pkVal, body) => api.put(`/data-browser/${table}/${pkCol}/${pkVal}`, body).then(r => r.data)
+
+// Trend
+export const getTrend = (days = 90, target = 'CNY') => api.get('/trend', { params: { days, target } }).then(r => r.data)
+
+// Auth
+export const getAuthStatus = () => api.get('/auth/status').then(r => r.data)
+export const login = (password) => api.post('/auth/login', { password }).then(r => r.data)
+export const logout = () => api.post('/auth/logout').then(r => r.data)

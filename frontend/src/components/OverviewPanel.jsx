@@ -30,6 +30,9 @@ export default function OverviewPanel() {
   const [growth, setGrowth] = useState({})
   const pieRef = useRef(null)
   const radarRef = useRef(null)
+  const trendRef = useRef(null)
+  const [trendData, setTrendData] = useState([])
+  const [trendTotal, setTrendTotal] = useState(null)
   const [sortKey, setSortKey] = useState('amount')
   const [sortDir, setSortDir] = useState('desc')
   const [currency, setCurrency] = useState('CNY')
@@ -39,6 +42,15 @@ export default function OverviewPanel() {
 
   useEffect(() => {
     api.getHoldingsConverted(currency).then(setHoldingsLocal).catch(()=>{})
+  }, [currency])
+
+  // 90 天资产走势
+  useEffect(() => {
+    api.getTrend(90, currency).then(d => {
+      const series = d?.series || []
+      setTrendData(series)
+      setTrendTotal(series.length ? series[series.length - 1].value : null)
+    }).catch(() => { setTrendData([]); setTrendTotal(null) })
   }, [currency])
 
   useEffect(() => {
@@ -90,9 +102,41 @@ export default function OverviewPanel() {
             }],
           })
         }
+  }, [currency])
+
+  // 趋势图独立 useEffect（依赖 trendData / currency）
+  useEffect(() => {
+    if (!trendRef.current || trendData.length === 0) return
+    const c = echarts.init(trendRef.current)
+    if (trendRef.current && trendData.length > 0) {
+          const c = echarts.init(trendRef.current)
+          c.setOption({
+            tooltip: { trigger: 'axis' },
+            grid: { left: 60, right: 16, top: 20, bottom: 30 },
+            xAxis: {
+              type: 'category',
+              data: trendData.map(p => p.date),
+              axisLine: { lineStyle: { color: 'rgba(255,255,255,0.1)' } },
+              axisLabel: { color: '#5a6a8a', fontSize: 10, fontFamily: '"GeistMono", monospace' },
+            },
+            yAxis: {
+              type: 'value',
+              axisLabel: { color: '#5a6a8a', fontSize: 10, fontFamily: '"GeistMono", monospace', formatter: v => (v/10000).toFixed(0) + '万' },
+              splitLine: { lineStyle: { color: 'rgba(255,255,255,0.05)' } },
+            },
+            series: [{
+              type: 'line',
+              data: trendData.map(p => Math.round(p.value)),
+              smooth: true,
+              showSymbol: false,
+              lineStyle: { color: '#4a7cf7', width: 2 },
+              areaStyle: { color: 'rgba(74,124,247,0.1)' },
+            }],
+          })
+        }
       }, 100)
     })
-  }, [currency])
+  }, [currency, trendData])
 
   // Holdings data for table — always prefer converted API
   const displayHoldings = holdingsLocal.length > 0 ? holdingsLocal : allHoldings.map(h => ({
@@ -185,6 +229,17 @@ export default function OverviewPanel() {
         <span style={{ fontSize: 11, color: 'var(--text-muted)', marginLeft: 'auto', fontFamily: '"GeistMono", monospace' }}>
           折算汇率见「设置 · 汇率」
         </span>
+      </div>
+
+      {/* 资产走势 90 天 */}
+      <div className="raised" style={{ padding: 0, overflow: 'hidden' }}>
+        <div style={{ padding: '8px 12px', display: 'flex', justifyContent: 'space-between', alignItems: 'center' }}>
+          <div className="section-title" style={{ marginBottom: 0 }}>资产走势 · 90天</div>
+          <span style={{ fontSize: 10, color: 'var(--text-muted)', fontFamily: '"GeistMono", monospace' }}>
+            {trendTotal != null ? getCurrencySymbol(currency) + Math.round(trendTotal).toLocaleString('en-US') : '加载中…'}
+          </span>
+        </div>
+        <div ref={trendRef} className="chart-box" style={{ width: '100%', height: 240 }} />
       </div>
 
       {/* Charts */}

@@ -1,7 +1,9 @@
 """PortfolioM — FastAPI 应用入口"""
-from datetime import date, datetime
+import hashlib
+import secrets
+from datetime import date, datetime, timedelta
 from pathlib import Path
-from fastapi import FastAPI, Depends, Query
+from fastapi import FastAPI, Depends, Query, Request, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 from sqlalchemy.orm import Session
@@ -32,6 +34,260 @@ app.add_middleware(
 )
 
 DATA_DIR = Path(__file__).parent.parent
+
+
+# ==================== 访问密码 + IP 限流 ====================
+
+import os
+# 启动时设置的访问密码。优先级: env APP_PASSWORD > 默认 dev 密码
+APP_PASSWORD = os.environ.get("APP_PASSWORD", "123456")
+# 简单 SHA-256 存明文 hash 比较（dev 简化，生产应换 bcrypt）
+def _hash_pw(pw: str) -> str:
+    return hashlib.sha256(pw.encode("utf-8")).hexdigest()
+APP_PASSWORD_HASH = _hash_pw(APP_PASSWORD)
+
+# IP 限流阈值
+_BAN_RULES = [
+    (10, timedelta(hours=1)),    # 10 次 → 1h
+    (20, timedelta(days=1)),     # 20 次 → 1d
+    (30, timedelta(days=30)),    # 30 次 → 30d
+    (40, timedelta(days=365)),   # 40 次 → 365d
+]
+
+
+def _client_ip(request: Request) -> str:
+    """取真实 IP（兼容反向代理）"""
+    xff = request.headers.get("x-forwarded-for")
+    if xff:
+        return xff.split(",")[0].strip()
+    real = request.headers.get("x-real-ip")
+    if real:
+        return real
+    if request.client:
+        return request.client.host
+    return "unknown"
+
+
+def _check_ban(db: Session, ip: str):
+    """检查 IP 是否被锁，返回 (banned_until_or_None, remaining_seconds)"""
+    from models import AccessAttempt
+    rec = db.query(AccessAttempt).filter(AccessAttempt.ip == ip).first()
+    if not rec or not rec.banned_until:
+        return None, 0
+    now = datetime.utcnow()
+    if rec.banned_until > now:
+        remaining = int((rec.banned_until - now).total_seconds())
+        return rec.banned_until, remaining
+    # 已过期 — 清空 banned_until 但保留计数
+    rec.banned_until = None
+    db.commit()
+    return None, 0
+
+
+def _record_fail(db: Session, ip: str):
+    """记录一次失败，并按规则判断是否需要封禁"""
+    from models import AccessAttempt
+    rec = db.query(AccessAttempt).filter(AccessAttempt.ip == ip).first()
+    if not rec:
+        rec = AccessAttempt(ip=ip, fails_1h=0, fails_1d=0, fails_1mo=0, fails_1y=0)
+        db.add(rec)
+    rec.fails_1h += 1
+    rec.fails_1d += 1
+    rec.fails_1mo += 1
+    rec.fails_1y += 1
+    rec.last_fail_at = datetime.utcnow()
+
+    # 按从大到小阈值检查（命中最大阈值优先）
+    ban_for = None
+    for threshold, duration in reversed(_BAN_RULES):
+        if rec.fails_1y >= threshold:
+            ban_for = duration
+            break
+    if ban_for:
+        rec.banned_until = datetime.utcnow() + ban_for
+    db.commit()
+    return rec, ban_for
+
+
+def _record_success(db: Session, ip: str):
+    """成功登录：清零失败计数（保留最后成功时间）"""
+    from models import AccessAttempt
+    rec = db.query(AccessAttempt).filter(AccessAttempt.ip == ip).first()
+    if rec:
+        rec.fails_1h = 0
+        rec.fails_1d = 0
+        rec.fails_1mo = 0
+        rec.fails_1y = 0
+        rec.banned_until = None
+        rec.last_success_at = datetime.utcnow()
+        db.commit()
+
+
+def _create_session(db: Session, ip: str) -> str:
+    """创建新 session，返回 token。默认 24h 过期"""
+    from models import AccessSession
+    token = secrets.token_hex(32)
+    sess = AccessSession(
+        token=token,
+        ip=ip,
+        created_at=datetime.utcnow(),
+        expires_at=datetime.utcnow() + timedelta(days=1),
+    )
+    db.add(sess)
+    db.commit()
+    return token
+
+
+def _verify_token(db: Session, token: str) -> bool:
+    """验证 session token 是否有效"""
+    from models import AccessSession
+    if not token:
+        return False
+    sess = db.query(AccessSession).filter(AccessSession.token == token).first()
+    if not sess:
+        return False
+    if sess.expires_at < datetime.utcnow():
+        db.delete(sess)
+        db.commit()
+        return False
+    return True
+
+
+def require_auth(request: Request, db: Session = Depends(get_db)):
+    """FastAPI 依赖：要求有效 session。失败抛 401。"""
+    # 跳过 auth 端点本身
+    if request.url.path.startswith("/api/auth/"):
+        return True
+    # 跳过 OpenAPI 文档
+    if request.url.path in ("/openapi.json", "/docs", "/docs/oauth2-redirect", "/redoc"):
+        return True
+    # 跳过 admin 端点（用于本地同步脚本）— 需额外 token
+    # 跳过 static 资源
+    token = request.headers.get("x-session-token") or request.query_params.get("session")
+    if not _verify_token(db, token):
+        raise HTTPException(status_code=401, detail="需要登录")
+
+
+class LoginRequest(BaseModel):
+    password: str
+
+
+@app.get("/api/auth/status")
+def auth_status(request: Request, db: Session = Depends(get_db)):
+    """检查当前 IP 是否被锁、密码长度要求等"""
+    ip = _client_ip(request)
+    banned_until, remaining = _check_ban(db, ip)
+    return {
+        "require_password": True,
+        "banned": banned_until is not None,
+        "banned_until": banned_until.isoformat() if banned_until else None,
+        "remaining_seconds": remaining,
+        "min_length": 6,
+        "max_length": 12,
+    }
+
+
+@app.post("/api/auth/login")
+def auth_login(req: LoginRequest, request: Request, db: Session = Depends(get_db)):
+    """提交密码。正确→发 token；错→按 IP 限流规则封禁"""
+    ip = _client_ip(request)
+    # 先检查是否被锁
+    banned_until, remaining = _check_ban(db, ip)
+    if banned_until:
+        return {
+            "status": "banned",
+            "banned_until": banned_until.isoformat(),
+            "remaining_seconds": remaining,
+        }
+    # 密码长度校验
+    if not (6 <= len(req.password) <= 12):
+        return {"status": "error", "message": "密码长度需 6-12 位"}
+    # 校验密码
+    if _hash_pw(req.password) != APP_PASSWORD_HASH:
+        rec, ban_for = _record_fail(db, ip)
+        result = {
+            "status": "error",
+            "message": "密码错误",
+            "attempts_1y": rec.fails_1y,
+        }
+        if ban_for:
+            result["status"] = "banned"
+            result["banned_until"] = (datetime.utcnow() + ban_for).isoformat()
+            result["remaining_seconds"] = int(ban_for.total_seconds())
+            result["message"] = f"输错 {rec.fails_1y} 次，已封禁 {int(ban_for.total_seconds()//3600)} 小时"
+        return result
+    # 成功
+    _record_success(db, ip)
+    token = _create_session(db, ip)
+    return {
+        "status": "ok",
+        "token": token,
+        "expires_in": 86400,
+    }
+
+
+@app.post("/api/auth/logout")
+def auth_logout(request: Request, db: Session = Depends(get_db)):
+    """登出（删除当前 session）"""
+    from models import AccessSession
+    token = request.headers.get("x-session-token") or request.query_params.get("session")
+    if token:
+        db.query(AccessSession).filter(AccessSession.token == token).delete()
+        db.commit()
+    return {"status": "ok"}
+
+
+# 给所有受保护端点加依赖
+def _apply_auth_to_routes():
+    """遍历 app 路由，给非 auth 端点加 require_auth 依赖"""
+    from fastapi.routing import APIRoute
+    for route in app.routes:
+        if not isinstance(route, APIRoute):
+            continue
+        if not route.path.startswith("/api/"):
+            continue
+        if route.path.startswith("/api/auth/"):
+            continue
+        # 在依赖列表前加 require_auth
+        # 注意：FastAPI 路由依赖是合并方式，重复 add 不会冲突
+        route.dependant.dependencies.insert(0, ...)  # 复杂；改用更直接的方法
+
+
+# 上面 _apply_auth_to_routes 太复杂，改用 middleware 方式：
+@app.middleware("http")
+async def auth_middleware(request: Request, call_next):
+    """统一鉴权：未通过 → 401"""
+    path = request.url.path
+    # admin 同步端点：需专用 token（独立于用户密码）
+    if path.startswith("/api/admin/sync-table"):
+        admin_token = os.environ.get("ADMIN_TOKEN", APP_PASSWORD)  # 默认复用 APP_PASSWORD
+        provided = request.headers.get("x-admin-token")
+        if provided != admin_token:
+            return _json_error(401, "admin token required")
+        return await call_next(request)
+    # 公开路径
+    PUBLIC_PATHS = (
+        "/api/auth/",
+        "/openapi.json", "/docs", "/docs/oauth2-redirect", "/redoc", "/favicon.ico",
+    )
+    if any(path.startswith(p) for p in PUBLIC_PATHS):
+        return await call_next(request)
+    if not path.startswith("/api/"):
+        return await call_next(request)
+    # 检查 session
+    token = request.headers.get("x-session-token") or request.query_params.get("session")
+    db = next(get_db())
+    try:
+        if not _verify_token(db, token):
+            return _json_error(401, "需要登录")
+    finally:
+        db.close()
+    return await call_next(request)
+
+
+def _json_error(status: int, msg: str):
+    from fastapi.responses import JSONResponse
+    return JSONResponse(status_code=status, content={"detail": msg})
 
 
 @app.on_event("startup")
@@ -269,6 +525,76 @@ def holdings_converted(target: str = Query("CNY"), db: Session = Depends(get_db)
             "type2": sm.type2 if sm else None,
         })
     return result
+
+
+@app.get("/api/trend")
+def get_portfolio_trend(
+    days: int = Query(90, ge=1, le=365),
+    target: str = Query("CNY"),
+    db: Session = Depends(get_db),
+):
+    """组合 90 天资产走势：每日期末总市值 = Σ(qty × close_px × fx_rate)
+    用 PriceCache.close_px + ExchangeRate.rate 计算。无历史价则用最近已知价补齐。"""
+    from datetime import date, timedelta
+    from models import Holding, PriceCache, ExchangeRate
+
+    # 1. 取当前所有 holdings
+    rows = db.query(Holding).all()
+    if not rows:
+        return {"series": [], "currency": target, "days": days}
+
+    # 2. 拿所有 (code, date) -> close_px
+    cutoff = date.today() - timedelta(days=days)
+    pc_rows = db.query(PriceCache).filter(PriceCache.trade_date >= cutoff).all()
+    # code -> {date: close}
+    pc_map: dict = {}
+    for r in pc_rows:
+        pc_map.setdefault(r.stock_code, {})[r.trade_date.isoformat()] = r.close_px
+
+    # 3. 汇率（按 date 查）
+    fx_rows = db.query(ExchangeRate).filter(ExchangeRate.rate_date >= cutoff).all()
+    # (date, from, to) -> rate
+    fx_map: dict = {}
+    for r in fx_rows:
+        key = (r.rate_date.isoformat(), r.from_currency, r.to_currency)
+        fx_map[key] = r.rate
+    # 同币 1.0
+    def get_fx(d_iso: str, from_cur: str, to_cur: str) -> float:
+        if from_cur == to_cur:
+            return 1.0
+        # 优先当日
+        if (d_iso, from_cur, to_cur) in fx_map:
+            return fx_map[(d_iso, from_cur, to_cur)]
+        # 倒退找最近（最多 7 天）
+        d = date.fromisoformat(d_iso)
+        for k in range(1, 8):
+            nd = (d - timedelta(days=k)).isoformat()
+            if (nd, from_cur, to_cur) in fx_map:
+                return fx_map[(nd, from_cur, to_cur)]
+        return 1.0  # 兜底
+
+    # 4. 找过去 N 天有 trade_date 的全部日期（union 全部 code 的 dates）
+    all_dates = sorted({d for code_dates in pc_map.values() for d in code_dates.keys()})
+    # 只留 cutoff 之后
+    all_dates = [d for d in all_dates if d >= cutoff.isoformat()]
+
+    # 5. 对每个日期算总值
+    series = []
+    for d_iso in all_dates:
+        total = 0.0
+        for h in rows:
+            code_map = pc_map.get(h.security_code, {})
+            px = code_map.get(d_iso)
+            if px is None:
+                continue  # 当日没价 — 跳过（不归零，留给次日补）
+            cur = h.currency or "CNY"
+            fx = get_fx(d_iso, cur, target)
+            total += (h.quantity or 0) * px * fx
+        if total > 0:
+            series.append({"date": d_iso, "value": round(total, 2)})
+
+    # 6. 如果完全没有历史价（冷启动），返回空 series — 前端不显示图
+    return {"series": series, "currency": target, "days": days}
 
 
 @app.post("/api/holdings/import", response_model=CrawlResponse)

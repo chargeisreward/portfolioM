@@ -10,6 +10,7 @@ import urllib.request
 import urllib.parse
 
 BACKEND_URL = sys.argv[1] if len(sys.argv) > 1 else "https://portback.zeabur.app"
+ADMIN_TOKEN = os.environ.get("ADMIN_TOKEN") or (sys.argv[2] if len(sys.argv) > 2 else "123456")
 DB_PATH = os.path.join(os.path.dirname(__file__), "..", "portfolio.db")
 DB_PATH = os.path.abspath(DB_PATH)
 
@@ -37,7 +38,7 @@ def post_sync(table, rows, truncate=True):
     req = urllib.request.Request(
         url,
         data=payload,
-        headers={"Content-Type": "application/json"},
+        headers={"Content-Type": "application/json", "X-Admin-Token": ADMIN_TOKEN},
         method="POST",
     )
     with urllib.request.urlopen(req, timeout=60) as resp:

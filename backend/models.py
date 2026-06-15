@@ -112,6 +112,31 @@ class ExchangeRate(Base):
     created_at = Column(DateTime, default=datetime.utcnow)
 
 
+class AccessAttempt(Base):
+    """按 IP 累计失败登录次数 + 锁定到期时间"""
+    __tablename__ = "access_attempts"
+
+    ip = Column(String(64), primary_key=True)
+    # 不同窗口的失败计数（每次失败全部 +1）
+    fails_1h = Column(Integer, default=0)    # 达到 10 → 禁 1h
+    fails_1d = Column(Integer, default=0)    # 达到 20 → 禁 1d
+    fails_1mo = Column(Integer, default=0)   # 达到 30 → 禁 1mo
+    fails_1y = Column(Integer, default=0)    # 达到 40 → 禁 1y
+    banned_until = Column(DateTime, nullable=True)  # 锁定到期时间
+    last_fail_at = Column(DateTime, nullable=True)
+    last_success_at = Column(DateTime, nullable=True)
+
+
+class AccessSession(Base):
+    """成功的 session token（前端存 localStorage）"""
+    __tablename__ = "access_sessions"
+
+    token = Column(String(64), primary_key=True)
+    ip = Column(String(64), nullable=True)
+    created_at = Column(DateTime, default=datetime.utcnow)
+    expires_at = Column(DateTime, nullable=False)
+
+
 # ---------- ETF/基金基础信息 ----------
 
 class Fund(Base):

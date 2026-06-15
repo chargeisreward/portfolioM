@@ -1,4 +1,4 @@
-import React, { useState, useCallback } from 'react'
+import React, { useState, useCallback, useEffect } from 'react'
 import * as api from './api'
 import OverviewPanel from './components/OverviewPanel'
 import AnalysisPanel from './components/AnalysisPanel'
@@ -6,6 +6,7 @@ import TradingPanel from './components/TradingPanel'
 import WatchPanel from './components/WatchPanel'
 import SettingsPanel from './components/SettingsPanel'
 import DataBrowser from './components/DataBrowser'
+import AuthGate from './components/AuthGate'
 import './App.css'
 
 // SVG path icons (no emoji — per UI UX Pro Max §4)
@@ -29,9 +30,28 @@ const TABS = [
   { id: 'settings', label: '设置', icon: ICONS.settings },
 ]
 
+const TOKEN_KEY = 'portfoliom_session'
+
 export default function App() {
+  const [sessionToken, setSessionToken] = useState(() => localStorage.getItem(TOKEN_KEY) || '')
   const [activeTab, setActiveTab] = useState('overview')
   const [loading, setLoading] = useState(false)
+
+  // token 注入 axios
+  useEffect(() => {
+    if (sessionToken) {
+      localStorage.setItem(TOKEN_KEY, sessionToken)
+    } else {
+      localStorage.removeItem(TOKEN_KEY)
+    }
+  }, [sessionToken])
+
+  const onLoggedIn = (token) => setSessionToken(token)
+  const onLogout = () => setSessionToken('')
+
+  if (!sessionToken) {
+    return <AuthGate onLoggedIn={onLoggedIn} />
+  }
 
   const refreshAll = useCallback(async () => {
     setLoading(true)
@@ -84,8 +104,9 @@ export default function App() {
             </button>
           ))}
         </nav>
-        <div className="sidebar-footer">
+        <div className="sidebar-footer" style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center' }}>
           <span className="version">v0.2.0</span>
+          <button onClick={onLogout} className="btn-ghost" style={{ padding: '2px 8px', fontSize: 10 }}>登出</button>
         </div>
       </aside>
 

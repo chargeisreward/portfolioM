@@ -1,6 +1,6 @@
 {
   "name": "portfoliom-frontend",
   "description": "PortfolioM React + Vite static frontend",
-  "build_command": "npm ci && npm run build",
+  "build_command": "npm ci && (test -n \"$VITE_API_URL\" && echo \"VITE_API_URL=$VITE_API_URL\" > .env.production || rm -f .env.production) && npm run build",
   "start_command": "npx --yes serve -s dist -l $PORT"
 }

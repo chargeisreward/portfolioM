@@ -3,9 +3,16 @@ from sqlalchemy import create_engine, event
 from sqlalchemy.orm import sessionmaker, declarative_base
 from config import DATABASE_URL
 
+# 转换 postgresql:// → postgresql+psycopg:// (psycopg3 驱动)
+_normalized_url = DATABASE_URL
+if _normalized_url.startswith("postgresql://"):
+    _normalized_url = _normalized_url.replace("postgresql://", "postgresql+psycopg://", 1)
+elif _normalized_url.startswith("postgres://"):
+    _normalized_url = _normalized_url.replace("postgres://", "postgresql+psycopg://", 1)
+
 engine = create_engine(
-    DATABASE_URL,
-    connect_args={"check_same_thread": False} if "sqlite" in DATABASE_URL else {},
+    _normalized_url,
+    connect_args={"check_same_thread": False} if "sqlite" in _normalized_url else {},
     echo=False,
 )
 

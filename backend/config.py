@@ -7,8 +7,14 @@ DATA_DIR = BASE_DIR / "backend" / "data"
 DATA_DIR.mkdir(parents=True, exist_ok=True)
 
 # Database - SQLite for local dev, override via env for cloud
+# Cloud: 优先读 POSTGRES_CONNECTION_STRING (zeabur 自动注入) → DATABASE_URL → SQLite 本地
 DB_PATH = os.environ.get("DB_PATH", str(BASE_DIR / "portfolio.db"))
-DATABASE_URL = f"sqlite:///{DB_PATH}"
+DATABASE_URL = (
+    os.environ.get("POSTGRES_CONNECTION_STRING")
+    or os.environ.get("POSTGRES_URI")
+    or os.environ.get("DATABASE_URL")
+    or f"sqlite:///{DB_PATH}"
+)
 
 # Tushare token (optional, for deeper A-share financials)
 TUSHARE_TOKEN = os.environ.get("TUSHARE_TOKEN", "")

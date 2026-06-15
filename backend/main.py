@@ -554,6 +554,11 @@ def get_portfolio_trend(
     pc_map: dict = {}
     for r in pc_rows:
         pc_map.setdefault(r.stock_code, {})[r.trade_date.isoformat()] = r.close_px
+    # 每个 code 的最近已知价（用于当日没价时 forward-fill）
+    last_known: dict = {}
+    for code, date_map in pc_map.items():
+        if date_map:
+            last_known[code] = max(date_map.values())
 
     # 3. 汇率（按 date 查）
     fx_rows = db.query(ExchangeRate).filter(ExchangeRate.rate_date >= cutoff).all()
@@ -562,24 +567,36 @@ def get_portfolio_trend(
     for r in fx_rows:
         key = (r.rate_date.isoformat(), r.from_currency, r.to_currency)
         fx_map[key] = r.rate
-    # 同币 1.0
+    # 全局最新汇率（最近一天）
+    latest_fx: dict = {}
+    for r in fx_rows:
+        latest_key = (r.from_currency, r.to_currency)
+        cur_val = fx_map.get((r.rate_date.isoformat(), r.from_currency, r.to_currency))
+        prev = latest_fx.get(latest_key)
+        if prev is None or r.rate_date > prev[0]:
+            latest_fx[latest_key] = (r.rate_date, cur_val)
+
     def get_fx(d_iso: str, from_cur: str, to_cur: str) -> float:
         if from_cur == to_cur:
             return 1.0
-        # 优先当日
         if (d_iso, from_cur, to_cur) in fx_map:
             return fx_map[(d_iso, from_cur, to_cur)]
         # 倒退找最近（最多 7 天）
-        d = date.fromisoformat(d_iso)
+        try:
+            d = date.fromisoformat(d_iso)
+        except (ValueError, TypeError):
+            d = date.today()
         for k in range(1, 8):
             nd = (d - timedelta(days=k)).isoformat()
             if (nd, from_cur, to_cur) in fx_map:
                 return fx_map[(nd, from_cur, to_cur)]
-        return 1.0  # 兜底
+        # 最后兜底：用最新汇率
+        if (from_cur, to_cur) in latest_fx:
+            return latest_fx[(from_cur, to_cur)][1]
+        return 1.0
 
-    # 4. 找过去 N 天有 trade_date 的全部日期（union 全部 code 的 dates）
+    # 4. 找过去 N 天所有有 trade_date 的全部日期
     all_dates = sorted({d for code_dates in pc_map.values() for d in code_dates.keys()})
-    # 只留 cutoff 之后
     all_dates = [d for d in all_dates if d >= cutoff.isoformat()]
 
     # 5. 对每个日期算总值
@@ -590,15 +607,113 @@ def get_portfolio_trend(
             code_map = pc_map.get(h.security_code, {})
             px = code_map.get(d_iso)
             if px is None:
-                continue  # 当日没价 — 跳过（不归零，留给次日补）
+                px = last_known.get(h.security_code)  # forward-fill
+            if px is None:
+                continue
             cur = h.currency or "CNY"
             fx = get_fx(d_iso, cur, target)
             total += (h.quantity or 0) * px * fx
         if total > 0:
             series.append({"date": d_iso, "value": round(total, 2)})
 
-    # 6. 如果完全没有历史价（冷启动），返回空 series — 前端不显示图
     return {"series": series, "currency": target, "days": days}
+
+
+@app.post("/api/admin/backfill-prices")
+def admin_backfill_prices(days: int = 90, db: Session = Depends(get_db)):
+    """拉所有 holding 过去 N 天 daily price，写入 price_cache。
+    同步拉过去 N 天 PBoC 汇率，写入 exchange_rates。"""
+    from datetime import date, timedelta
+    from models import Holding, PriceCache
+    from crawlers.price_data import fetch_price_history
+    from crawlers.exchange_rates import fetch_pboc_rates, update_rates_today
+
+    holdings = db.query(Holding).all()
+    results = []
+    cutoff = date.today() - timedelta(days=days)
+
+    # 1) Daily price
+    for h in holdings:
+        code = h.security_code
+        try:
+            history = fetch_price_history(code, days)
+        except Exception as e:
+            results.append({"code": code, "status": "fetch_error", "error": str(e)[:100]})
+            continue
+        if not history:
+            results.append({"code": code, "status": "no_data"})
+            continue
+        written = 0
+        for p in history:
+            try:
+                d = date.fromisoformat(p["date"])
+            except (ValueError, TypeError):
+                continue
+            if d < cutoff:
+                continue
+            exists = db.query(PriceCache).filter(
+                PriceCache.stock_code == code,
+                PriceCache.trade_date == d,
+            ).first()
+            if exists:
+                continue
+            db.add(PriceCache(
+                stock_code=code,
+                trade_date=d,
+                open_px=p.get("open"),
+                close_px=p.get("close"),
+                high_px=p.get("high"),
+                low_px=p.get("low"),
+                volume=p.get("volume"),
+                source="backfill",
+            ))
+            written += 1
+        db.commit()
+        results.append({"code": code, "status": "ok", "rows": written})
+
+    # 2) Daily PBoC 汇率（过去 N 天）
+    fx_written = 0
+    try:
+        for d_offset in range(days + 1):
+            d = date.today() - timedelta(days=d_offset)
+            try:
+                rates = fetch_pboc_rates(target_date=d)
+            except Exception:
+                continue
+            for from_cur, rate in rates.items():
+                # 同时存 → CNY 和 → CAD 两条
+                for to_cur in ("CNY", "CAD"):
+                    if from_cur == to_cur:
+                        continue
+                    exists = db.query(ExchangeRate).filter(
+                        ExchangeRate.from_currency == from_cur,
+                        ExchangeRate.to_currency == to_cur,
+                        ExchangeRate.rate_date == d,
+                    ).first()
+                    if exists:
+                        continue
+                    db.add(ExchangeRate(
+                        rate_date=d,
+                        from_currency=from_cur,
+                        to_currency=to_cur,
+                        rate=rate,
+                        source="PBOC_backfill",
+                    ))
+                    fx_written += 1
+        db.commit()
+    except Exception as e:
+        results.append({"fx": "error", "error": str(e)[:100]})
+
+    total_pc = db.query(PriceCache).count()
+    total_fx = db.query(ExchangeRate).count()
+    return {
+        "status": "ok",
+        "holdings_processed": len(holdings),
+        "total_price_cache_rows": total_pc,
+        "total_fx_rows": total_fx,
+        "fx_written": fx_written,
+        "details": results,
+    }
 
 
 @app.post("/api/holdings/import", response_model=CrawlResponse)
@@ -1149,6 +1264,60 @@ def admin_sync_table(req: AdminSyncRequest, db: Session = Depends(get_db)):
 
     db.commit()
     return {"status": "ok", "table": req.table, "inserted": inserted, "truncated": req.truncate}
+
+
+@app.post("/api/admin/backfill-prices")
+def admin_backfill_prices(days: int = 90, db: Session = Depends(get_db)):
+    """拉所有 holding 过去 N 天 daily price，写入 price_cache"""
+    from datetime import date, timedelta
+    from models import Holding, PriceCache
+    from crawlers.price_data import fetch_price_history
+
+    holdings = db.query(Holding).all()
+    results = []
+    cutoff = date.today() - timedelta(days=days)
+
+    for h in holdings:
+        code = h.security_code
+        try:
+            history = fetch_price_history(code, days)
+        except Exception as e:
+            results.append({"code": code, "status": "fetch_error", "error": str(e)[:100]})
+            continue
+        if not history:
+            results.append({"code": code, "status": "no_data"})
+            continue
+        written = 0
+        for p in history:
+            try:
+                d = date.fromisoformat(p["date"])
+            except (ValueError, TypeError):
+                continue
+            if d < cutoff:
+                continue
+            # 已有则跳过（避免重复）
+            exists = db.query(PriceCache).filter(
+                PriceCache.stock_code == code,
+                PriceCache.trade_date == d,
+            ).first()
+            if exists:
+                continue
+            db.add(PriceCache(
+                stock_code=code,
+                trade_date=d,
+                open_px=p.get("open"),
+                close_px=p.get("close"),
+                high_px=p.get("high"),
+                low_px=p.get("low"),
+                volume=p.get("volume"),
+                source="backfill",
+            ))
+            written += 1
+        db.commit()
+        results.append({"code": code, "status": "ok", "rows": written})
+
+    total_rows = db.query(PriceCache).count()
+    return {"status": "ok", "holdings_processed": len(holdings), "total_price_cache_rows": total_rows, "details": results}
 
 
 # ==================== 关注清单 (Watchlist) ====================

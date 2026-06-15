@@ -1,9 +1,6 @@
 {
   "name": "portfoliom-backend",
   "description": "PortfolioM FastAPI backend",
-  "build_command": "pip install -r requirements.txt",
-  "start_command": "uvicorn main:app --host 0.0.0.0 --port $PORT",
-  "env": {
-    "PYTHONUNBUFFERED": "true"
-  }
+  "build_command": "echo 'using Dockerfile'",
+  "start_command": "uvicorn main:app --host 0.0.0.0 --port $PORT"
 }

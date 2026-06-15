@@ -10,6 +10,6 @@ yfinance==0.2.40
 akshare==1.18.8
 tushare==1.4.1
 apscheduler==3.10.4
-numpy==1.26.4
-pandas==2.2.2
+numpy==2.1.0
+pandas==2.3.0
 psycopg2-binary==2.9.9

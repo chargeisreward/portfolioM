@@ -1,4 +1,4 @@
-import React, { useState, useEffect, useRef } from 'react'
+import React, { useState, useEffect, useRef, useMemo } from 'react'
 import * as echarts from 'echarts'
 import * as api from '../api'
 import { rawApi } from '../api'
@@ -138,25 +138,27 @@ export default function OverviewPanel() {
     })
   }, [currency, trendData])
 
-  // Holdings data for table — always prefer converted API
-  const displayHoldings = holdingsLocal.length > 0 ? holdingsLocal : allHoldings.map(h => ({
-    ...h, amount_local: h.amount_cny || h.amount, currency: h.currency || 'CNY', price: h.price,
-  }))
-
-  // Backfill asset_type from security_code suffix when missing (e.g. /holdings legacy rows)
-  const CODE_TYPE_MAP = [
-    ['.SH', 'a_share_etf'], ['.SZ', 'a_share_etf'],
-    ['.HK', 'hk_equity'],
-    ['.US', 'us_stock'], ['.OQ', 'us_stock'], ['.NYSE', 'us_stock'], ['.NASDAQ', 'us_stock'],
-  ]
-  displayHoldings.forEach(h => {
-    if (!h.asset_type) {
+  // Holdings data for table — always prefer converted API.
+  // Memoize to avoid mutating React-tracked references (causes #321).
+  const displayHoldings = useMemo(() => {
+    const _raw = holdingsLocal.length > 0 ? holdingsLocal : allHoldings
+    const _withCurrency = _raw.map(h => ({
+      ...h, amount_local: h.amount_local ?? h.amount_cny ?? h.amount,
+      currency: h.currency || 'CNY',
+    }))
+    const CODE_TYPE_MAP = [
+      ['.SH', 'a_share_etf'], ['.SZ', 'a_share_etf'],
+      ['.HK', 'hk_equity'],
+      ['.US', 'us_stock'], ['.OQ', 'us_stock'], ['.NYSE', 'us_stock'], ['.NASDAQ', 'us_stock'],
+    ]
+    return _withCurrency.map(h => {
+      if (h.asset_type) return h
       for (const [suffix, type] of CODE_TYPE_MAP) {
-        if (h.security_code?.endsWith(suffix)) { h.asset_type = type; break }
+        if (h.security_code?.endsWith(suffix)) return { ...h, asset_type: type }
       }
-    }
-  })
-
+      return h
+    })
+  }, [holdingsLocal, allHoldings])
   const topHoldings = penTable.slice(0, 10)
 
   // 类型1：按显示短标签去重（同名 label 合并，如 A股基 = a_share_equity ∪ a_share_etf）
@@ -185,7 +187,6 @@ export default function OverviewPanel() {
     }
     return true
   })
-  console.log('[OverviewPanel] t1=', typeFilter, 't2=', type2Filter, 'displayed=', displayHoldings.length, 'filtered=', filteredHoldings.length)
 
   const sortedHoldings = [...filteredHoldings].sort((a,b) => {
     const aV = a[sortKey]||0, bV = b[sortKey]||0

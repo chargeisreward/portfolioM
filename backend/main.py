@@ -262,9 +262,9 @@ async def auth_middleware(request: Request, call_next):
     # CORS 预检：直接放行（让 CORSMiddleware 响应 OPTIONS）
     if method == "OPTIONS":
         return await call_next(request)
-    # admin 同步端点：需专用 token（独立于用户密码）
-    if path.startswith("/api/admin/sync-table"):
-        admin_token = os.environ.get("ADMIN_TOKEN", APP_PASSWORD)  # 默认复用 APP_PASSWORD
+    # admin 端点（需 X-Admin-Token，独立于用户密码）
+    if path.startswith("/api/admin/"):
+        admin_token = os.environ.get("ADMIN_TOKEN", APP_PASSWORD)
         provided = request.headers.get("x-admin-token")
         if provided != admin_token:
             return _json_error(401, "admin token required")
@@ -1264,60 +1264,6 @@ def admin_sync_table(req: AdminSyncRequest, db: Session = Depends(get_db)):
 
     db.commit()
     return {"status": "ok", "table": req.table, "inserted": inserted, "truncated": req.truncate}
-
-
-@app.post("/api/admin/backfill-prices")
-def admin_backfill_prices(days: int = 90, db: Session = Depends(get_db)):
-    """拉所有 holding 过去 N 天 daily price，写入 price_cache"""
-    from datetime import date, timedelta
-    from models import Holding, PriceCache
-    from crawlers.price_data import fetch_price_history
-
-    holdings = db.query(Holding).all()
-    results = []
-    cutoff = date.today() - timedelta(days=days)
-
-    for h in holdings:
-        code = h.security_code
-        try:
-            history = fetch_price_history(code, days)
-        except Exception as e:
-            results.append({"code": code, "status": "fetch_error", "error": str(e)[:100]})
-            continue
-        if not history:
-            results.append({"code": code, "status": "no_data"})
-            continue
-        written = 0
-        for p in history:
-            try:
-                d = date.fromisoformat(p["date"])
-            except (ValueError, TypeError):
-                continue
-            if d < cutoff:
-                continue
-            # 已有则跳过（避免重复）
-            exists = db.query(PriceCache).filter(
-                PriceCache.stock_code == code,
-                PriceCache.trade_date == d,
-            ).first()
-            if exists:
-                continue
-            db.add(PriceCache(
-                stock_code=code,
-                trade_date=d,
-                open_px=p.get("open"),
-                close_px=p.get("close"),
-                high_px=p.get("high"),
-                low_px=p.get("low"),
-                volume=p.get("volume"),
-                source="backfill",
-            ))
-            written += 1
-        db.commit()
-        results.append({"code": code, "status": "ok", "rows": written})
-
-    total_rows = db.query(PriceCache).count()
-    return {"status": "ok", "holdings_processed": len(holdings), "total_price_cache_rows": total_rows, "details": results}
 
 
 # ==================== 关注清单 (Watchlist) ====================

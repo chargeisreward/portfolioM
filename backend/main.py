@@ -622,98 +622,79 @@ def get_portfolio_trend(
 @app.post("/api/admin/backfill-prices")
 def admin_backfill_prices(days: int = 90, db: Session = Depends(get_db)):
     """拉所有 holding 过去 N 天 daily price，写入 price_cache。
-    同步拉过去 N 天 PBoC 汇率，写入 exchange_rates。"""
+    PBoC 历史汇率暂不拉（接口限流），只用当日汇率做最新市值转换。"""
     from datetime import date, timedelta
     from models import Holding, PriceCache
-    from crawlers.price_data import fetch_price_history
-    from crawlers.exchange_rates import fetch_pboc_rates, update_rates_today
 
-    holdings = db.query(Holding).all()
-    results = []
-    cutoff = date.today() - timedelta(days=days)
-
-    # 1) Daily price
-    for h in holdings:
-        code = h.security_code
-        try:
-            history = fetch_price_history(code, days)
-        except Exception as e:
-            results.append({"code": code, "status": "fetch_error", "error": str(e)[:100]})
-            continue
-        if not history:
-            results.append({"code": code, "status": "no_data"})
-            continue
-        written = 0
-        for p in history:
-            try:
-                d = date.fromisoformat(p["date"])
-            except (ValueError, TypeError):
-                continue
-            if d < cutoff:
-                continue
-            exists = db.query(PriceCache).filter(
-                PriceCache.stock_code == code,
-                PriceCache.trade_date == d,
-            ).first()
-            if exists:
-                continue
-            db.add(PriceCache(
-                stock_code=code,
-                trade_date=d,
-                open_px=p.get("open"),
-                close_px=p.get("close"),
-                high_px=p.get("high"),
-                low_px=p.get("low"),
-                volume=p.get("volume"),
-                source="backfill",
-            ))
-            written += 1
-        db.commit()
-        results.append({"code": code, "status": "ok", "rows": written})
-
-    # 2) Daily PBoC 汇率（过去 N 天）
-    fx_written = 0
     try:
-        for d_offset in range(days + 1):
-            d = date.today() - timedelta(days=d_offset)
-            try:
-                rates = fetch_pboc_rates(target_date=d)
-            except Exception:
-                continue
-            for from_cur, rate in rates.items():
-                # 同时存 → CNY 和 → CAD 两条
-                for to_cur in ("CNY", "CAD"):
-                    if from_cur == to_cur:
-                        continue
-                    exists = db.query(ExchangeRate).filter(
-                        ExchangeRate.from_currency == from_cur,
-                        ExchangeRate.to_currency == to_cur,
-                        ExchangeRate.rate_date == d,
-                    ).first()
-                    if exists:
-                        continue
-                    db.add(ExchangeRate(
-                        rate_date=d,
-                        from_currency=from_cur,
-                        to_currency=to_cur,
-                        rate=rate,
-                        source="PBOC_backfill",
-                    ))
-                    fx_written += 1
-        db.commit()
-    except Exception as e:
-        results.append({"fx": "error", "error": str(e)[:100]})
+        from crawlers.price_data import fetch_price_history
+    except ImportError as e:
+        return {"status": "error", "message": f"import failed: {e}"}
 
-    total_pc = db.query(PriceCache).count()
-    total_fx = db.query(ExchangeRate).count()
-    return {
-        "status": "ok",
-        "holdings_processed": len(holdings),
-        "total_price_cache_rows": total_pc,
-        "total_fx_rows": total_fx,
-        "fx_written": fx_written,
-        "details": results,
-    }
+    try:
+        holdings = db.query(Holding).all()
+        results = []
+        cutoff = date.today() - timedelta(days=days)
+
+        for h in holdings:
+            code = h.security_code
+            try:
+                history = fetch_price_history(code, days)
+            except Exception as e:
+                results.append({"code": code, "status": "fetch_error", "error": str(e)[:200]})
+                continue
+            if not history:
+                results.append({"code": code, "status": "no_data"})
+                continue
+            written = 0
+            for p in history:
+                try:
+                    d = date.fromisoformat(p["date"])
+                except (ValueError, TypeError):
+                    continue
+                if d < cutoff:
+                    continue
+                try:
+                    exists = db.query(PriceCache).filter(
+                        PriceCache.stock_code == code,
+                        PriceCache.trade_date == d,
+                    ).first()
+                except Exception:
+                    exists = None
+                if exists:
+                    continue
+                try:
+                    db.add(PriceCache(
+                        stock_code=code,
+                        trade_date=d,
+                        open_px=p.get("open"),
+                        close_px=p.get("close"),
+                        high_px=p.get("high"),
+                        low_px=p.get("low"),
+                        volume=p.get("volume"),
+                        source="backfill",
+                    ))
+                    written += 1
+                except Exception as e:
+                    continue
+            try:
+                db.commit()
+            except Exception as e:
+                db.rollback()
+                results.append({"code": code, "status": "commit_error", "error": str(e)[:200]})
+                continue
+            results.append({"code": code, "status": "ok", "rows": written})
+
+        total_pc = db.query(PriceCache).count()
+        return {
+            "status": "ok",
+            "holdings_processed": len(holdings),
+            "total_price_cache_rows": total_pc,
+            "details": results,
+        }
+    except Exception as e:
+        import traceback
+        return {"status": "error", "message": str(e)[:500], "trace": traceback.format_exc()[-500:]}
 
 
 @app.post("/api/holdings/import", response_model=CrawlResponse)

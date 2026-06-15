@@ -258,6 +258,10 @@ def _apply_auth_to_routes():
 async def auth_middleware(request: Request, call_next):
     """统一鉴权：未通过 → 401"""
     path = request.url.path
+    method = request.method
+    # CORS 预检：直接放行（让 CORSMiddleware 响应 OPTIONS）
+    if method == "OPTIONS":
+        return await call_next(request)
     # admin 同步端点：需专用 token（独立于用户密码）
     if path.startswith("/api/admin/sync-table"):
         admin_token = os.environ.get("ADMIN_TOKEN", APP_PASSWORD)  # 默认复用 APP_PASSWORD

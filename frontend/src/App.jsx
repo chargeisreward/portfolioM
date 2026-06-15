@@ -49,10 +49,6 @@ export default function App() {
   const onLoggedIn = (token) => setSessionToken(token)
   const onLogout = () => setSessionToken('')
 
-  if (!sessionToken) {
-    return <AuthGate onLoggedIn={onLoggedIn} />
-  }
-
   const refreshAll = useCallback(async () => {
     setLoading(true)
     try {
@@ -64,6 +60,10 @@ export default function App() {
     } catch (e) { console.error(e) }
     setLoading(false)
   }, [])
+
+  if (!sessionToken) {
+    return <AuthGate onLoggedIn={onLoggedIn} />
+  }
 
   const renderPage = () => {
     switch (activeTab) {

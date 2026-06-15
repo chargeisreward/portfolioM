@@ -44,6 +44,28 @@ export default function OverviewPanel() {
     api.getHoldingsConverted(currency).then(setHoldingsLocal).catch(()=>{})
   }, [currency])
 
+  // Holdings data for table — always prefer converted API.
+  // Must be defined before any useEffect that references it (React hook order).
+  const displayHoldings = useMemo(() => {
+    const _raw = holdingsLocal.length > 0 ? holdingsLocal : allHoldings
+    const _withCurrency = _raw.map(h => ({
+      ...h, amount_local: h.amount_local ?? h.amount_cny ?? h.amount,
+      currency: h.currency || 'CNY',
+    }))
+    const CODE_TYPE_MAP = [
+      ['.SH', 'a_share_etf'], ['.SZ', 'a_share_etf'],
+      ['.HK', 'hk_equity'],
+      ['.US', 'us_stock'], ['.OQ', 'us_stock'], ['.NYSE', 'us_stock'], ['.NASDAQ', 'us_stock'],
+    ]
+    return _withCurrency.map(h => {
+      if (h.asset_type) return h
+      for (const [suffix, type] of CODE_TYPE_MAP) {
+        if (h.security_code?.endsWith(suffix)) return { ...h, asset_type: type }
+      }
+      return h
+    })
+  }, [holdingsLocal, allHoldings])
+
   // 90 天资产走势
   useEffect(() => {
     api.getTrend(90, currency).then(d => {
@@ -132,61 +154,6 @@ export default function OverviewPanel() {
     })
   }, [currency, trendData])
 
-  // 趋势图独立 useEffect（依赖 trendData / currency）
-  useEffect(() => {
-    if (!trendRef.current || trendData.length === 0) return
-    const c = echarts.init(trendRef.current)
-    if (trendRef.current && trendData.length > 0) {
-          const c = echarts.init(trendRef.current)
-          c.setOption({
-            tooltip: { trigger: 'axis' },
-            grid: { left: 60, right: 16, top: 20, bottom: 30 },
-            xAxis: {
-              type: 'category',
-              data: trendData.map(p => p.date),
-              axisLine: { lineStyle: { color: 'rgba(255,255,255,0.1)' } },
-              axisLabel: { color: '#5a6a8a', fontSize: 10, fontFamily: '"GeistMono", monospace' },
-            },
-            yAxis: {
-              type: 'value',
-              axisLabel: { color: '#5a6a8a', fontSize: 10, fontFamily: '"GeistMono", monospace', formatter: v => (v/10000).toFixed(0) + '万' },
-              splitLine: { lineStyle: { color: 'rgba(255,255,255,0.05)' } },
-            },
-            series: [{
-              type: 'line',
-              data: trendData.map(p => Math.round(p.value)),
-              smooth: true,
-              showSymbol: false,
-              lineStyle: { color: '#4a7cf7', width: 2 },
-              areaStyle: { color: 'rgba(74,124,247,0.1)' },
-            }],
-          })
-        }
-      }, 100)
-    })
-  }, [currency, trendData])
-
-  // Holdings data for table — always prefer converted API.
-  // Memoize to avoid mutating React-tracked references (causes #321).
-  const displayHoldings = useMemo(() => {
-    const _raw = holdingsLocal.length > 0 ? holdingsLocal : allHoldings
-    const _withCurrency = _raw.map(h => ({
-      ...h, amount_local: h.amount_local ?? h.amount_cny ?? h.amount,
-      currency: h.currency || 'CNY',
-    }))
-    const CODE_TYPE_MAP = [
-      ['.SH', 'a_share_etf'], ['.SZ', 'a_share_etf'],
-      ['.HK', 'hk_equity'],
-      ['.US', 'us_stock'], ['.OQ', 'us_stock'], ['.NYSE', 'us_stock'], ['.NASDAQ', 'us_stock'],
-    ]
-    return _withCurrency.map(h => {
-      if (h.asset_type) return h
-      for (const [suffix, type] of CODE_TYPE_MAP) {
-        if (h.security_code?.endsWith(suffix)) return { ...h, asset_type: type }
-      }
-      return h
-    })
-  }, [holdingsLocal, allHoldings])
   const topHoldings = penTable.slice(0, 10)
 
   // 类型1：按显示短标签去重（同名 label 合并，如 A股基 = a_share_equity ∪ a_share_etf）

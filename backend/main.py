@@ -542,6 +542,13 @@ def get_portfolio_trend(
     from datetime import date, timedelta
     from models import Holding, PriceCache, ExchangeRate
 
+    # 兜底：确保当日汇率存在（USD→CNY 转换必需）
+    try:
+        from crawlers.exchange_rates import update_rates_today
+        update_rates_today(db)
+    except Exception:
+        pass
+
     # 1. 取当前所有 holdings
     rows = db.query(Holding).all()
     if not rows:
@@ -579,6 +586,7 @@ def get_portfolio_trend(
     def get_fx(d_iso: str, from_cur: str, to_cur: str) -> float:
         if from_cur == to_cur:
             return 1.0
+        # 优先用 daily 历史汇率
         if (d_iso, from_cur, to_cur) in fx_map:
             return fx_map[(d_iso, from_cur, to_cur)]
         # 倒退找最近（最多 7 天）
@@ -590,7 +598,7 @@ def get_portfolio_trend(
             nd = (d - timedelta(days=k)).isoformat()
             if (nd, from_cur, to_cur) in fx_map:
                 return fx_map[(nd, from_cur, to_cur)]
-        # 最后兜底：用最新汇率
+        # 兜底：用最新汇率（云端只有当日 1 条）
         if (from_cur, to_cur) in latest_fx:
             return latest_fx[(from_cur, to_cur)][1]
         return 1.0

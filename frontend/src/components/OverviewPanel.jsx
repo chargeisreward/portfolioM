@@ -102,7 +102,35 @@ export default function OverviewPanel() {
             }],
           })
         }
-  }, [currency])
+        if (trendRef.current && trendData.length > 0) {
+          const c = echarts.init(trendRef.current)
+          c.setOption({
+            tooltip: { trigger: 'axis' },
+            grid: { left: 60, right: 16, top: 20, bottom: 30 },
+            xAxis: {
+              type: 'category',
+              data: trendData.map(p => p.date),
+              axisLine: { lineStyle: { color: 'rgba(255,255,255,0.1)' } },
+              axisLabel: { color: '#5a6a8a', fontSize: 10, fontFamily: '"GeistMono", monospace' },
+            },
+            yAxis: {
+              type: 'value',
+              axisLabel: { color: '#5a6a8a', fontSize: 10, fontFamily: '"GeistMono", monospace', formatter: v => (v/10000).toFixed(0) + '万' },
+              splitLine: { lineStyle: { color: 'rgba(255,255,255,0.05)' } },
+            },
+            series: [{
+              type: 'line',
+              data: trendData.map(p => Math.round(p.value)),
+              smooth: true,
+              showSymbol: false,
+              lineStyle: { color: '#4a7cf7', width: 2 },
+              areaStyle: { color: 'rgba(74,124,247,0.1)' },
+            }],
+          })
+        }
+      }, 100)
+    })
+  }, [currency, trendData])
 
   // 趋势图独立 useEffect（依赖 trendData / currency）
   useEffect(() => {

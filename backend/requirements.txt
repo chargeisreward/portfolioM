@@ -13,3 +13,4 @@ apscheduler==3.10.4
 numpy==1.26.4
 pandas==2.2.2
 psycopg[binary]==3.2.3
+chinese-calendar==1.11.0

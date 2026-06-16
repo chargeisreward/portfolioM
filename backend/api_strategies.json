@@ -98,6 +98,18 @@
       "rate_limit": "未知",
       "data_type": "指数成分股 HTML 解析",
       "covers": ["指数成分股 fallback"]
+    },
+    {
+      "id": "trading_calendar",
+      "name": "主要市场交易日历 (CN/HK/US)",
+      "type": "基础",
+      "module": "services/trading_calendar.py",
+      "function": "is_trading_day / populate_market / get_range / get_month / expected_trading_dates / is_any_market_open_today",
+      "endpoints": ["chinese-calendar pip (SSE/SZSE)", "HKEx 公开 holiday schedule", "NYSE 公开 holiday schedule"],
+      "auth": "无需",
+      "rate_limit": "本地库 + 静态 dict，零网络调用",
+      "data_type": "2020-2030 交易日 / 节假日元数据",
+      "covers": ["CN(A股)", "HK(港股)", "US(美股)", "OF(场外基金)"]
     }
   ]
 }

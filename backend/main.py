@@ -299,6 +299,20 @@ def startup():
     init_db()
     from services.scheduler import start_scheduler
     start_scheduler()
+    # 初始化交易日历（CN/HK/US 2020-2030），失败不阻塞启动
+    try:
+        from database import SessionLocal
+        from services.trading_calendar import populate_market
+        db = SessionLocal()
+        try:
+            populate_market("CN", 2020, 2030, db)
+            populate_market("HK", 2020, 2030, db)
+            populate_market("US", 2020, 2030, db)
+        finally:
+            db.close()
+    except Exception as e:
+        import logging
+        logging.getLogger(__name__).warning("calendar init failed (non-fatal): %s", e)
 
 
 @app.on_event("shutdown")
@@ -639,6 +653,7 @@ def get_portfolio_trend(
             skipped.append(h.security_code)
 
     # 7. 对每个日期算总值（使用 last-known backward-fill，不是 forward-fill 编造）
+    from services.trading_calendar import is_trading_day
     series = []
     for d_iso in all_dates:
         total = 0.0
@@ -650,7 +665,13 @@ def get_portfolio_trend(
             cur = h.currency or "CNY"
             fx = get_fx(d_iso, cur, target)
             total += (h.quantity or 0) * px * fx
-        series.append({"date": d_iso, "value": round(total, 2)})
+        # 标注该日是否为交易日（任一持仓所属市场开市即视为交易日；周末/节假日为 false）
+        try:
+            d_obj = date.fromisoformat(d_iso)
+            is_td = is_trading_day("CN", d_obj, db) or is_trading_day("HK", d_obj, db) or is_trading_day("US", d_obj, db)
+        except Exception:
+            is_td = True
+        series.append({"date": d_iso, "value": round(total, 2), "is_trading": is_td})
 
     return {
         "series": series,
@@ -667,6 +688,73 @@ def admin_backfill_gaps(days: int = 90):
     """手动触发 90 天历史价完整性检查 + 补缺任务"""
     from services.scheduler import job_backfill_gaps
     return job_backfill_gaps(days)
+
+
+# ==================== 交易日历 ====================
+
+@app.get("/api/calendar")
+def calendar_range(
+    market: str = Query("CN"),
+    start: str = Query(..., description="YYYY-MM-DD"),
+    end: str = Query(..., description="YYYY-MM-DD"),
+    db: Session = Depends(get_db),
+):
+    """区间查询某市场的开/休市状态（自动惰性补齐缺失日期）"""
+    from services.trading_calendar import get_range
+    from datetime import date as date_cls
+    try:
+        s = date_cls.fromisoformat(start)
+        e = date_cls.fromisoformat(end)
+    except ValueError:
+        return {"error": "start/end must be YYYY-MM-DD"}
+    return {"market": market, "start": start, "end": end, "days": get_range(market, s, e, db)}
+
+
+@app.get("/api/calendar/is-trading")
+def calendar_is_trading(
+    market: str = Query("CN"),
+    date: str = Query(..., description="YYYY-MM-DD"),
+    db: Session = Depends(get_db),
+):
+    """单日判断"""
+    from services.trading_calendar import is_trading_day
+    from datetime import date as date_cls
+    try:
+        d = date_cls.fromisoformat(date)
+    except ValueError:
+        return {"error": "date must be YYYY-MM-DD"}
+    is_t = is_trading_day(market, d, db)
+    return {"market": market, "date": date, "is_trading": is_t}
+
+
+@app.get("/api/calendar/month")
+def calendar_month(
+    market: str = Query("CN"),
+    year: int = Query(2026),
+    month: int = Query(1, ge=1, le=12),
+    db: Session = Depends(get_db),
+):
+    """取整月日历（6×7 网格用）+ 汇总"""
+    from services.trading_calendar import get_month
+    return get_month(market, year, month, db)
+
+
+@app.get("/api/calendar/summary")
+def calendar_summary(
+    market: str = Query("CN"),
+    year: int = Query(2026),
+    db: Session = Depends(get_db),
+):
+    """全年汇总：交易日 / 节假日 / 周末"""
+    from services.trading_calendar import get_range
+    from datetime import date as date_cls
+    start = date_cls(year, 1, 1)
+    end = date_cls(year, 12, 31)
+    rows = get_range(market, start, end, db)
+    trading = sum(1 for r in rows if r["is_trading"])
+    holiday = sum(1 for r in rows if not r["is_trading"] and date_cls.fromisoformat(r["date"]).weekday() < 5)
+    weekend = sum(1 for r in rows if date_cls.fromisoformat(r["date"]).weekday() >= 5)
+    return {"market": market, "year": year, "trading": trading, "holiday": holiday, "weekend": weekend, "total": len(rows)}
 
 
 @app.post("/api/admin/backfill-prices")
@@ -688,9 +776,13 @@ def admin_backfill_prices(days: int = 90, db: Session = Depends(get_db)):
         results = []
         cutoff = date.today() - timedelta(days=days)
 
+        # 日历过滤：按 holding 所属市场决定是否接受该日期
+        from services.trading_calendar import is_trading_day, _market_for_code
+
         for h in holdings:
             code = h.security_code
             is_fund = code.endswith(".OF")
+            market = _market_for_code(code)
 
             try:
                 if is_fund:
@@ -711,6 +803,12 @@ def admin_backfill_prices(days: int = 90, db: Session = Depends(get_db)):
                     continue
                 if d < cutoff:
                     continue
+                # 日历过滤：非交易日不写入（OF 基金的 akshare 数据落库时通过 is_trading_day 自身惰性持久化）
+                try:
+                    if not is_trading_day(market, d, db):
+                        continue
+                except Exception:
+                    pass  # 日历失败不阻塞写入
                 try:
                     exists = db.query(PriceCache).filter(
                         PriceCache.stock_code == code,

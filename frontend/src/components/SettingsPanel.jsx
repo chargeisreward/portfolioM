@@ -1,6 +1,6 @@
 import React, { useState } from 'react'
 import * as api from '../api'
-import StyleGallery from './StyleGallery'
+import TradingCalendarView from './TradingCalendarView'
 
 export default function SettingsPanel() {
   const [curPwd, setCurPwd] = useState('')
@@ -48,7 +48,7 @@ export default function SettingsPanel() {
       </div>
 
       <div className="raised" style={{marginBottom:16}}>
-        <StyleGallery />
+        <TradingCalendarView />
       </div>
 
       <div className="raised">

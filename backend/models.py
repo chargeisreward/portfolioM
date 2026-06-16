@@ -1,6 +1,6 @@
 """SQLAlchemy ORM models for PortfolioM"""
 from datetime import date, datetime
-from sqlalchemy import Column, Integer, Float, String, Date, DateTime, Text, JSON
+from sqlalchemy import Column, Integer, Float, String, Date, DateTime, Text, JSON, Boolean, UniqueConstraint
 from database import Base
 import enum
 
@@ -268,3 +268,21 @@ class Watchlist(Base):
     industry = Column(String(50), nullable=True)       # 行业（首次添加时拉取）
     weight = Column(Float, default=5.0)                # 用户设定的权重 %
     added_at = Column(DateTime, default=datetime.utcnow)
+
+
+# ---------- 交易日历 ----------
+
+class TradingCalendar(Base):
+    """各主要市场交易日历。CN=沪深(共用)、HK=港交所、US=NYSE/NASDAQ、OF=场外基金。
+    来源：CN 来自 chinese-calendar 库；HK/US 来自官方公开 holiday schedule 静态表。
+    is_trading=False 表示周末或法定节假日。"""
+    __tablename__ = "trading_calendar"
+    __table_args__ = (UniqueConstraint('market', 'date', name='ux_trading_calendar_market_date'),)
+
+    id = Column(Integer, primary_key=True, autoincrement=True)
+    market = Column(String(8), nullable=False, index=True)     # CN | HK | US | OF
+    date = Column(Date, nullable=False, index=True)
+    is_trading = Column(Boolean, nullable=False)              # True=开市；False=休市（周末/节假日）
+    source = Column(String(40), nullable=False)               # chinese_calendar / hkex_static / nyse_static / akshare / fallback
+    note = Column(String(100), nullable=True)                  # 节假日名（国庆/Thanksgiving/...）
+    created_at = Column(DateTime, default=datetime.utcnow)

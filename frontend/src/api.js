@@ -72,6 +72,10 @@ export const updateTableRow = (table, pkCol, pkVal, body) => api.put(`/data-brow
 // Strategies (API 策略页面)
 export const getStrategies = () => api.get('/strategies').then(r => r.data)
 
+// Trading calendar
+export const getCalendarMonth = (market, year, month) => api.get('/calendar/month', { params: { market, year, month } }).then(r => r.data)
+export const getCalendarRange = (market, start, end) => api.get('/calendar', { params: { market, start, end } }).then(r => r.data)
+
 // Trend
 export const getTrend = (days = 90, target = 'CNY') => api.get('/trend', { params: { days, target } }).then(r => r.data)
 

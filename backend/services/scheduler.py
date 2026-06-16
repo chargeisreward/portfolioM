@@ -59,6 +59,7 @@ def job_fetch_realtime_prices(force: bool = False):
         from crawlers.price_data import fetch_tencent_quote
         from crawlers.exchange_rates import get_rate
         from services.importer import _fetch_fund_nav
+        from services.trading_calendar import is_any_market_open_today
 
         holdings = db.query(Holding).all()
         if not holdings:
@@ -66,6 +67,15 @@ def job_fetch_realtime_prices(force: bool = False):
             return
 
         today = date.today()
+        # 日历门控：今日无任何市场开市（CN/HK/US）→ 跳过（force 强制仍跑）
+        if not force:
+            try:
+                if not is_any_market_open_today(db):
+                    logger.info("今日全市场休市（日历），跳过实时拉取")
+                    return
+            except Exception as e:
+                logger.warning("日历门控失败，继续执行: %s", e)
+
         updated = 0
 
         for h in holdings:
@@ -292,33 +302,40 @@ def job_update_industry_crawler_data():
 
 # ---------- 任务4：90 天历史价完整性检查 + 补缺 ----------
 
-def _expected_trading_dates(days: int) -> list:
-    """生成过去 N 天的预期交易日列表（简化：每个工作日）"""
+def _expected_trading_dates_legacy(days: int) -> list:
+    """兜底：按 Mon-Fri 生成预期交易日（日历表为空时降级）"""
     from datetime import timedelta
     out = []
     today = date.today()
     for k in range(days + 1):
         d = today - timedelta(days=k)
-        if d.weekday() < 5:  # 周一到周五
+        if d.weekday() < 5:
             out.append(d)
     return out
 
 
 def job_backfill_gaps(days: int = 90):
     """检查所有 holding 过去 N 天的 price_cache 完整性，缺哪补哪。
-    每个 (code, date) 若缺失就拉历史价补上。"""
+    使用交易日历（按 holding 所属市场）判断应补哪些日期。"""
     db: Session = SessionLocal()
     try:
         from crawlers.price_data import fetch_price_history
+        from services.trading_calendar import expected_trading_dates, _market_for_code
 
         holdings = db.query(Holding).all()
-        expected_dates = set(_expected_trading_dates(days))
         results = []
         filled_total = 0
 
         for h in holdings:
             code = h.security_code
             try:
+                # 该 holding 所属市场的预期交易日（按日历）
+                mkt = _market_for_code(code)
+                try:
+                    expected = set(expected_trading_dates(mkt, days, db))
+                except Exception:
+                    expected = set(_expected_trading_dates_legacy(days))
+
                 # 已有日期集合
                 existing = set(
                     row[0] for row in
@@ -327,7 +344,7 @@ def job_backfill_gaps(days: int = 90):
                     .all()
                 )
                 # 缺哪些日期
-                missing = expected_dates - existing
+                missing = expected - existing
                 if not missing:
                     results.append({"code": code, "status": "complete"})
                     continue
@@ -368,7 +385,7 @@ def job_backfill_gaps(days: int = 90):
                 if written:
                     db.commit()
                 filled_total += written
-                results.append({"code": code, "status": "ok", "missing": len(missing), "filled": written})
+                results.append({"code": code, "status": "ok", "missing": len(missing), "filled": written, "market": mkt})
             except Exception as e:
                 results.append({"code": code, "status": "error", "error": str(e)[:100]})
                 continue

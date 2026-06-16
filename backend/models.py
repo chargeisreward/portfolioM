@@ -286,3 +286,24 @@ class TradingCalendar(Base):
     source = Column(String(40), nullable=False)               # chinese_calendar / hkex_static / nyse_static / akshare / fallback
     note = Column(String(100), nullable=True)                  # 节假日名（国庆/Thanksgiving/...）
     created_at = Column(DateTime, default=datetime.utcnow)
+
+
+# ---------- API 代码映射 ----------
+
+class ApiCodeMap(Base):
+    """不同 API 拉取同一证券时进行的代码转换。
+    code_in = 持仓里写法的标准 code（如 'NVDA'、'159326.SZ'、'006829.OF'）
+    api_strategy = API 策略 id（tencent_kline / tencent_quote / akshare_fund_nav / ...）
+    code_out = 该 API 实际调用时用的 code（如 'usNVDA.OQ'、'006829'）
+    """
+    __tablename__ = "api_code_map"
+    __table_args__ = (UniqueConstraint('code_in', 'api_strategy', name='ux_api_code_map_in_api'),)
+
+    id = Column(Integer, primary_key=True, autoincrement=True)
+    code_in = Column(String(30), nullable=False, index=True)   # 标准代码（持仓写法）
+    api_strategy = Column(String(40), nullable=False, index=True)  # API 策略 id
+    code_out = Column(String(60), nullable=False)              # 该 API 调用时用的代码
+    market = Column(String(8), nullable=True, index=True)      # CN/HK/US/OF（统计用）
+    note = Column(String(200), nullable=True)
+    created_at = Column(DateTime, default=datetime.utcnow)
+    updated_at = Column(DateTime, default=datetime.utcnow, onupdate=datetime.utcnow)

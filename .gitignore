@@ -23,6 +23,7 @@ build/
 *.sqlite
 *.sqlite3
 backend/data/
+sourceData/
 .env
 .env.local
 .env.*.local
@@ -30,6 +31,7 @@ backend/data/
 # Local secrets (per localsecrets/DEPLOY_LOCAL_GUIDE.md)
 local_secrets/
 zeabur_cli/
+backend/scripts/pull_from_zeabur.py
 
 # OS
 .DS_Store

@@ -34,6 +34,7 @@ export default function OverviewPanel() {
   const [trendData, setTrendData] = useState([])
   const [trendTotal, setTrendTotal] = useState(null)
   const [trendDays, setTrendDays] = useState(90)
+  const [trendView, setTrendView] = useState('return')  // 'return' = 收益率%, 'value' = 资产净值
   const [trendReturn, setTrendReturn] = useState(null)  // {pct, abs} over the window
   const [sortKey, setSortKey] = useState('amount')
   const [sortDir, setSortDir] = useState('desc')
@@ -68,22 +69,27 @@ export default function OverviewPanel() {
     })
   }, [holdingsLocal, allHoldings])
 
-  // 资产走势（90/180/360 天可切换）
+  // 资产走势（90/180/360 天可切换，曲线=累计收益率%）
   useEffect(() => {
     api.getTrend(trendDays, currency).then(d => {
       const series = d?.series || []
       setTrendData(series)
-      if (series.length >= 2) {
-        const first = series[0].value
+      if (series.length >= 1) {
+        const t0 = series[0].value
         const last = series[series.length - 1].value
         setTrendTotal(last)
-        setTrendReturn({
-          pct: first > 0 ? (last - first) / first * 100 : null,
-          abs: last - first,
-        })
-      } else if (series.length === 1) {
-        setTrendTotal(series[0].value)
-        setTrendReturn({ pct: null, abs: 0 })
+        if (t0 > 0) {
+          // 每日累计收益率 %（t0 = 0%）
+          const ret = (last - t0) / t0 * 100
+          setTrendReturn({
+            pct: ret,
+            abs: last - t0,
+            t0,
+            returnPctSeries: series.map(p => ((p.value - t0) / t0 * 100)),
+          })
+        } else {
+          setTrendReturn({ pct: 0, abs: 0, t0: 0, returnPctSeries: series.map(() => 0) })
+        }
       } else {
         setTrendTotal(null)
         setTrendReturn(null)
@@ -140,35 +146,72 @@ export default function OverviewPanel() {
             }],
           })
         }
-        if (trendRef.current && trendData.length > 0) {
-          const c = echarts.init(trendRef.current)
-          c.setOption({
-            tooltip: { trigger: 'axis' },
-            grid: { left: 60, right: 16, top: 20, bottom: 30 },
-            xAxis: {
-              type: 'category',
-              data: trendData.map(p => p.date),
-              axisLine: { lineStyle: { color: 'rgba(255,255,255,0.1)' } },
-              axisLabel: { color: '#5a6a8a', fontSize: 10, fontFamily: '"GeistMono", monospace' },
-            },
-            yAxis: {
-              type: 'value',
-              axisLabel: { color: '#5a6a8a', fontSize: 10, fontFamily: '"GeistMono", monospace', formatter: v => (v/10000).toFixed(0) + '万' },
-              splitLine: { lineStyle: { color: 'rgba(255,255,255,0.05)' } },
-            },
-            series: [{
-              type: 'line',
-              data: trendData.map(p => Math.round(p.value)),
-              smooth: true,
-              showSymbol: false,
-              lineStyle: { color: '#4a7cf7', width: 2 },
-              areaStyle: { color: 'rgba(74,124,247,0.1)' },
-            }],
-          })
-        }
+        // trend chart 抽到独立 useEffect（避免被其他 API 阻塞）
       }, 100)
     })
-  }, [currency, trendData])
+  }, [currency, trendData, trendView])
+
+  // trend chart 独立渲染：只依赖 trendData / trendReturn / trendView / currency，立即生效
+  useEffect(() => {
+    if (!trendRef.current || trendData.length === 0 || !trendReturn) return
+    const pctSeries = trendReturn.returnPctSeries || []
+    const valueSeries = trendData.map(p => p.value)
+    const lastPct = pctSeries.length ? pctSeries[pctSeries.length - 1] : 0
+    const lineColor = trendView === 'return'
+      ? (lastPct >= 0 ? '#4caf7c' : '#e45a5a')
+      : '#4a7cf7'
+    const chartData = trendView === 'return'
+      ? pctSeries.map(v => Number(v.toFixed(3)))
+      : valueSeries.map(v => Math.round(v))
+    const yFormatter = trendView === 'return'
+      ? v => (v >= 0 ? '+' : '') + v.toFixed(1) + '%'
+      : v => (v / 10000).toFixed(0) + '万'
+    const valuePrefix = getCurrencySymbol(currency)
+    // 复用已有 instance（避免每次 init）
+    let c = echarts.getInstanceByDom(trendRef.current)
+    if (!c) c = echarts.init(trendRef.current)
+    c.setOption({
+      tooltip: {
+        trigger: 'axis',
+        formatter: (params) => {
+          const p = params[0]
+          const idx = p.dataIndex
+          const abs = trendData[idx].value
+          const pct = pctSeries[idx]
+          const sign = pct >= 0 ? '+' : ''
+          return `${p.axisValue}<br/>` +
+                 `<span style="color:#4caf7c">${sign}${pct.toFixed(2)}%</span><br/>` +
+                 `<span style="color:#888">${valuePrefix}${Math.round(abs).toLocaleString('en-US')}</span>`
+        },
+      },
+      grid: { left: 60, right: 16, top: 20, bottom: 30 },
+      xAxis: {
+        type: 'category',
+        data: trendData.map(p => p.date),
+        axisLine: { lineStyle: { color: 'rgba(255,255,255,0.1)' } },
+        axisLabel: { color: '#5a6a8a', fontSize: 10, fontFamily: '"GeistMono", monospace' },
+      },
+      yAxis: {
+        type: 'value',
+        axisLabel: { color: '#5a6a8a', fontSize: 10, fontFamily: '"GeistMono", monospace', formatter: yFormatter },
+        splitLine: { lineStyle: { color: 'rgba(255,255,255,0.05)' } },
+      },
+      series: [{
+        type: 'line',
+        data: chartData,
+        smooth: true,
+        showSymbol: false,
+        lineStyle: { color: lineColor, width: 2 },
+        areaStyle: { color: lineColor + '22' },
+        markLine: trendView === 'return' ? {
+          silent: true,
+          symbol: 'none',
+          lineStyle: { color: 'rgba(255,255,255,0.2)', type: 'dashed' },
+          data: [{ yAxis: 0, label: { show: false } }],
+        } : undefined,
+      }],
+    })  // 关 c.setOption({...}) 调用
+  }, [trendData, trendReturn, trendView, currency])
 
   const topHoldings = penTable.slice(0, 10)
 
@@ -243,10 +286,10 @@ export default function OverviewPanel() {
         </span>
       </div>
 
-      {/* 资产走势 (90 / 180 / 360 天可切换) */}
+      {/* 资产走势 (90 / 180 / 360 天 + 资产净值/收益率 切换) */}
       <div className="raised" style={{ padding: 0, overflow: 'hidden' }}>
         <div style={{ padding: '8px 12px', display: 'flex', justifyContent: 'space-between', alignItems: 'center', flexWrap: 'wrap', gap: 8 }}>
-          <div style={{ display: 'flex', alignItems: 'center', gap: 8 }}>
+          <div style={{ display: 'flex', alignItems: 'center', gap: 8, flexWrap: 'wrap' }}>
             <div className="section-title" style={{ marginBottom: 0 }}>资产走势</div>
             {/* 90 / 180 / 360 标签式切换 */}
             <div style={{ display: 'flex', gap: 2 }}>
@@ -259,22 +302,43 @@ export default function OverviewPanel() {
                 </button>
               ))}
             </div>
+            {/* 资产净值 / 收益率 切换 */}
+            <div style={{ display: 'flex', gap: 2, marginLeft: 4 }}>
+              <button
+                onClick={() => setTrendView('value')}
+                className={trendView === 'value' ? 'cur-btn on' : 'cur-btn'}
+                style={{ fontSize: 10, padding: '2px 8px' }}
+                title="Y 轴显示资产净值（绝对值）">
+                资产净值
+              </button>
+              <button
+                onClick={() => setTrendView('return')}
+                className={trendView === 'return' ? 'cur-btn on' : 'cur-btn'}
+                style={{ fontSize: 10, padding: '2px 8px' }}
+                title="Y 轴显示累计收益率%（t0=0%）">
+                收益率
+              </button>
+            </div>
           </div>
           <div style={{ display: 'flex', alignItems: 'center', gap: 12, fontFamily: '"GeistMono", monospace' }}>
-            {/* 收益率标签 */}
-            {trendReturn && trendReturn.pct != null && (
-              <span style={{
-                fontSize: 12, fontWeight: 600,
-                color: trendReturn.pct >= 0 ? 'var(--chart-up)' : 'var(--chart-down)',
-              }}>
-                {trendReturn.pct >= 0 ? '+' : ''}{trendReturn.pct.toFixed(2)}%
-              </span>
-            )}
-            {/* 当前资产价值标签 */}
-            <span style={{ fontSize: 11, color: 'var(--text-muted)' }}>
+            {/* 累计收益率标签（始终显示） */}
+            <span style={{
+              fontSize: 13, fontWeight: 700,
+              color: trendReturn
+                ? (trendReturn.pct >= 0 ? 'var(--chart-up)' : 'var(--chart-down)')
+                : 'var(--text-muted)',
+              minWidth: 64, textAlign: 'right',
+            }} title="累计收益率（自 t0 起）">
+              {trendReturn
+                ? `${trendReturn.pct >= 0 ? '+' : ''}${trendReturn.pct.toFixed(2)}%`
+                : '—'}
+            </span>
+            <span style={{ width: 1, height: 14, background: 'var(--border)' }} />
+            {/* 当前资产价值标签（始终显示） */}
+            <span style={{ fontSize: 11, color: 'var(--text-muted)' }} title="当前资产价值">
               {trendTotal != null
                 ? getCurrencySymbol(currency) + Math.round(trendTotal).toLocaleString('en-US')
-                : '加载中…'}
+                : '—'}
             </span>
           </div>
         </div>

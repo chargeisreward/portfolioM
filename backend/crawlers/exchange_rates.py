@@ -61,8 +61,14 @@ def fetch_pboc_rates(target_date: date | None = None) -> Dict[str, float]:
 
 
 def update_rates_today(db: Session) -> int:
-    """Fetch today's rates and save to DB. Returns count of records updated."""
+    """Fetch today's rates and save to DB. Returns count of records updated.
+    当日已有则直接 skip（避免重复拉 PBoC 接口耗 17s）。"""
     today = date.today()
+    # 快速路径：当日已存在则直接返回
+    existing_count = db.query(ExchangeRate).filter(ExchangeRate.rate_date == today).count()
+    if existing_count >= 2:  # USD→CNY + HKD→CNY
+        return existing_count
+
     rates = fetch_pboc_rates(today)
     count = 0
 

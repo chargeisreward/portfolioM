@@ -25,6 +25,16 @@ def fetch_tencent_quote(ticker: str) -> dict | None:
     从腾讯财经 API 获取实时行情。
     返回 {price, pe_ttm, market_cap, name, industry, ...}
     """
+    # 优先用 DB 映射表（api_code_map.tencent_quote）
+    from services.code_map import transform_code
+    from database import SessionLocal
+    db = SessionLocal()
+    try:
+        mapped = transform_code(ticker, "tencent_quote", db)
+    finally:
+        db.close()
+    if mapped:
+        ticker = mapped
     # Format ticker for Tencent API
     tencent_code = _to_tencent_ticker(ticker)
     if not tencent_code:
@@ -73,6 +83,11 @@ def fetch_tencent_quote(ticker: str) -> dict | None:
 def _to_tencent_ticker(ticker: str) -> str | None:
     """Convert standard ticker to Tencent API format"""
     t = ticker.upper().strip()
+    raw = ticker.strip()
+
+    # passthrough：已经被 transform_code 转过的格式（usNVDA.OQ / sh600519）
+    if raw.startswith(("sh", "sz", "hk", "us")) and len(raw) > 3:
+        return raw
 
     # US stocks: just usNVDA (exchange suffix breaks the API)
     if t in ("GOOGL", "NVDA", "INTC", "SNDK", "AMD", "AAPL", "MSFT", "AMZN", "TSLA", "QQQ"):
@@ -108,6 +123,16 @@ def fetch_tencent_kline(ticker: str, days: int = 365) -> list[dict]:
     返回 [{date, open, close, high, low, volume}, ...]
     注：A股/港股走 qfqday 字段；美股走 day 字段。
     """
+    # 优先用 DB 映射表（api_code_map.tencent_kline）
+    from services.code_map import transform_code
+    from database import SessionLocal
+    db = SessionLocal()
+    try:
+        mapped = transform_code(ticker, "tencent_kline", db)
+    finally:
+        db.close()
+    if mapped:
+        ticker = mapped
     kline_ticker = _to_kline_ticker(ticker)
     if not kline_ticker:
         return _fetch_yfinance_kline(ticker, days)
@@ -162,19 +187,31 @@ _TENCENT_US_EXCHANGE_SUFFIX = {
 def _to_kline_ticker(ticker: str) -> str | None:
     """Convert to Tencent K-line ticker format.
     美股必须加交易所后缀 (.OQ/.N/.AM) 才能拿到完整 K 线，否则只返回 1 天。
-    A股/港股无后缀（sh/sz/hk + 6/5 位数字）。"""
+    A股/港股无后缀（sh/sz/hk + 6/5 位数字）。
+    已转换格式 (usNVDA.OQ / sh600519) 直接 passthrough。"""
     t = ticker.upper().strip()
-    # 美股：加交易所后缀
+    raw = ticker.strip()
+    # 1. passthrough：已经被 transform_code 转过的格式
+    if raw.startswith(("sh", "sz", "hk", "us")) and len(raw) > 3:
+        return raw
+    # 2. 美股：加交易所后缀
     if t in _TENCENT_US_EXCHANGE_SUFFIX:
         return f"us{t}{_TENCENT_US_EXCHANGE_SUFFIX[t]}"
-    # A 股：6 位数字 + .SH/.SZ 后缀
+    # 3. A 股：6 位数字 + .SH/.SZ 后缀
     if t.endswith(".SH") and t[:-3].isdigit() and len(t[:-3]) == 6:
         return f"sh{t[:-3]}"
     if t.endswith(".SZ") and t[:-3].isdigit() and len(t[:-3]) == 6:
         return f"sz{t[:-3]}"
-    # 港股：5 位数字 + .HK
+    # 4. 港股：5 位数字 + .HK
     if t.endswith(".HK") and t[:-3].isdigit() and len(t[:-3]) == 5:
         return f"hk{t[:-3]}"
+    # 5. 纯 6 位数字
+    if t.isdigit() and len(t) == 6:
+        prefix = "sh" if t.startswith(("5", "6")) else "sz"
+        return prefix + t
+    # 6. 纯 5 位数字 → 港股
+    if t.isdigit() and len(t) == 5:
+        return "hk" + t
     # OF 基金不在腾讯 K 线，保留 None 走 yfinance/akshare
     return None
 

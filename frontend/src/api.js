@@ -76,6 +76,9 @@ export const getStrategies = () => api.get('/strategies').then(r => r.data)
 export const getCalendarMonth = (market, year, month) => api.get('/calendar/month', { params: { market, year, month } }).then(r => r.data)
 export const getCalendarRange = (market, start, end) => api.get('/calendar', { params: { market, start, end } }).then(r => r.data)
 
+// API code map
+export const getCodeMaps = (api) => api.get('/code-map', { params: api ? { api } : {} }).then(r => r.data)
+
 // Trend
 export const getTrend = (days = 90, target = 'CNY') => api.get('/trend', { params: { days, target } }).then(r => r.data)
 

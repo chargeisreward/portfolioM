@@ -132,9 +132,18 @@ def fetch_fund_nav_history(fund_code: str, days: int = 90) -> list[dict]:
     from datetime import timedelta
 
     def _try(indicator: str, value_col: str) -> list[dict]:
+        # 优先用 DB 映射表（api_code_map.akshare_fund_nav）
+        from services.code_map import transform_code
+        from database import SessionLocal
+        db = SessionLocal()
+        try:
+            mapped = transform_code(fund_code, "akshare_fund_nav", db)
+        finally:
+            db.close()
+        effective = mapped if mapped else fund_code
         try:
             import akshare as ak
-            df = ak.fund_open_fund_info_em(symbol=fund_code, indicator=indicator)
+            df = ak.fund_open_fund_info_em(symbol=effective, indicator=indicator)
         except Exception:
             return []
         if df is None or df.empty:

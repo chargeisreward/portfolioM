@@ -110,6 +110,18 @@
       "rate_limit": "本地库 + 静态 dict，零网络调用",
       "data_type": "2020-2030 交易日 / 节假日元数据",
       "covers": ["CN(A股)", "HK(港股)", "US(美股)", "OF(场外基金)"]
+    },
+    {
+      "id": "api_code_map",
+      "name": "API 代码映射表",
+      "type": "基础",
+      "module": "services/code_map.py",
+      "function": "transform_code / populate_default_maps / list_maps / upsert_map",
+      "endpoints": ["GET /api/code-map", "POST /api/code-map", "DELETE /api/code-map/{code_in}/{api_strategy}"],
+      "auth": "无需",
+      "rate_limit": "内存缓存，零网络",
+      "data_type": "标准代码 → 各 API 调用代码的映射（如 NVDA → usNVDA.OQ）",
+      "covers": ["所有数据获取策略的前置转换"]
     }
   ]
 }

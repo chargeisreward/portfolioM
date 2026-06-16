@@ -2,12 +2,14 @@ import React, { useEffect, useState } from 'react'
 import * as api from '../api'
 
 /**
- * API 策略页面：列出所有数据源 + 限制 + 覆盖范围。
- * 数据源：api_strategies.json (manifest) + 实时扫描 backend 代码 (live hook)
+ * API 策略页面：列出所有数据源 + 限制 + 覆盖范围 + 代码映射表。
+ * 数据源：api_strategies.json (manifest) + 实时扫描 backend 代码 (live hook) + api_code_map 表
  */
 export default function StrategiesPanel() {
   const [manifest, setManifest] = useState({ strategies: [] })
   const [live, setLive] = useState({ sources: [], total: 0, scanned_at: '' })
+  const [codeMaps, setCodeMaps] = useState([])
+  const [filterApi, setFilterApi] = useState('')
   const [error, setError] = useState(null)
 
   useEffect(() => {
@@ -19,7 +21,16 @@ export default function StrategiesPanel() {
       .catch(e => setError('加载失败：' + (e?.message || e)))
   }, [])
 
+  useEffect(() => {
+    api.getCodeMaps(filterApi || undefined)
+      .then(d => setCodeMaps(d.items || []))
+      .catch(() => setCodeMaps([]))
+  }, [filterApi])
+
   const fileFunc = (s) => `${s.module.split('/').pop()} :: ${s.function}`
+
+  // distinct api_strategy values for filter
+  const distinctApis = [...new Set(codeMaps.map(m => m.api_strategy))].sort()
 
   return (
     <div>
@@ -119,6 +130,51 @@ export default function StrategiesPanel() {
           <li>汇率每日更新（scheduler.industry_crawler_data 任务 4）</li>
           <li>不使用任何 mock/种子数据 — 所有数据均为真实拉取</li>
         </ul>
+      </div>
+
+      {/* 代码映射表 */}
+      <div className="raised">
+        <div className="section-title">代码映射表 · {codeMaps.length} 条</div>
+        <div style={{ fontSize: 10, color: 'var(--text-muted)', marginBottom: 8 }}>
+          同一个证券在不同的 API 有不同的代码格式。本表统一标准代码 → 各 API 调用代码的转换。
+          所有 fetch 函数入口处先查本表。来源：<code style={{ fontFamily: '"GeistMono", monospace' }}>backend/api_code_map</code> 表 + 内置默认规则惰性持久化。
+        </div>
+        <div style={{ display: 'flex', gap: 4, flexWrap: 'wrap', marginBottom: 8, alignItems: 'center' }}>
+          <span style={{ fontSize: 11, color: 'var(--text-muted)', fontFamily: '"GeistMono", monospace', marginRight: 4 }}>API</span>
+          <button onClick={() => setFilterApi('')}
+            className={filterApi === '' ? 'cur-btn on' : 'cur-btn'} style={{ fontSize: 10 }}>全部</button>
+          {distinctApis.map(a => (
+            <button key={a} onClick={() => setFilterApi(a)}
+              className={filterApi === a ? 'cur-btn on' : 'cur-btn'} style={{ fontSize: 10 }}>{a}</button>
+          ))}
+        </div>
+        <table className="data-table">
+          <thead>
+            <tr>
+              <th>标准代码</th>
+              <th>API 策略</th>
+              <th>调用代码</th>
+              <th>市场</th>
+              <th>说明</th>
+            </tr>
+          </thead>
+          <tbody>
+            {codeMaps.map((m, i) => (
+              <tr key={`${m.code_in}-${m.api_strategy}-${i}`}>
+                <td style={{ fontFamily: '"GeistMono", monospace', fontSize: 11 }}>{m.code_in}</td>
+                <td style={{ fontFamily: '"GeistMono", monospace', fontSize: 10, color: 'var(--accent-primary)' }}>{m.api_strategy}</td>
+                <td style={{ fontFamily: '"GeistMono", monospace', fontSize: 11, color: 'var(--chart-up)' }}>{m.code_out}</td>
+                <td style={{ fontSize: 10, color: 'var(--text-muted)' }}>{m.market || '-'}</td>
+                <td style={{ fontSize: 10, color: 'var(--text-secondary)' }}>{m.note || '-'}</td>
+              </tr>
+            ))}
+            {codeMaps.length === 0 && (
+              <tr><td colSpan={5} style={{ textAlign: 'center', color: 'var(--text-muted)', fontSize: 11, padding: 12 }}>
+                暂无映射（empty）
+              </td></tr>
+            )}
+          </tbody>
+        </table>
       </div>
     </div>
   )

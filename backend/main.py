@@ -313,6 +313,18 @@ def startup():
     except Exception as e:
         import logging
         logging.getLogger(__name__).warning("calendar init failed (non-fatal): %s", e)
+    # 初始化 API 代码映射表（默认规则 + 现有 .OF 持仓），失败不阻塞
+    try:
+        from database import SessionLocal
+        from services.code_map import populate_default_maps
+        db = SessionLocal()
+        try:
+            populate_default_maps(db)
+        finally:
+            db.close()
+    except Exception as e:
+        import logging
+        logging.getLogger(__name__).warning("code_map init failed (non-fatal): %s", e)
 
 
 @app.on_event("shutdown")
@@ -556,7 +568,7 @@ def get_portfolio_trend(
     from datetime import date, timedelta
     from models import Holding, PriceCache, ExchangeRate
 
-    # 兜底：确保当日汇率存在（USD→CNY 转换必需）
+    # 兜底：仅当当日汇率缺失时才拉（update_rates_today 内部有 17s 的 PBoC 接口，频繁调很慢）
     try:
         from crawlers.exchange_rates import update_rates_today
         update_rates_today(db)
@@ -637,23 +649,32 @@ def get_portfolio_trend(
                 break
         return None
 
-    # 6. 跳过整只 holding 在 90 天内完全无价的情况（无法计算 → 不编造）
+    # 6. 跳过整只 holding 在窗口内完全无价的情况（无法计算 → 不编造）
+    # 优化：只看 pc_map 里是否有该 code 的任何价格，不再做 O(D×K) 双重 any
     eligible = []
     skipped = []
     for h in rows:
         cm = pc_map.get(h.security_code, {})
-        has_any = any(d_iso in cm for d_iso in all_dates) or any(
-            (date.fromisoformat(d_iso) - timedelta(days=k)).isoformat() in cm
-            for d_iso in all_dates
-            for k in range(1, days + 5)
-        )
-        if has_any:
+        if cm:
             eligible.append(h)
         else:
             skipped.append(h.security_code)
 
     # 7. 对每个日期算总值（使用 last-known backward-fill，不是 forward-fill 编造）
     from services.trading_calendar import is_trading_day
+    # 预计算每个日期的 is_trading（避免 255 日 × 3 市场 = 765 次 DB 调用）
+    is_td_cache: dict[str, bool] = {}
+    for d_iso in all_dates:
+        try:
+            d_obj = date.fromisoformat(d_iso)
+            is_td_cache[d_iso] = (
+                is_trading_day("CN", d_obj, db)
+                or is_trading_day("HK", d_obj, db)
+                or is_trading_day("US", d_obj, db)
+            )
+        except Exception:
+            is_td_cache[d_iso] = True
+
     series = []
     for d_iso in all_dates:
         total = 0.0
@@ -665,13 +686,7 @@ def get_portfolio_trend(
             cur = h.currency or "CNY"
             fx = get_fx(d_iso, cur, target)
             total += (h.quantity or 0) * px * fx
-        # 标注该日是否为交易日（任一持仓所属市场开市即视为交易日；周末/节假日为 false）
-        try:
-            d_obj = date.fromisoformat(d_iso)
-            is_td = is_trading_day("CN", d_obj, db) or is_trading_day("HK", d_obj, db) or is_trading_day("US", d_obj, db)
-        except Exception:
-            is_td = True
-        series.append({"date": d_iso, "value": round(total, 2), "is_trading": is_td})
+        series.append({"date": d_iso, "value": round(total, 2), "is_trading": is_td_cache.get(d_iso, True)})
 
     return {
         "series": series,
@@ -755,6 +770,52 @@ def calendar_summary(
     holiday = sum(1 for r in rows if not r["is_trading"] and date_cls.fromisoformat(r["date"]).weekday() < 5)
     weekend = sum(1 for r in rows if date_cls.fromisoformat(r["date"]).weekday() >= 5)
     return {"market": market, "year": year, "trading": trading, "holiday": holiday, "weekend": weekend, "total": len(rows)}
+
+
+# ==================== API 代码映射表 ====================
+
+@app.get("/api/code-map")
+def code_map_list(
+    api: str | None = Query(None, description="按 API 策略过滤（可选）"),
+    db: Session = Depends(get_db),
+):
+    """列出所有代码映射。可选 ?api=tencent_kline 过滤。"""
+    from services.code_map import list_maps
+    rows = list_maps(db, api_strategy=api)
+    return {"count": len(rows), "items": rows}
+
+
+class CodeMapUpsert(BaseModel):
+    code_in: str
+    api_strategy: str
+    code_out: str
+    market: str | None = None
+    note: str | None = None
+
+
+@app.post("/api/code-map")
+def code_map_upsert(body: CodeMapUpsert, db: Session = Depends(get_db)):
+    """新增 / 更新一条代码映射。"""
+    from services.code_map import upsert_map
+    return upsert_map(db, body.code_in, body.api_strategy, body.code_out, body.market, body.note)
+
+
+@app.delete("/api/code-map/{code_in}/{api_strategy}")
+def code_map_delete(code_in: str, api_strategy: str, db: Session = Depends(get_db)):
+    """删除一条代码映射。"""
+    from services.code_map import delete_map
+    ok = delete_map(db, code_in, api_strategy)
+    if not ok:
+        return {"status": "error", "message": "not found"}
+    return {"status": "ok"}
+
+
+@app.post("/api/admin/init-code-map")
+def admin_init_code_map(db: Session = Depends(get_db)):
+    """手动触发：重新初始化默认代码映射（保留已有，覆盖默认集合）。"""
+    from services.code_map import populate_default_maps
+    n = populate_default_maps(db)
+    return {"status": "ok", "new_rows": n}
 
 
 @app.post("/api/admin/backfill-prices")

@@ -6,6 +6,7 @@ import TradingPanel from './components/TradingPanel'
 import WatchPanel from './components/WatchPanel'
 import SettingsPanel from './components/SettingsPanel'
 import DataBrowser from './components/DataBrowser'
+import StrategiesPanel from './components/StrategiesPanel'
 import AuthGate from './components/AuthGate'
 import './App.css'
 
@@ -27,6 +28,7 @@ const TABS = [
   { id: 'trading',  label: '交易', icon: ICONS.trading },
   { id: 'watch',    label: '关注', icon: ICONS.watch },
   { id: 'data',     label: '数据', icon: ICONS.data },
+  { id: 'strategies', label: 'API策略', icon: 'M13 10V3L4 14h7v7l9-11h-7z' },
   { id: 'settings', label: '设置', icon: ICONS.settings },
 ]
 
@@ -78,6 +80,7 @@ export default function App() {
       case 'trading': return <TradingPanel />
       case 'watch': return <WatchPanel />
       case 'data': return <DataBrowser />
+      case 'strategies': return <StrategiesPanel />
       case 'settings': return <SettingsPanel />
       default: return null
     }

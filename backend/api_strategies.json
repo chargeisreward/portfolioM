@@ -1,0 +1,103 @@
+{
+  "_comment": "API 数据源策略清单。pages/strategies 页面读这个文件 + 扫描代码自动同步。",
+  "_version": "1.0",
+  "_last_updated": "2026-06-16",
+  "strategies": [
+    {
+      "id": "tencent_quote",
+      "name": "腾讯财经实时行情",
+      "type": "行情",
+      "module": "crawlers/price_data.py",
+      "function": "fetch_tencent_quote",
+      "endpoints": ["https://qt.gtimg.cn/"],
+      "auth": "无需",
+      "rate_limit": "无明确文档；本项目用为主源",
+      "data_type": "实时价/PE/市值",
+      "covers": ["美股", "美股ETF", "A股", "A股ETF", "港股"]
+    },
+    {
+      "id": "tencent_kline",
+      "name": "腾讯 K 线历史价",
+      "type": "行情",
+      "module": "crawlers/price_data.py",
+      "function": "fetch_tencent_kline",
+      "endpoints": ["https://web.ifzq.gtimg.cn/appstock/app/fqkline/get"],
+      "auth": "无需",
+      "rate_limit": "无明确文档；日线 90+ 天",
+      "data_type": "日 K 线（开高低收+量）",
+      "covers": ["A股", "A股ETF", "港股", "美股ETF(QQQ)"]
+    },
+    {
+      "id": "akshare_fund_nav",
+      "name": "东方财富 OF 基金净值",
+      "type": "行情",
+      "module": "services/importer.py",
+      "function": "fetch_fund_nav_history / _fetch_fund_nav",
+      "endpoints": ["ak.fund_open_fund_info_em"],
+      "auth": "无需",
+      "rate_limit": "东财限流；建议 1-2 req/s",
+      "data_type": "单位净值 / 累计净值（含历史 90+ 天）",
+      "covers": ["场外基金 (.OF)"]
+    },
+    {
+      "id": "akshare_currency",
+      "name": "PBoC 中间价汇率",
+      "type": "宏观",
+      "module": "crawlers/exchange_rates.py",
+      "function": "fetch_pboc_rates / update_rates_today",
+      "endpoints": ["ak.currency_boc_safe"],
+      "auth": "无需",
+      "rate_limit": "人民银行接口；日 1 次即可",
+      "data_type": "USD/CNY, USD/CAD, HKD/CNY 等中间价",
+      "covers": ["全部币种换算"]
+    },
+    {
+      "id": "yfinance",
+      "name": "Yahoo Finance 财务",
+      "type": "基本面",
+      "module": "crawlers/price_data.py",
+      "function": "fetch_yfinance_info / _fetch_yfinance_kline",
+      "endpoints": ["https://query1.finance.yahoo.com"],
+      "auth": "无需",
+      "rate_limit": "3s/req；易 429",
+      "data_type": "财务三表、行业、市值",
+      "covers": ["美股", "美股ETF"]
+    },
+    {
+      "id": "akshare_etf_index",
+      "name": "东方财富 ETF→指数映射",
+      "type": "穿透",
+      "module": "crawlers/etf_index.py",
+      "function": "crawl_fund_index_map",
+      "endpoints": ["ak.fund_etf_fund_info_em"],
+      "auth": "无需",
+      "rate_limit": "建议 1 req/s",
+      "data_type": "ETF 跟踪的指数代码",
+      "covers": ["A股ETF", "QDII"]
+    },
+    {
+      "id": "akshare_index_constituents",
+      "name": "东方财富 指数成分股",
+      "type": "穿透",
+      "module": "crawlers/index_constituents.py",
+      "function": "crawl_constituents",
+      "endpoints": ["ak.index_stock_cons_weight_csindex / 腾讯财经指数页"],
+      "auth": "无需",
+      "rate_limit": "建议 1 req/s",
+      "data_type": "沪深 300 / 行业指数成分股 + 权重",
+      "covers": ["指数成分股"]
+    },
+    {
+      "id": "tencent_index_html",
+      "name": "腾讯财经 指数页面 HTML",
+      "type": "穿透",
+      "module": "crawlers/index_constituents.py",
+      "function": "_crawl_from_html",
+      "endpoints": ["https://stockapp.finance.qq.com/cstock1/cbindex"],
+      "auth": "无需",
+      "rate_limit": "未知",
+      "data_type": "指数成分股 HTML 解析",
+      "covers": ["指数成分股 fallback"]
+    }
+  ]
+}

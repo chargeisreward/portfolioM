@@ -271,7 +271,7 @@ async def auth_middleware(request: Request, call_next):
         return await call_next(request)
     # 公开路径
     PUBLIC_PATHS = (
-        "/api/auth/",
+        "/api/auth/", "/api/strategies",
         "/openapi.json", "/docs", "/docs/oauth2-redirect", "/redoc", "/favicon.ico",
     )
     if any(path.startswith(p) for p in PUBLIC_PATHS):
@@ -1210,6 +1210,60 @@ def update_table_row(
     db.commit()
     db.refresh(row)
     return {"status": "ok", "changed": changed, "row": {c: getattr(row, c, None) for c in [pk_col, *editable]}}
+
+
+# ==================== API 策略 ====================
+
+def _scan_data_sources() -> dict:
+    """扫描 backend/crawlers/ + services/ 中所有 fetch_/crawl_ 函数，作为策略页面 live hook。"""
+    import ast
+    from pathlib import Path
+
+    sources = []
+    backend_dir = Path(__file__).parent
+    for sub in ("crawlers", "services"):
+        d = backend_dir / sub
+        if not d.exists():
+            continue
+        for py in d.glob("*.py"):
+            try:
+                tree = ast.parse(py.read_text(encoding="utf-8"))
+            except SyntaxError:
+                continue
+            for node in ast.walk(tree):
+                if not isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
+                    continue
+                name = node.name
+                if not (name.startswith("fetch_") or name.startswith("crawl_") or name == "fetch_tencent_quote"):
+                    continue
+                # 提取 docstring 前 1 行
+                doc = ast.get_docstring(node) or ""
+                short = doc.split("\n")[0].strip() if doc else ""
+                sources.append({
+                    "function": name,
+                    "file": f"backend/{sub}/{py.name}",
+                    "line": node.lineno,
+                    "doc": short[:120],
+                })
+    return {"scanned_at": datetime.utcnow().isoformat(), "total": len(sources), "sources": sources}
+
+
+@app.get("/api/strategies")
+def list_strategies():
+    """列出所有数据源策略（从 api_strategies.json + 实时扫描代码）"""
+    from pathlib import Path
+    import json as _json
+    p = Path(__file__).parent / "api_strategies.json"
+    manifest = {"strategies": []}
+    if p.exists():
+        try:
+            manifest = _json.loads(p.read_text(encoding="utf-8"))
+        except Exception:
+            pass
+    return {
+        "manifest": manifest,
+        "live": _scan_data_sources(),
+    }
 
 
 # ==================== Admin: 本地 SQLite → 云端 Postgres 同步 ====================

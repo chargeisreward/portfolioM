@@ -69,6 +69,9 @@ export const searchSecurities = (q) => api.get('/watchlist/search', { params: { 
 export const getDataBrowserOptions = () => api.get('/data-browser/options').then(r => r.data)
 export const updateTableRow = (table, pkCol, pkVal, body) => api.put(`/data-browser/${table}/${pkCol}/${pkVal}`, body).then(r => r.data)
 
+// Strategies (API 策略页面)
+export const getStrategies = () => api.get('/strategies').then(r => r.data)
+
 // Trend
 export const getTrend = (days = 90, target = 'CNY') => api.get('/trend', { params: { days, target } }).then(r => r.data)
 

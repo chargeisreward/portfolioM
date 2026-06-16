@@ -1,5 +1,5 @@
 """Import portfolio holdings from Excel"""
-from datetime import datetime
+from datetime import datetime, date
 from openpyxl import load_workbook
 from sqlalchemy.orm import Session
 from models import Holding, AssetType, Currency
@@ -129,7 +129,7 @@ def fetch_fund_nav_history(fund_code: str, days: int = 90) -> list[dict]:
     """拉 OF 基金过去 N 天每日净值（真实数据，来自东方财富）。
     返回 [{date: 'YYYY-MM-DD', close: 1.234}, ...]
     优先用「单位净值走势」，单位净值为空的基金（如某些 QDII/债券）用「累计净值走势」。"""
-    from datetime import date, timedelta
+    from datetime import timedelta
 
     def _try(indicator: str, value_col: str) -> list[dict]:
         try:
@@ -143,22 +143,30 @@ def fetch_fund_nav_history(fund_code: str, days: int = 90) -> list[dict]:
         cutoff = date.today() - timedelta(days=days)
         for _, row in df.iterrows():
             try:
-                d_str = str(row.get("净值日期") or row.get("日期") or "")
-                if not d_str or d_str == "nan":
+                raw_date = row.get("净值日期")
+                if raw_date is None:
+                    raw_date = row.get("日期")
+                if raw_date is None:
                     continue
-                # 兼容 "2025-03-01" 字符串 / Timestamp
-                if hasattr(row.get("净值日期"), "strftime"):
-                    d = row["净值日期"].date()
+                # 统一成 date 对象
+                # pandas.Timestamp → date
+                # datetime.datetime → date
+                # datetime.date → 直接用
+                # 字符串 → 解析
+                if hasattr(raw_date, "date") and callable(raw_date.date) and not isinstance(raw_date, date):
+                    d = raw_date.date()
+                elif isinstance(raw_date, date):
+                    d = raw_date
                 else:
-                    from datetime import datetime
-                    d = datetime.strptime(d_str[:10], "%Y-%m-%d").date()
+                    d = datetime.strptime(str(raw_date)[:10], "%Y-%m-%d").date()
                 if d < cutoff:
                     continue
                 nav = row.get(value_col)
                 if nav is None or str(nav) == "nan":
                     continue
                 out.append({"date": d.isoformat(), "close": float(nav)})
-            except (ValueError, TypeError):
+            except Exception:
+                # 单行解析失败不影响整体
                 continue
         return out
 

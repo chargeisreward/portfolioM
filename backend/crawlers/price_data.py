@@ -106,6 +106,7 @@ def fetch_tencent_kline(ticker: str, days: int = 365) -> list[dict]:
     """
     从腾讯K线API获取历史日线数据（前复权）。
     返回 [{date, open, close, high, low, volume}, ...]
+    注：A股/港股走 qfqday 字段；美股走 day 字段。
     """
     kline_ticker = _to_kline_ticker(ticker)
     if not kline_ticker:
@@ -122,33 +123,50 @@ def fetch_tencent_kline(ticker: str, days: int = 365) -> list[dict]:
         resp = requests.get(TENCENT_KLINE_URL, params=params, headers=headers, timeout=5, verify=False)
         data = resp.json()
 
-        # Navigate: data -> {ticker} -> day -> [ [date, open, close, high, low, vol], ...]
-        for key in data.get("data", {}):
-            day_data = data["data"][key].get("day", [])
-            if day_data:
-                return [
-                    {
-                        "date": item[0],
-                        "open": float(item[1]),
-                        "close": float(item[2]),
-                        "high": float(item[3]),
-                        "low": float(item[4]),
-                        "volume": float(item[5]),
-                    }
-                    for item in day_data
-                ]
+        for key, payload in data.get("data", {}).items():
+            if not isinstance(payload, dict):
+                continue
+            # A 股/港股走 qfqday（前复权），美股走 day
+            rows = payload.get("day") or payload.get("qfqday") or []
+            if rows:
+                out = []
+                for item in rows:
+                    try:
+                        out.append({
+                            "date": item[0],
+                            "open": float(item[1]),
+                            "close": float(item[2]),
+                            "high": float(item[3]),
+                            "low": float(item[4]),
+                            "volume": float(item[5]),
+                        })
+                    except (ValueError, TypeError, IndexError):
+                        continue
+                if out:
+                    return out
     except Exception:
         pass
 
     return _fetch_yfinance_kline(ticker, days)
 
 
+# 美股 → 腾讯 K 线交易所后缀映射（NASDAQ=.OQ, NYSE=.N, NYSE Arca=.AM）
+_TENCENT_US_EXCHANGE_SUFFIX = {
+    "GOOGL": ".OQ", "NVDA": ".OQ", "INTC": ".OQ", "AMD": ".OQ",
+    "AAPL": ".OQ", "MSFT": ".OQ", "AMZN": ".OQ", "TSLA": ".OQ",
+    "QQQ": ".OQ",
+    "SNDK": ".OQ",  # NASDAQ
+}
+
+
 def _to_kline_ticker(ticker: str) -> str | None:
-    """Convert to Tencent K-line ticker format"""
+    """Convert to Tencent K-line ticker format.
+    美股必须加交易所后缀 (.OQ/.N/.AM) 才能拿到完整 K 线，否则只返回 1 天。
+    A股/港股无后缀（sh/sz/hk + 6/5 位数字）。"""
     t = ticker.upper().strip()
-    # Same as quote API: just usNVDA (exchange suffix breaks it)
-    if t in ("GOOGL", "NVDA", "INTC", "SNDK", "AMD", "AAPL", "MSFT", "AMZN", "TSLA", "QQQ"):
-        return f"us{t}"
+    # 美股：加交易所后缀
+    if t in _TENCENT_US_EXCHANGE_SUFFIX:
+        return f"us{t}{_TENCENT_US_EXCHANGE_SUFFIX[t]}"
     # A 股：6 位数字 + .SH/.SZ 后缀
     if t.endswith(".SH") and t[:-3].isdigit() and len(t[:-3]) == 6:
         return f"sh{t[:-3]}"

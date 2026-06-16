@@ -627,6 +627,13 @@ def get_portfolio_trend(
     return {"series": series, "currency": target, "days": days}
 
 
+@app.post("/api/admin/backfill-gaps")
+def admin_backfill_gaps(days: int = 90):
+    """手动触发 90 天历史价完整性检查 + 补缺任务"""
+    from services.scheduler import job_backfill_gaps
+    return job_backfill_gaps(days)
+
+
 @app.post("/api/admin/backfill-prices")
 def admin_backfill_prices(days: int = 90, db: Session = Depends(get_db)):
     """拉所有 holding 过去 N 天 daily price，写入 price_cache。

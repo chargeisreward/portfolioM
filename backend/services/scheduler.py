@@ -47,13 +47,12 @@ def _is_trading_hours(now: datetime) -> bool:
 # ---------- 任务1：实时行情抓取 ----------
 
 def job_fetch_realtime_prices(force: bool = False):
-    """交易时段每15分钟执行：抓取所有持仓的最新价格并更新缓存
-    force=True 时跳过交易时段判断（手动触发用）
+    """每15分钟执行：抓取所有持仓的最新价格并更新缓存。
+    交易时段（A股+美股）每15分钟；非交易时段只拉最近1天价。
+    force=True 时强制全量拉（手动触发用）
     """
     now = datetime.now()
-    if not force and not _is_trading_hours(now):
-        logger.debug("当前非交易时段，跳过行情抓取")
-        return
+    in_session = _is_trading_hours(now)
 
     db: Session = SessionLocal()
     try:
@@ -291,6 +290,104 @@ def job_update_industry_crawler_data():
         db.close()
 
 
+# ---------- 任务4：90 天历史价完整性检查 + 补缺 ----------
+
+def _expected_trading_dates(days: int) -> list:
+    """生成过去 N 天的预期交易日列表（简化：每个工作日）"""
+    from datetime import timedelta
+    out = []
+    today = date.today()
+    for k in range(days + 1):
+        d = today - timedelta(days=k)
+        if d.weekday() < 5:  # 周一到周五
+            out.append(d)
+    return out
+
+
+def job_backfill_gaps(days: int = 90):
+    """检查所有 holding 过去 N 天的 price_cache 完整性，缺哪补哪。
+    每个 (code, date) 若缺失就拉历史价补上。"""
+    db: Session = SessionLocal()
+    try:
+        from crawlers.price_data import fetch_price_history
+
+        holdings = db.query(Holding).all()
+        expected_dates = set(_expected_trading_dates(days))
+        results = []
+        filled_total = 0
+
+        for h in holdings:
+            code = h.security_code
+            try:
+                # 已有日期集合
+                existing = set(
+                    row[0] for row in
+                    db.query(PriceCache.trade_date)
+                    .filter(PriceCache.stock_code == code)
+                    .all()
+                )
+                # 缺哪些日期
+                missing = expected_dates - existing
+                if not missing:
+                    results.append({"code": code, "status": "complete"})
+                    continue
+
+                # 拉历史价（用 days 大窗口确保覆盖）
+                try:
+                    history = fetch_price_history(code, days + 5)
+                except Exception as e:
+                    results.append({"code": code, "status": "fetch_error", "missing": len(missing), "error": str(e)[:100]})
+                    continue
+
+                # 只补缺失的日期
+                history_by_date = {}
+                for p in history:
+                    try:
+                        d = date.fromisoformat(p["date"])
+                        history_by_date[d] = p
+                    except (ValueError, TypeError):
+                        continue
+
+                written = 0
+                for d in missing:
+                    p = history_by_date.get(d)
+                    if not p:
+                        continue
+                    db.add(PriceCache(
+                        stock_code=code,
+                        trade_date=d,
+                        open_px=p.get("open"),
+                        close_px=p.get("close"),
+                        high_px=p.get("high"),
+                        low_px=p.get("low"),
+                        volume=p.get("volume"),
+                        source="gap_fill",
+                    ))
+                    written += 1
+
+                if written:
+                    db.commit()
+                filled_total += written
+                results.append({"code": code, "status": "ok", "missing": len(missing), "filled": written})
+            except Exception as e:
+                results.append({"code": code, "status": "error", "error": str(e)[:100]})
+                continue
+
+        from collections import Counter
+        statuses = Counter(r["status"] for r in results)
+        logger.info(
+            "历史价完整性检查完成: %s, 共补 %d 条",
+            dict(statuses), filled_total,
+        )
+        return {"status": "ok", "summary": dict(statuses), "filled_total": filled_total, "details": results}
+    except Exception as e:
+        import traceback
+        logger.error("历史价补缺任务异常: %s", e, exc_info=True)
+        return {"status": "error", "message": str(e)[:500]}
+    finally:
+        db.close()
+
+
 # ---------- 调度器启停 ----------
 
 def start_scheduler():
@@ -336,6 +433,19 @@ def start_scheduler():
         name="行业/爬虫数据更新",
         max_instances=1,
         misfire_grace_time=300,
+    )
+
+    # 任务4：90 天历史价完整性检查 — 每日凌晨 5:00
+    scheduler.add_job(
+        job_backfill_gaps,
+        "cron",
+        hour=5,
+        minute=0,
+        id="backfill_gaps",
+        name="历史价补缺",
+        max_instances=1,
+        misfire_grace_time=600,
+        kwargs={"days": 90},
     )
 
     scheduler.start()

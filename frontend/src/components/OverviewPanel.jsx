@@ -33,6 +33,8 @@ export default function OverviewPanel() {
   const trendRef = useRef(null)
   const [trendData, setTrendData] = useState([])
   const [trendTotal, setTrendTotal] = useState(null)
+  const [trendDays, setTrendDays] = useState(90)
+  const [trendReturn, setTrendReturn] = useState(null)  // {pct, abs} over the window
   const [sortKey, setSortKey] = useState('amount')
   const [sortDir, setSortDir] = useState('desc')
   const [currency, setCurrency] = useState('CNY')
@@ -66,14 +68,28 @@ export default function OverviewPanel() {
     })
   }, [holdingsLocal, allHoldings])
 
-  // 90 天资产走势
+  // 资产走势（90/180/360 天可切换）
   useEffect(() => {
-    api.getTrend(90, currency).then(d => {
+    api.getTrend(trendDays, currency).then(d => {
       const series = d?.series || []
       setTrendData(series)
-      setTrendTotal(series.length ? series[series.length - 1].value : null)
-    }).catch(() => { setTrendData([]); setTrendTotal(null) })
-  }, [currency])
+      if (series.length >= 2) {
+        const first = series[0].value
+        const last = series[series.length - 1].value
+        setTrendTotal(last)
+        setTrendReturn({
+          pct: first > 0 ? (last - first) / first * 100 : null,
+          abs: last - first,
+        })
+      } else if (series.length === 1) {
+        setTrendTotal(series[0].value)
+        setTrendReturn({ pct: null, abs: 0 })
+      } else {
+        setTrendTotal(null)
+        setTrendReturn(null)
+      }
+    }).catch(() => { setTrendData([]); setTrendTotal(null); setTrendReturn(null) })
+  }, [currency, trendDays])
 
   useEffect(() => {
     Promise.all([
@@ -227,13 +243,40 @@ export default function OverviewPanel() {
         </span>
       </div>
 
-      {/* 资产走势 90 天 */}
+      {/* 资产走势 (90 / 180 / 360 天可切换) */}
       <div className="raised" style={{ padding: 0, overflow: 'hidden' }}>
-        <div style={{ padding: '8px 12px', display: 'flex', justifyContent: 'space-between', alignItems: 'center' }}>
-          <div className="section-title" style={{ marginBottom: 0 }}>资产走势 · 90天</div>
-          <span style={{ fontSize: 10, color: 'var(--text-muted)', fontFamily: '"GeistMono", monospace' }}>
-            {trendTotal != null ? getCurrencySymbol(currency) + Math.round(trendTotal).toLocaleString('en-US') : '加载中…'}
-          </span>
+        <div style={{ padding: '8px 12px', display: 'flex', justifyContent: 'space-between', alignItems: 'center', flexWrap: 'wrap', gap: 8 }}>
+          <div style={{ display: 'flex', alignItems: 'center', gap: 8 }}>
+            <div className="section-title" style={{ marginBottom: 0 }}>资产走势</div>
+            {/* 90 / 180 / 360 标签式切换 */}
+            <div style={{ display: 'flex', gap: 2 }}>
+              {[90, 180, 360].map(d => (
+                <button key={d}
+                  onClick={() => setTrendDays(d)}
+                  className={trendDays === d ? 'cur-btn on' : 'cur-btn'}
+                  style={{ fontSize: 10, padding: '2px 8px' }}>
+                  {d}天
+                </button>
+              ))}
+            </div>
+          </div>
+          <div style={{ display: 'flex', alignItems: 'center', gap: 12, fontFamily: '"GeistMono", monospace' }}>
+            {/* 收益率标签 */}
+            {trendReturn && trendReturn.pct != null && (
+              <span style={{
+                fontSize: 12, fontWeight: 600,
+                color: trendReturn.pct >= 0 ? 'var(--chart-up)' : 'var(--chart-down)',
+              }}>
+                {trendReturn.pct >= 0 ? '+' : ''}{trendReturn.pct.toFixed(2)}%
+              </span>
+            )}
+            {/* 当前资产价值标签 */}
+            <span style={{ fontSize: 11, color: 'var(--text-muted)' }}>
+              {trendTotal != null
+                ? getCurrencySymbol(currency) + Math.round(trendTotal).toLocaleString('en-US')
+                : '加载中…'}
+            </span>
+          </div>
         </div>
         <div ref={trendRef} className="chart-box" style={{ width: '100%', height: 240 }} />
       </div>

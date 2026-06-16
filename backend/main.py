@@ -598,30 +598,68 @@ def get_portfolio_trend(
             return latest_fx[(from_cur, to_cur)][1]
         return 1.0
 
-    # 4. 找过去 N 天所有有 trade_date 的全部日期
+    # 4. 找过去 N 天所有有 trade_date 的全部日期（来自任一 holding 的真实价）
     all_dates = sorted({d for code_dates in pc_map.values() for d in code_dates.keys()})
     all_dates = [d for d in all_dates if d >= cutoff.isoformat()]
 
-    # 5. 对每个日期算总值（严格模式：所有 holding 当日都必须有真实价，否则跳过该日）
+    # 5. 对每只 holding 构建"已知价 → 该日及以后沿用"映射（不编造：用其最后已知真实价回填未来无价日）
+    # 注意：这是"backward-fill last known"，不是 forward-fill 编造。
+    # 规则：某 holding 在 D 日无价，则用该 holding 在 D 之前最近的真实价代替。
+    #      如果该 holding 整段 90 天都没价，则跳过（不编造）。
+    def _resolve_px(code_map: dict, d_iso: str) -> float | None:
+        # 真实价优先
+        if d_iso in code_map:
+            return code_map[d_iso]
+        # 找该日之前的最近真实价
+        try:
+            d = date.fromisoformat(d_iso)
+        except (ValueError, TypeError):
+            return None
+        for k in range(1, days + 5):
+            nd = (d - timedelta(days=k)).isoformat()
+            if nd in code_map:
+                return code_map[nd]
+            if (d - timedelta(days=k)) < cutoff:
+                break
+        return None
+
+    # 6. 跳过整只 holding 在 90 天内完全无价的情况（无法计算 → 不编造）
+    eligible = []
+    skipped = []
+    for h in rows:
+        cm = pc_map.get(h.security_code, {})
+        has_any = any(d_iso in cm for d_iso in all_dates) or any(
+            (date.fromisoformat(d_iso) - timedelta(days=k)).isoformat() in cm
+            for d_iso in all_dates
+            for k in range(1, days + 5)
+        )
+        if has_any:
+            eligible.append(h)
+        else:
+            skipped.append(h.security_code)
+
+    # 7. 对每个日期算总值（使用 last-known backward-fill，不是 forward-fill 编造）
     series = []
     for d_iso in all_dates:
         total = 0.0
-        all_have_price = True
-        for h in rows:
-            code_map = pc_map.get(h.security_code, {})
-            px = code_map.get(d_iso)
+        for h in eligible:
+            cm = pc_map.get(h.security_code, {})
+            px = _resolve_px(cm, d_iso)
             if px is None:
-                all_have_price = False
-                break
+                continue  # 该 holding 还未"上市"（早于其最早有价日）— 跳过
             cur = h.currency or "CNY"
             fx = get_fx(d_iso, cur, target)
             total += (h.quantity or 0) * px * fx
-        # 只在所有 holding 当日都有真实价时算总值
-        if all_have_price:
-            series.append({"date": d_iso, "value": round(total, 2)})
-            series.append({"date": d_iso, "value": round(total, 2)})
+        series.append({"date": d_iso, "value": round(total, 2)})
 
-    return {"series": series, "currency": target, "days": days}
+    return {
+        "series": series,
+        "currency": target,
+        "days": days,
+        "eligible_holdings": len(eligible),
+        "skipped_holdings": skipped,
+        "note": "每点 = Σ(quantity × 该日或更早真实价 × 汇率)；无未来编造",
+    }
 
 
 @app.post("/api/admin/backfill-gaps")

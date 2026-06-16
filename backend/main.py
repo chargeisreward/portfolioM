@@ -561,11 +561,6 @@ def get_portfolio_trend(
     pc_map: dict = {}
     for r in pc_rows:
         pc_map.setdefault(r.stock_code, {})[r.trade_date.isoformat()] = r.close_px
-    # 每个 code 的最近已知价（用于当日没价时 forward-fill）
-    last_known: dict = {}
-    for code, date_map in pc_map.items():
-        if date_map:
-            last_known[code] = max(date_map.values())
 
     # 3. 汇率（按 date 查）
     fx_rows = db.query(ExchangeRate).filter(ExchangeRate.rate_date >= cutoff).all()
@@ -607,21 +602,23 @@ def get_portfolio_trend(
     all_dates = sorted({d for code_dates in pc_map.values() for d in code_dates.keys()})
     all_dates = [d for d in all_dates if d >= cutoff.isoformat()]
 
-    # 5. 对每个日期算总值
+    # 5. 对每个日期算总值（严格模式：所有 holding 当日都必须有真实价，否则跳过该日）
     series = []
     for d_iso in all_dates:
         total = 0.0
+        all_have_price = True
         for h in rows:
             code_map = pc_map.get(h.security_code, {})
             px = code_map.get(d_iso)
             if px is None:
-                px = last_known.get(h.security_code)  # forward-fill
-            if px is None:
-                continue
+                all_have_price = False
+                break
             cur = h.currency or "CNY"
             fx = get_fx(d_iso, cur, target)
             total += (h.quantity or 0) * px * fx
-        if total > 0:
+        # 只在所有 holding 当日都有真实价时算总值
+        if all_have_price:
+            series.append({"date": d_iso, "value": round(total, 2)})
             series.append({"date": d_iso, "value": round(total, 2)})
 
     return {"series": series, "currency": target, "days": days}
@@ -637,12 +634,14 @@ def admin_backfill_gaps(days: int = 90):
 @app.post("/api/admin/backfill-prices")
 def admin_backfill_prices(days: int = 90, db: Session = Depends(get_db)):
     """拉所有 holding 过去 N 天 daily price，写入 price_cache。
-    PBoC 历史汇率暂不拉（接口限流），只用当日汇率做最新市值转换。"""
+    来源：腾讯 K 线（A 股/港股/美股 ETF）+ akshare 净值走势（OF 基金）。
+    只插真实数据；不编造。"""
     from datetime import date, timedelta
     from models import Holding, PriceCache
 
     try:
         from crawlers.price_data import fetch_price_history
+        from services.importer import fetch_fund_nav_history
     except ImportError as e:
         return {"status": "error", "message": f"import failed: {e}"}
 
@@ -653,8 +652,13 @@ def admin_backfill_prices(days: int = 90, db: Session = Depends(get_db)):
 
         for h in holdings:
             code = h.security_code
+            is_fund = code.endswith(".OF")
+
             try:
-                history = fetch_price_history(code, days)
+                if is_fund:
+                    history = fetch_fund_nav_history(code.replace(".OF", ""), days)
+                else:
+                    history = fetch_price_history(code, days)
             except Exception as e:
                 results.append({"code": code, "status": "fetch_error", "error": str(e)[:200]})
                 continue
@@ -687,7 +691,7 @@ def admin_backfill_prices(days: int = 90, db: Session = Depends(get_db)):
                         high_px=p.get("high"),
                         low_px=p.get("low"),
                         volume=p.get("volume"),
-                        source="backfill",
+                        source="akshare_fund" if is_fund else "tencent",
                     ))
                     written += 1
                 except Exception as e:

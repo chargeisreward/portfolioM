@@ -149,6 +149,16 @@ def _to_kline_ticker(ticker: str) -> str | None:
     # Same as quote API: just usNVDA (exchange suffix breaks it)
     if t in ("GOOGL", "NVDA", "INTC", "SNDK", "AMD", "AAPL", "MSFT", "AMZN", "TSLA", "QQQ"):
         return f"us{t}"
+    # A 股：6 位数字 + .SH/.SZ 后缀
+    if t.endswith(".SH") and t[:-3].isdigit() and len(t[:-3]) == 6:
+        return f"sh{t[:-3]}"
+    if t.endswith(".SZ") and t[:-3].isdigit() and len(t[:-3]) == 6:
+        return f"sz{t[:-3]}"
+    # 港股：5 位数字 + .HK
+    if t.endswith(".HK") and t[:-3].isdigit() and len(t[:-3]) == 5:
+        return f"hk{t[:-3]}"
+    # OF 基金不在腾讯 K 线，保留 None 走 yfinance/akshare
+    return None
 
 
 # ---------- yfinance（备用） ----------

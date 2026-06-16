@@ -125,6 +125,49 @@ def _fetch_fund_nav(fund_code: str) -> float | None:
     return None
 
 
+def fetch_fund_nav_history(fund_code: str, days: int = 90) -> list[dict]:
+    """拉 OF 基金过去 N 天每日净值（真实数据，来自东方财富）。
+    返回 [{date: 'YYYY-MM-DD', close: 1.234}, ...]
+    优先用「单位净值走势」，单位净值为空的基金（如某些 QDII/债券）用「累计净值走势」。"""
+    from datetime import date, timedelta
+
+    def _try(indicator: str, value_col: str) -> list[dict]:
+        try:
+            import akshare as ak
+            df = ak.fund_open_fund_info_em(symbol=fund_code, indicator=indicator)
+        except Exception:
+            return []
+        if df is None or df.empty:
+            return []
+        out = []
+        cutoff = date.today() - timedelta(days=days)
+        for _, row in df.iterrows():
+            try:
+                d_str = str(row.get("净值日期") or row.get("日期") or "")
+                if not d_str or d_str == "nan":
+                    continue
+                # 兼容 "2025-03-01" 字符串 / Timestamp
+                if hasattr(row.get("净值日期"), "strftime"):
+                    d = row["净值日期"].date()
+                else:
+                    from datetime import datetime
+                    d = datetime.strptime(d_str[:10], "%Y-%m-%d").date()
+                if d < cutoff:
+                    continue
+                nav = row.get(value_col)
+                if nav is None or str(nav) == "nan":
+                    continue
+                out.append({"date": d.isoformat(), "close": float(nav)})
+            except (ValueError, TypeError):
+                continue
+        return out
+
+    result = _try("单位净值走势", "单位净值")
+    if result:
+        return result
+    return _try("累计净值走势", "累计净值")
+
+
 def fill_prices(db: Session):
     """Fetch latest prices for all holdings and calculate amount = quantity × price.
     US stocks → Tencent API | Chinese funds → akshare NAV | ETFs → Tencent API"""

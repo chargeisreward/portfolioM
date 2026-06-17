@@ -291,7 +291,16 @@ async def auth_middleware(request: Request, call_next):
 
 def _json_error(status: int, msg: str):
     from fastapi.responses import JSONResponse
-    return JSONResponse(status_code=status, content={"detail": msg})
+    # 显式带 CORS 头（避免 CORSMiddleware 漏包到错误响应时浏览器拒绝跨域）
+    return JSONResponse(
+        status_code=status,
+        content={"detail": msg},
+        headers={
+            "Access-Control-Allow-Origin": "*",
+            "Access-Control-Allow-Methods": "GET, POST, PUT, DELETE, OPTIONS, PATCH",
+            "Access-Control-Allow-Headers": "*",
+        },
+    )
 
 
 @app.on_event("startup")

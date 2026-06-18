@@ -1,9 +1,15 @@
 # Fund Penetration & Industry Aggregation Analysis
 
-**Status:** draft
+**Status:** implemented (backend complete; frontend integrated, pending final polish and end-to-end verification)
 **Date:** 2026-06-17
+**Updated:** 2026-06-18
 **Author:** Claude
 **Spec owner:** PortfolioM user
+
+> See also:
+> - [`../../project-status.md`](../project-status.md) — current implementation status and pending tasks
+> - [`../../reference-price-system.md`](../reference-price-system.md) — price cache and trading calendar reference
+> - [`../../howto-backfill-6m-prices.md`](../howto-backfill-6m-prices.md) — how to backfill 6-month closing prices
 
 ## Context
 
@@ -743,6 +749,37 @@ SQLAlchemy session lock.
 
 ---
 
-## §8 Open questions for the user before implementation
+## §8 Implementation Status
+
+As of 2026-06-18, all backend components described in this spec are implemented and the new frontend components are in place. The remaining work is commit cleanup, end-to-end verification, and hardening of the official-source index crawler.
+
+### Completed
+
+- All 9 new tables created in `backend/models.py`
+- `backend/services/data_version.py` — version resolution
+- Snapshot importers in `backend/scripts/import_*.py`
+- `backend/services/penetration_v2.py` — weight-invariant drill-down
+- `backend/services/aggregation.py` — virtual-earnings aggregation + CSI300 comparison
+- `backend/services/price_filler.py` — missing `current_price` backfill
+- All §4.1 API endpoints implemented in `backend/main.py`
+- Frontend components: `DataVersionBar`, `IndustryBreakdownPanel`, `IndustryDrilldownTable`, `MetricTimeseriesChart`, `FullHoldingTable`, `DrillableFundsPage`, `PortfolioVsCsi300Card`
+- Trading calendar `CN/HK/US/OF` in `backend/services/trading_calendar.py`
+- 6-month price backfill scripts: `pull_history_prices.py`, `pull_fund_nav.py`
+- Auto-import on startup in `backend/main.py::startup`
+
+### Pending
+
+- Commit the uncommitted implementation files
+- Run end-to-end verification against `sourceData/202605数据/`
+- Confirm 6-month price completeness for all drilled securities
+- Final frontend polish: remove any residual mock values, verify tab/chart interactions
+- Harden `backend/scripts/crawl_index_official.py` for CSI / CNINDEX / SZSE / HSI
+- Prepare `sourceData/202606数据/` for the next monthly snapshot
+
+See [`../../project-status.md`](../project-status.md) for the full task list.
+
+---
+
+## §9 Open questions for the user before implementation
 
 None at this point. All blocking ambiguities resolved during brainstorming.

@@ -559,6 +559,16 @@ D:\claude_code_project\PortfolioM\
 
 ---
 
+## 文档
+
+- [`data_get.md`](./data_get.md) — 全项目数据源总览（腾讯 / yfinance / akshare / Tushare / 中证指数 / 天天基金）
+- [`docs/project-status.md`](./docs/project-status.md) — 当前实现状态与待办任务清单
+- [`docs/superpowers/specs/2026-06-17-fund-penetration-analysis-design.md`](./docs/superpowers/specs/2026-06-17-fund-penetration-analysis-design.md) — 基金穿透与行业聚合设计（spec §1–§7 已实现）
+- [`docs/reference-price-system.md`](./docs/reference-price-system.md) — 价格缓存、交易日历、价格拉取脚本参考
+- [`docs/howto-backfill-6m-prices.md`](./docs/howto-backfill-6m-prices.md) — 如何为持仓和穿透证券补全 6 个月收盘价
+
+---
+
 ## Acceptance Criteria
 
 1. ✅ 从 Excel 导入持仓数据，存储到数据库
@@ -623,10 +633,27 @@ D:\claude_code_project\PortfolioM\
 | `backend/main.py` | FastAPI 入口 + 30 个 API 端点 + 调度器启停 |
 | `backend/schemas.py` | Pydantic 请求/响应模型 |
 | `backend/services/penetration.py` | 核心穿透算法 |
+| `backend/services/penetration_v2.py` | 新版快照穿透（weight-invariant recompute） |
+| `backend/services/aggregation.py` | 多维度聚合 + CSI300 对比 + 估值时序 |
+| `backend/services/data_version.py` | 月度快照版本解析 |
+| `backend/services/trading_calendar.py` | CN/HK/US/OF 交易日历 |
+| `backend/services/code_map.py` | API 代码映射表 |
+| `backend/services/price_filler.py` | 缺失 current_price 补全 |
+| `backend/services/drillable_funds.py` | 可下钻基金卡片数据 |
 | `backend/services/growth_bucketer.py` | 沪深300加权分位增长分层 |
 | `backend/services/scheduler.py` | APScheduler 定时调度（3 类任务） |
 | `backend/services/importer.py` | Excel 导入 + 价格填充 |
 | `backend/services/csi300.py` | 沪深300 数据工具 |
+| `backend/scripts/import_fund_index_map.py` | 基金→指数映射导入 |
+| `backend/scripts/import_index_constituents.py` | 指数成分股快照导入 |
+| `backend/scripts/import_a_share_financials.py` | A 股估值快照导入 |
+| `backend/scripts/import_hk_share_financials.py` | 港股估值快照导入 |
+| `backend/scripts/import_399673_cons.py` | 创业板 50 官方权重导入 |
+| `backend/scripts/import_common.py` | 导入通用工具（价格解析、动态指标） |
+| `backend/scripts/pull_history_prices.py` | A+H 底层证券 6 个月历史价拉取 |
+| `backend/scripts/pull_fund_nav.py` | OF 基金历史净值拉取 |
+| `backend/scripts/fill_prices_tencent.py` | 腾讯行情补全 current_price CLI |
+| `backend/scripts/crawl_index_official.py` | 官方指数成分股下载（进行中） |
 | `backend/crawlers/price_data.py` | 统一行情入口（腾讯/yfinance/akshare） |
 | `backend/crawlers/exchange_rates.py` | 汇率获取 + 币种推断 |
 | `backend/crawlers/etf_index.py` | ETF→指数映射爬虫 |

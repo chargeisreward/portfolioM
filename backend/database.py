@@ -51,6 +51,29 @@ def init_db():
         ("watchlist", "industry", "VARCHAR(50)"),
         ("watchlist", "weight", "FLOAT"),
         ("watchlist", "added_at", "DATETIME"),
+        # 7+4 industry columns for snapshots + full_holding + csi300
+        ("a_share_financial_snapshot", "swy_l4", "VARCHAR(60)"),
+        ("a_share_financial_snapshot", "se_l1", "VARCHAR(60)"),
+        ("a_share_financial_snapshot", "se_l2", "VARCHAR(60)"),
+        ("a_share_financial_snapshot", "se_l3", "VARCHAR(60)"),
+        ("a_share_financial_snapshot", "se_l4", "VARCHAR(60)"),
+        ("hk_share_financial_snapshot", "swy_l4", "VARCHAR(60)"),
+        ("hk_share_financial_snapshot", "se_l1", "VARCHAR(60)"),
+        ("hk_share_financial_snapshot", "se_l2", "VARCHAR(60)"),
+        ("hk_share_financial_snapshot", "se_l3", "VARCHAR(60)"),
+        ("hk_share_financial_snapshot", "se_l4", "VARCHAR(60)"),
+        ("full_holding_snapshot", "swy_l4", "VARCHAR(60)"),
+        ("full_holding_snapshot", "se_l1", "VARCHAR(60)"),
+        ("full_holding_snapshot", "se_l2", "VARCHAR(60)"),
+        ("full_holding_snapshot", "se_l3", "VARCHAR(60)"),
+        ("full_holding_snapshot", "se_l4", "VARCHAR(60)"),
+        ("csi300_constituent_snapshot", "swy_l4", "VARCHAR(60)"),
+        ("csi300_constituent_snapshot", "se_l1", "VARCHAR(60)"),
+        ("csi300_constituent_snapshot", "se_l2", "VARCHAR(60)"),
+        ("csi300_constituent_snapshot", "se_l3", "VARCHAR(60)"),
+        ("csi300_constituent_snapshot", "se_l4", "VARCHAR(60)"),
+        # Index constituent weight (added 2026-06 via pull_index_weights.py)
+        ("index_constituent_snapshot", "weight", "FLOAT"),
     ]
     from sqlalchemy import inspect
     insp = inspect(engine)

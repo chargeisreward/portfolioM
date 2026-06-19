@@ -86,3 +86,22 @@ export const getTrend = (days = 90, target = 'CNY') => api.get('/trend', { param
 export const getAuthStatus = () => api.get('/auth/status').then(r => r.data)
 export const login = (password) => api.post('/auth/login', { password }).then(r => r.data)
 export const logout = () => api.post('/auth/logout').then(r => r.data)
+
+// ============================================================================
+// Fund Penetration & Industry Aggregation (spec §4)
+// ============================================================================
+
+export const getDataVersion = () => api.get('/data-version').then(r => r.data)
+export const getFullHolding = (asOfDate) => api.get('/penetration/full-holding', { params: { as_of_date: asOfDate } }).then(r => r.data)
+export const getDimension = (dim, asOfDate, market = 'A+H') => api.get('/penetration/dimension', { params: { dim, as_of_date: asOfDate, market } }).then(r => r.data)
+export const getDimensionDetail = (dim, key, asOfDate, market = 'A+H') => api.get('/penetration/dimension-detail', { params: { dim, key, as_of_date: asOfDate, market } }).then(r => r.data)
+export const getTimeseries = (scope = 'both', metric = 'pe_weighted', window = 90) =>
+  api.get('/penetration/timeseries', { params: { scope, metric, window } }).then(r => r.data)
+export const getKpi = (asOfDate) => api.get('/penetration/kpi', { params: { as_of_date: asOfDate } }).then(r => r.data)
+export const importSourceData = (sourceFolder) => api.post('/admin/import-source-data', null, { params: { source_folder: sourceFolder } }).then(r => r.data)
+export const recalcAggregation = (asOfDate) => api.post('/admin/recalc-aggregation', null, { params: { as_of_date: asOfDate } }).then(r => r.data)
+
+export const getPortfolioVsCsi300 = (asOfDate) => api.get('/penetration/portfolio-vs-csi300', { params: { as_of_date: asOfDate } }).then(r => r.data)
+
+export const getDrillableIndices = (asOfDate) => api.get('/penetration/drillable-indices', { params: { as_of_date: asOfDate } }).then(r => r.data)
+export const getIndexDrill = (indexCode, asOfDate) => api.get('/penetration/index-drill', { params: { index_code: indexCode, as_of_date: asOfDate } }).then(r => r.data)

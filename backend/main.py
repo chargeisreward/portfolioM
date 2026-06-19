@@ -6,6 +6,7 @@ from pathlib import Path
 from fastapi import FastAPI, Depends, Query, Request, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
+from sqlalchemy import func
 from sqlalchemy.orm import Session
 
 from database import get_db, init_db
@@ -334,6 +335,50 @@ def startup():
     except Exception as e:
         import logging
         logging.getLogger(__name__).warning("code_map init failed (non-fatal): %s", e)
+
+    # 启动时自动导入穿透快照（如果当前业务日期对应的 snapshot 表为空）。
+    # 失败不阻塞启动（云端网络/权限可能限制 Excel 读取）。
+    try:
+        from database import SessionLocal as _SL
+        from services.data_version import current_business_date, resolve_source_folder
+        from models import AShareFinancialSnapshot
+        db = _SL()
+        try:
+            biz = current_business_date()
+            if biz:
+                have = db.query(AShareFinancialSnapshot).filter(
+                    AShareFinancialSnapshot.as_of_date == biz
+                ).count()
+                if have == 0:
+                    folder = resolve_source_folder(biz)
+                    if folder and folder.exists():
+                        from scripts.import_fund_index_map import import_fund_index_map
+                        from scripts.import_index_constituents import import_index_constituents
+                        from scripts.import_a_share_financials import import_a_share
+                        from scripts.import_hk_share_financials import import_hk_share
+                        from services.penetration_v2 import run_penetration as run_pen
+                        from services.aggregation import refresh_all_dimensions, write_timeseries_for_day
+                        import_fund_index_map(db, biz, folder / "基金-指数.xlsx")
+                        import_index_constituents(db, folder / "指数构成.xlsx")
+                        import_a_share(db, biz, folder / "全部A股.xlsx")
+                        import_hk_share(db, biz, folder / "全部港股.xlsx")
+                        # Optional: 399673_cons.xlsx if present
+                        cons_399673 = folder / "399673_cons.xlsx"
+                        if cons_399673.exists():
+                            from scripts.import_399673_cons import import_399673 as imp_399673
+                            imp_399673(db, cons_399673)
+                        run_pen(db, biz)
+                        refresh_all_dimensions(db, biz)
+                        write_timeseries_for_day(db, biz, biz)
+                        import logging
+                        logging.getLogger(__name__).info(
+                            "auto-imported snapshots for %s from %s", biz, folder.name
+                        )
+        finally:
+            db.close()
+    except Exception as e:
+        import logging
+        logging.getLogger(__name__).warning("snapshot auto-import failed (non-fatal): %s", e)
 
 
 @app.on_event("shutdown")
@@ -1706,3 +1751,1087 @@ def search_securities(q: str = Query("", description="代码或名称关键字")
 
     return results
 
+
+# ============================================================================
+# Fund Penetration & Industry Aggregation API (spec §4.1)
+# ============================================================================
+
+from services.data_version import (
+    current_business_date,
+    list_available_versions,
+    resolve_source_folder,
+)
+from services.penetration_v2 import run_penetration as run_penetration_v2
+from services.aggregation import (
+    aggregate_dimension,
+    upsert_dimension,
+    write_timeseries_for_day,
+)
+
+
+@app.get("/api/data-version")
+def get_data_version(db: Session = Depends(get_db)):
+    """当前活跃业务日期 + 各市场最新股价日期 + 历史可用版本。"""
+    biz = current_business_date()
+    versions = list_available_versions()
+    # Latest price date per market from snapshots (best-effort)
+    from models import AShareFinancialSnapshot, HKShareFinancialSnapshot, PriceCache
+    a_latest = db.query(func.max(AShareFinancialSnapshot.current_price_date)).scalar()
+    hk_latest = db.query(func.max(HKShareFinancialSnapshot.current_price_date)).scalar()
+    us_latest = db.query(func.max(PriceCache.trade_date)).filter(
+        PriceCache.stock_code.like("%.OQ"),
+    ).scalar() or db.query(func.max(PriceCache.trade_date)).filter(
+        PriceCache.stock_code.in_(["NVDA", "GOOGL"]),
+    ).scalar()
+    return {
+        "current_business_date": biz.isoformat() if biz else None,
+        "available_versions": [
+            {"as_of_date": v.as_of_date.isoformat(), "source_folder": v.source_folder,
+             "imported_at": v.imported_at, "note": v.note}
+            for v in versions
+        ],
+        "price_dates": {
+            "CN": a_latest.isoformat() if a_latest else None,
+            "HK": hk_latest.isoformat() if hk_latest else None,
+            "US": us_latest.isoformat() if us_latest else None,
+        },
+    }
+
+
+def _resolve_market_value(stock_code: str, amount_cny: float, snap,
+                          current_price: float | None,
+                          baseline_price: float | None):
+    """Compute shares / est_market_value / deviation based on prices.
+
+    For drilled_fund rows: amount_cny is already the *dynamic* amount
+    (weight × original_amount × current/baseline). So:
+      shares = amount_static / baseline_price
+      est_market_value_at_current = shares × current_price = amount_dynamic
+      deviation = amount_dynamic - amount_static
+
+    For direct_stock rows: amount_cny is the import-time amount.
+      shares = amount_cny / baseline_price (if baseline known)
+      est_market_value_at_current = shares × current_price
+      deviation = est_market_value_at_current - amount_cny
+
+    For undrilled_fund / cash: no prices, return zeros.
+    """
+    if not snap or not baseline_price or baseline_price <= 0:
+        return None, amount_cny, 0.0
+    shares = amount_cny / baseline_price
+    if current_price and current_price > 0:
+        est_value = shares * current_price
+    else:
+        est_value = amount_cny
+    deviation_pct = ((est_value - amount_cny) / amount_cny * 100) if amount_cny else 0.0
+    return round(shares, 2), round(est_value, 4), round(deviation_pct, 4)
+
+
+def _pct_change_3m(stock_code: str, current_price: float | None, db) -> float | None:
+    """Compute 3-month price change using price_cache.
+
+    current_price is the latest known close. price_3m_ago is the latest close
+    on or before (today - 90 calendar days).
+    """
+    if not current_price:
+        return None
+    from datetime import timedelta
+    from models import PriceCache
+    target = date.today() - timedelta(days=90)
+    row = (
+        db.query(PriceCache)
+        .filter(PriceCache.stock_code == stock_code)
+        .filter(PriceCache.trade_date <= target)
+        .filter(PriceCache.close_px.isnot(None))
+        .order_by(PriceCache.trade_date.desc())
+        .first()
+    )
+    if not row or not row.close_px or row.close_px <= 0:
+        return None
+    pct = (current_price - row.close_px) / row.close_px * 100
+    if pct != pct or pct in (float('inf'), float('-inf')):
+        return None
+    return round(pct, 2)
+
+
+@app.get("/api/penetration/full-holding")
+def get_full_holding(
+    as_of_date: date = Query(...),
+    db: Session = Depends(get_db),
+):
+    """返回 full_holding_snapshot 全量（下钻基金 + 直接股票 + 不下钻基金 + 现金）。
+
+    - 同代码的证券已合并为单行（amount 求和，PE/PB/PS 取首个非空）。
+    - *_dynamic 缺失时回退到 baseline (5/29)。
+    - 估算市值 = 股数 × 上一交易日收盘价（shares = amount / baseline_price）。
+    - 估算偏差% = (估算市值 - 持仓金额) / 持仓金额。
+    - 3月涨跌% = (current_price - 90天前收盘价) / 90天前收盘价 × 100。
+    """
+    from models import FullHoldingSnapshot, AShareFinancialSnapshot, HKShareFinancialSnapshot
+    rows = db.query(FullHoldingSnapshot).filter(FullHoldingSnapshot.as_of_date == as_of_date).all()
+
+    # Build dual indexes: a_snap is keyed by BOTH the raw code (e.g. "2104")
+    # AND the suffixed code (e.g. "002104"). Same for h_snap with HK padding.
+    # This handles the case where full_holding uses raw integer codes (from
+    # index constituents) while snapshots use suffixed codes (from Excel).
+    def _index_a_snap(db, as_of_date):
+        idx = {}
+        for a in db.query(AShareFinancialSnapshot).filter(AShareFinancialSnapshot.as_of_date == as_of_date).all():
+            norm = a.stock_code.split(".")[0]
+            idx[norm] = a
+            idx[a.stock_code] = a
+            if norm.isdigit() and len(norm) == 6:
+                # also index the unpadded last-N-digits so 4-digit constituent codes match
+                idx[norm.lstrip("0")] = a
+        return idx
+
+    def _index_h_snap(db, as_of_date):
+        idx = {}
+        for h in db.query(HKShareFinancialSnapshot).filter(HKShareFinancialSnapshot.as_of_date == as_of_date).all():
+            norm = h.stock_code.split(".")[0]
+            idx[norm] = h
+            idx[h.stock_code] = h
+            if norm.isdigit():
+                # Pad unpadded (4-digit → 5-digit) and vice versa
+                if len(norm) <= 5:
+                    idx[norm.zfill(5)] = h
+                idx[norm.lstrip("0")] = h
+        return idx
+
+    a_snap = _index_a_snap(db, as_of_date)
+    h_snap = _index_h_snap(db, as_of_date)
+
+    from models import Holding
+    static_by_holding = {}
+    for h in db.query(Holding).all():
+        static_by_holding[h.security_code] = static_by_holding.get(h.security_code, 0) + (h.amount_cny or 0)
+
+    out = []
+    for r in rows:
+        # Try multiple lookup keys:
+        #   1. r.stock_code (full, possibly with suffix)
+        #   2. norm = suffix-stripped
+        #   3. For HK: norm.zfill(5) (constituents use 4-digit, snapshot uses 5-digit)
+        #   4. For A-share: norm.zfill(6) (constituents use raw 4-digit, snapshot uses 6-digit)
+        norm = r.stock_code.split(".")[0]
+        keys = [r.stock_code, norm]
+        if norm.isdigit():
+            keys.append(norm.zfill(5))
+            keys.append(norm.zfill(6))
+        snap = None
+        for k in keys:
+            snap = a_snap.get(k) or h_snap.get(k)
+            if snap:
+                break
+        # Priority: snap dynamic (recomputed from current price) > snap baseline > null
+        if snap:
+            pe_v = snap.pe_ttm_dynamic if snap.pe_ttm_dynamic is not None else snap.pe_ttm
+            pb_v = snap.pb_mrq_dynamic if snap.pb_mrq_dynamic is not None else snap.pb_mrq
+            ps_v = snap.ps_ttm_dynamic if snap.ps_ttm_dynamic is not None else snap.ps_ttm
+            basis = "dynamic" if snap.pe_ttm_dynamic is not None else "baseline_5_29"
+        else:
+            pe_v = r.pe_ttm_dynamic
+            pb_v = r.pb_mrq_dynamic
+            ps_v = r.ps_ttm_dynamic
+            basis = "dynamic"
+
+        baseline_price = snap.baseline_price if snap else None
+        current_price = snap.current_price if snap else None
+        current_price_date = snap.current_price_date if snap else None
+
+        if r.source_type == "drilled_fund":
+            static_amount = static_by_holding.get(r.source_holding_code, r.amount_cny)
+        else:
+            static_amount = r.amount_cny
+        shares, est_value, dev_pct = _resolve_market_value(
+            r.stock_code, static_amount, snap, current_price, baseline_price
+        )
+        pct_3m = _pct_change_3m(r.stock_code, current_price, db)
+
+        out.append({
+            "stock_code": r.stock_code,
+            "stock_name": r.stock_name,
+            "source_type": r.source_type,
+            "source_holding_code": r.source_holding_code,
+            "amount_cny": r.amount_cny,
+            "static_amount_cny": static_amount,
+            "shares": shares,
+            "baseline_price": baseline_price,
+            "current_price": current_price,
+            "current_price_date": current_price_date.isoformat() if current_price_date else None,
+            "est_market_value_cny": est_value,
+            "est_deviation_pct": dev_pct,
+            "pct_change_3m": pct_3m,
+            "industry_l1": r.industry_l1,
+            "industry_l2": r.industry_l2,
+            "chain_position": r.chain_position,
+            "growth_tier": r.growth_tier,
+            "competition": r.competition,
+            "pe_ttm_dynamic": pe_v,
+            "pb_mrq_dynamic": pb_v,
+            "ps_ttm_dynamic": ps_v,
+            "dividend_yield": snap.dividend_yield if snap else None,
+            "eps_fy1": r.eps_fy1,
+            "metric_basis": basis,
+        })
+    return out
+
+
+@app.get("/api/penetration/dimension")
+def get_dimension(
+    dim: str = Query(..., regex="^(swy1|swy2|swy3|swy4|csi1|csi2|csi3|csi4|se1|se2|se3|se4|l1|l2|chain|growth_tier|competition)$"),
+    as_of_date: date = Query(...),
+    market: str = Query("A+H", regex="^(A\\+H|A|H)$"),
+    db: Session = Depends(get_db),
+):
+    """统一维度聚合（组合 vs CSI300）。
+
+    支持 9 套行业系统 (申万 L1-L4 + 中证 L1-L4 + 战略新兴 L1-L4)
+    + 链位置 / 增长分层 / 竞争格局。
+    market=A+H (全部) / A (A 股) / H (港股)。
+    """
+    from models import AggregationCache
+    portfolio = aggregate_dimension(db, as_of_date, "portfolio", dim, market=market)
+    csi300 = aggregate_dimension(db, as_of_date, "csi300", dim)
+    return {
+        "as_of_date": as_of_date.isoformat(),
+        "dimension": dim,
+        "market": market,
+        "portfolio": [
+            {
+                "key": r.key,
+                "stock_count": r.stock_count,
+                "amount_cny": r.amount_cny,
+                "weight_pct": r.weight_pct,
+                "virtual_earnings": r.virtual_earnings,
+                "pe_weighted": r.pe_weighted,
+                "pb_weighted": r.pb_weighted,
+                "ps_weighted": r.ps_weighted,
+            }
+            for r in portfolio if r.key != "_total"
+        ],
+        "csi300": [
+            {
+                "key": r.key,
+                "stock_count": r.stock_count,
+                "weight_pct": r.weight_pct,
+                "pe_weighted": r.pe_weighted,
+                "pb_weighted": r.pb_weighted,
+                "ps_weighted": r.ps_weighted,
+            }
+            for r in csi300 if r.key != "_total"
+        ],
+        "totals": {
+            "portfolio": _agg_total(portfolio),
+            "csi300": _agg_total(csi300),
+        },
+    }
+
+
+def _agg_total(rows):
+    for r in rows:
+        if r.key == "_total":
+            return {
+                "stock_count": r.stock_count,
+                "amount_cny": r.amount_cny,
+                "pe_weighted": r.pe_weighted,
+                "pb_weighted": r.pb_weighted,
+                "ps_weighted": r.ps_weighted,
+            }
+    return None
+
+
+@app.get("/api/penetration/dimension-detail")
+def get_dimension_detail(
+    dim: str = Query(..., regex="^(swy1|swy2|swy3|swy4|csi1|csi2|csi3|csi4|se1|se2|se3|se4|l1|l2|chain|growth_tier|competition)$"),
+    key: str = Query(...),
+    as_of_date: date = Query(...),
+    market: str = Query("A+H", regex="^(A\\+H|A|H)$"),
+    db: Session = Depends(get_db),
+):
+    """下钻明细：某维度 key 下的每只股票。"""
+    from models import FullHoldingSnapshot, Csi300ConstituentSnapshot
+    from sqlalchemy import func
+    DIM_COL = {
+        "swy1": "swy_l1", "swy2": "swy_l2", "swy3": "swy_l3", "swy4": "swy_l4",
+        "csi1": "csi_l1", "csi2": "csi_l2", "csi3": "csi_l3", "csi4": "csi_l4",
+        "se1": "se_l1", "se2": "se_l2", "se3": "se_l3", "se4": "se_l4",
+        "l1": "swy_l1", "l2": "swy_l2",
+        "chain": "chain_position", "growth_tier": "growth_tier", "competition": "competition",
+    }
+    col = DIM_COL[dim]
+    q = db.query(FullHoldingSnapshot).filter(
+        FullHoldingSnapshot.as_of_date == as_of_date,
+        getattr(FullHoldingSnapshot, col) == key,
+    )
+    if market == "A":
+        q = q.filter(
+            (FullHoldingSnapshot.stock_code.like("%.SH")) |
+            (FullHoldingSnapshot.stock_code.like("%.SZ"))
+        )
+    elif market == "H":
+        q = q.filter(FullHoldingSnapshot.stock_code.like("%.HK"))
+    raw = q.all()
+    by_stock: dict[str, dict] = {}
+    for r in raw:
+        s = by_stock.setdefault(r.stock_code, {
+            "stock_code": r.stock_code, "stock_name": r.stock_name,
+            "amount_cny": 0.0, "pe_ttm_dynamic": None,
+            "pb_mrq_dynamic": None, "ps_ttm_dynamic": None,
+            "industry_l2": getattr(r, "swy_l2", None) or getattr(r, "csi_l2", None) or getattr(r, "se_l2", None),
+            "chain_position": r.chain_position,
+            "source_funds": set(), "is_direct": False,
+        })
+        s["amount_cny"] += (r.amount_cny or 0.0)
+        if s["pe_ttm_dynamic"] is None and r.pe_ttm_dynamic is not None:
+            s["pe_ttm_dynamic"] = r.pe_ttm_dynamic
+        if s["pb_mrq_dynamic"] is None and r.pb_mrq_dynamic is not None:
+            s["pb_mrq_dynamic"] = r.pb_mrq_dynamic
+        if s["ps_ttm_dynamic"] is None and r.ps_ttm_dynamic is not None:
+            s["ps_ttm_dynamic"] = r.ps_ttm_dynamic
+        if r.source_type == "direct_stock":
+            s["is_direct"] = True
+        elif r.source_holding_code:
+            s["source_funds"].add(r.source_holding_code)
+    out = []
+    for s in by_stock.values():
+        s["source_funds"] = sorted(s["source_funds"])
+        out.append(s)
+    out.sort(key=lambda x: x["amount_cny"] or 0, reverse=True)
+    return {"as_of_date": as_of_date.isoformat(), "dimension": dim, "key": key, "market": market, "stocks": out}
+
+
+def _is_hk_code(stock_code: str) -> bool:
+    return stock_code.upper().endswith(".HK")
+
+
+def _portfolio_scope_totals(db: Session, as_of_date: _date, market: str):
+    """Compute virtual-earnings totals for portfolio over a market scope.
+
+    market: 'A+H' (all stocks), 'A' (A-share only), 'H' (HK only)
+    Returns: { stock_count, total_amount, weighted_pe, weighted_pb, weighted_ps,
+              weighted_eps_fy1, virt_pe, virt_pb, virt_ps, sum_eps_weighted }
+    """
+    from sqlalchemy import func as sa_func
+    from models import FullHoldingSnapshot, AShareFinancialSnapshot, HKShareFinancialSnapshot
+
+    q = db.query(
+        FullHoldingSnapshot.stock_code,
+        FullHoldingSnapshot.swy_l1,
+        FullHoldingSnapshot.swy_l2,
+        FullHoldingSnapshot.swy_l3,
+        FullHoldingSnapshot.csi_l1,
+        FullHoldingSnapshot.csi_l2,
+        FullHoldingSnapshot.csi_l3,
+        FullHoldingSnapshot.csi_l4,
+        sa_func.sum(FullHoldingSnapshot.amount_cny).label("amount"),
+        sa_func.max(FullHoldingSnapshot.pe_ttm_dynamic).label("pe_d"),
+        sa_func.max(FullHoldingSnapshot.pb_mrq_dynamic).label("pb_d"),
+        sa_func.max(FullHoldingSnapshot.ps_ttm_dynamic).label("ps_d"),
+        sa_func.max(FullHoldingSnapshot.eps_fy1).label("eps"),
+    ).filter(
+        FullHoldingSnapshot.as_of_date == as_of_date,
+        FullHoldingSnapshot.source_type.in_(("drilled_fund", "direct_stock")),
+    ).group_by(
+        FullHoldingSnapshot.stock_code,
+        FullHoldingSnapshot.swy_l1, FullHoldingSnapshot.swy_l2, FullHoldingSnapshot.swy_l3,
+        FullHoldingSnapshot.csi_l1, FullHoldingSnapshot.csi_l2, FullHoldingSnapshot.csi_l3, FullHoldingSnapshot.csi_l4,
+    )
+
+    a_snap = {a.stock_code.split(".")[0]: a for a in
+              db.query(AShareFinancialSnapshot).filter_by(as_of_date=as_of_date).all()}
+    h_snap = {h.stock_code.split(".")[0]: h for h in
+              db.query(HKShareFinancialSnapshot).filter_by(as_of_date=as_of_date).all()}
+    for code, snap in list(a_snap.items()):
+        if snap.stock_code.endswith(".SZ"):
+            a_snap[code] = snap
+        elif snap.stock_code.endswith(".SH"):
+            a_snap[code] = snap
+
+    total_amount = 0.0
+    virt_pe = virt_pb = virt_ps = 0.0
+    sum_dy_weighted = 0.0
+    stock_count = 0
+    breakdown = []  # for click-to-expand: top stocks contributing
+    for r in q.all():
+        code_norm = r.stock_code.split(".")[0]
+        is_hk = _is_hk_code(r.stock_code) or (r.csi_l1 and r.csi_l1 != "其他")
+        # More reliable HK detection: try snap lookup
+        snap = None
+        if code_norm in h_snap:
+            snap = h_snap[code_norm]
+            is_hk = True
+        elif code_norm in a_snap:
+            snap = a_snap[code_norm]
+            is_hk = False
+        # Fallback by suffix
+        if snap is None:
+            if r.stock_code.upper().endswith(".HK"):
+                is_hk = True
+            elif r.stock_code.upper().endswith((".SH", ".SZ")):
+                is_hk = False
+        if market == "A" and is_hk:
+            continue
+        if market == "H" and not is_hk:
+            continue
+
+        amt = r.amount or 0.0
+        total_amount += amt
+        stock_count += 1
+        pe_d = r.pe_d
+        pb_d = r.pb_d
+        ps_d = r.ps_d
+        dy = None
+        # Fallback to snap if dynamic fields null
+        if (pe_d is None or pb_d is None or ps_d is None or dy is None) and snap:
+            if pe_d is None:
+                pe_d = snap.pe_ttm_dynamic if snap.pe_ttm_dynamic is not None else snap.pe_ttm
+            if pb_d is None:
+                pb_d = snap.pb_mrq_dynamic if snap.pb_mrq_dynamic is not None else snap.pb_mrq
+            if ps_d is None:
+                ps_d = snap.ps_ttm_dynamic if snap.ps_ttm_dynamic is not None else snap.ps_ttm
+            dy = snap.dividend_yield
+        if amt > 0:
+            if pe_d and pe_d > 0:
+                virt_pe += amt / pe_d
+                breakdown.append({"stock": r.stock_code, "amount": amt, "pe": pe_d, "amt_pe": amt / pe_d})
+            if pb_d and pb_d > 0:
+                virt_pb += amt / pb_d
+            if ps_d and ps_d > 0:
+                virt_ps += amt / ps_d
+            if dy is not None:
+                sum_dy_weighted += amt * dy
+
+    # Top 30 contributors to PE (for click-to-expand panel)
+    breakdown.sort(key=lambda x: x["amt_pe"], reverse=True)
+    breakdown = breakdown[:30]
+
+    return {
+        "stock_count": stock_count,
+        "total_amount_cny": round(total_amount, 4),
+        # PE = amount / (amount/PE) = total / virt_pe (per-share inversion of E/P)
+        "weighted_pe": round(total_amount / virt_pe, 4) if virt_pe else None,
+        "weighted_pb": round(total_amount / virt_pb, 4) if virt_pb else None,
+        "weighted_ps": round(total_amount / virt_ps, 4) if virt_ps else None,
+        # 股息率 is a direct amount-weighted average
+        "weighted_dividend_yield": round(sum_dy_weighted / total_amount, 4) if total_amount else None,
+        "virtual_earnings": round(virt_pe, 4),
+        "top_pe_contributors": breakdown,
+    }
+
+
+def _csi300_scope_totals(db: Session, as_of_date: _date):
+    """Compute CSI300 virtual-earnings totals using 5/29 weight × price ratio as amount.
+
+    Returns: { stock_count, total_amount, weighted_pe, weighted_pb, weighted_ps,
+              weighted_eps_fy1 }
+    """
+    from sqlalchemy import func as sa_func
+    from models import Csi300ConstituentSnapshot, AShareFinancialSnapshot, HKShareFinancialSnapshot
+
+    a_snap = {a.stock_code.split(".")[0]: a for a in
+              db.query(AShareFinancialSnapshot).filter_by(as_of_date=as_of_date).all()}
+    h_snap = {h.stock_code.split(".")[0]: h for h in
+              db.query(HKShareFinancialSnapshot).filter_by(as_of_date=as_of_date).all()}
+
+    rows = db.query(
+        Csi300ConstituentSnapshot.stock_code,
+        sa_func.max(Csi300ConstituentSnapshot.weight).label("weight"),
+        sa_func.max(Csi300ConstituentSnapshot.pe_ttm_dynamic).label("pe_d"),
+        sa_func.max(Csi300ConstituentSnapshot.pb_mrq_dynamic).label("pb_d"),
+        sa_func.max(Csi300ConstituentSnapshot.ps_ttm_dynamic).label("ps_d"),
+    ).filter(Csi300ConstituentSnapshot.as_of_date == as_of_date).group_by(
+        Csi300ConstituentSnapshot.stock_code).all()
+
+    total = 0.0
+    virt_pe = virt_pb = virt_ps = 0.0
+    sum_dy_weighted = 0.0
+    count = 0
+    breakdown = []
+    for r in rows:
+        code_norm = r.stock_code.split(".")[0]
+        weight = r.weight or 0.0
+        # Price-adjusted weight
+        snap = a_snap.get(code_norm) or h_snap.get(code_norm)
+        if not snap and code_norm.isdigit():
+            snap = h_snap.get(code_norm.zfill(5))
+        if snap and snap.baseline_price and snap.current_price and snap.baseline_price > 0:
+            weight = weight * (snap.current_price / snap.baseline_price)
+        pe_d = r.pe_d
+        pb_d = r.pb_d
+        ps_d = r.ps_d
+        if (pe_d is None or pb_d is None or ps_d is None) and snap:
+            if pe_d is None:
+                pe_d = snap.pe_ttm_dynamic if snap.pe_ttm_dynamic is not None else snap.pe_ttm
+            if pb_d is None:
+                pb_d = snap.pb_mrq_dynamic if snap.pb_mrq_dynamic is not None else snap.pb_mrq
+            if ps_d is None:
+                ps_d = snap.ps_ttm_dynamic if snap.ps_ttm_dynamic is not None else snap.ps_ttm
+        total += weight
+        count += 1
+        if weight > 0:
+            if pe_d and pe_d > 0:
+                virt_pe += weight / pe_d
+                breakdown.append({"stock": r.stock_code, "amount": weight, "pe": pe_d, "amt_pe": weight / pe_d})
+            if pb_d and pb_d > 0:
+                virt_pb += weight / pb_d
+            if ps_d and ps_d > 0:
+                virt_ps += weight / ps_d
+            if snap and snap.dividend_yield is not None:
+                sum_dy_weighted += weight * snap.dividend_yield
+
+    breakdown.sort(key=lambda x: x["amt_pe"], reverse=True)
+    breakdown = breakdown[:30]
+
+    return {
+        "stock_count": count,
+        "total_amount_cny": round(total, 4),  # weight sum (normalized to ~100)
+        "weighted_pe": round(total / virt_pe, 4) if virt_pe else None,
+        "weighted_pb": round(total / virt_pb, 4) if virt_pb else None,
+        "weighted_ps": round(total / virt_ps, 4) if virt_ps else None,
+        "weighted_dividend_yield": round(sum_dy_weighted / total, 4) if total else None,
+        "virtual_earnings": round(virt_pe, 4),
+        "top_pe_contributors": breakdown,
+    }
+
+
+@app.get("/api/penetration/portfolio-vs-csi300")
+def get_portfolio_vs_csi300(
+    as_of_date: date = Query(...),
+    db: Session = Depends(get_db),
+):
+    """A+H / A / H / CSI300 四套口径的聚合指标，使用虚拟盈利法。
+
+    portfolio 金额是 CNY；CSI300 是 5/29 weight × price-adjusted（归一化比例）。
+    每个口径：股票数 / 总金额 / weighted PE / PB / PS / EPS_FY1。
+    """
+    return {
+        "as_of_date": as_of_date.isoformat(),
+        "ah": _portfolio_scope_totals(db, as_of_date, "A+H"),
+        "a_only": _portfolio_scope_totals(db, as_of_date, "A"),
+        "h_only": _portfolio_scope_totals(db, as_of_date, "H"),
+        "csi300": _csi300_scope_totals(db, as_of_date),
+    }
+
+
+@app.get("/api/penetration/timeseries")
+def get_timeseries(
+    scope: str = Query("portfolio", regex="^(portfolio|csi300|both)$"),
+    metric: str = Query("pe_weighted", regex="^(pe_weighted|pb_weighted|ps_weighted|virtual_earnings|total_amount)$"),
+    window: int = Query(90, regex="^(90|180|360)$"),
+    db: Session = Depends(get_db),
+):
+    """序时估值时序（spec §4.6）。"""
+    from datetime import timedelta
+    from models import AggregationTimeseries
+    today_d = date.today()
+    start = today_d - timedelta(days=window)
+    scopes = ("portfolio", "csi300") if scope == "both" else (scope,)
+    out: list[dict] = []
+    seen_dates: set[date] = set()
+    for s in scopes:
+        rows = db.query(AggregationTimeseries).filter(
+            AggregationTimeseries.scope == s,
+            AggregationTimeseries.calc_date >= start,
+        ).order_by(AggregationTimeseries.calc_date).all()
+        for r in rows:
+            val = getattr(r, metric, None)
+            if val is None:
+                continue
+            out.append({
+                "calc_date": r.calc_date.isoformat(),
+                "scope": s,
+                "value": val,
+                "business_date": r.business_date.isoformat(),
+            })
+            seen_dates.add(r.calc_date)
+    # Identify missing trading days in the window
+    from services.trading_calendar import is_trading_day
+    missing: list[str] = []
+    cur = start
+    while cur <= today_d:
+        if cur not in seen_dates and is_trading_day("CN", cur, db):
+            missing.append(cur.isoformat())
+        cur += timedelta(days=1)
+    return {
+        "as_of_date": current_business_date().isoformat() if current_business_date() else None,
+        "metric": metric,
+        "window_days": window,
+        "scope": scope,
+        "data": out,
+        "missing_dates": missing,
+    }
+
+
+@app.get("/api/penetration/kpi")
+def get_kpi(
+    as_of_date: date = Query(...),
+    db: Session = Depends(get_db),
+):
+    """顶部 KPI bar 实时数据（替换硬编码）。"""
+    from models import FullHoldingSnapshot, AggregationCache
+    from sqlalchemy import func
+
+    total_amount = db.query(func.coalesce(func.sum(FullHoldingSnapshot.amount_cny), 0)).filter(
+        FullHoldingSnapshot.as_of_date == as_of_date,
+    ).scalar() or 0
+    drilled_stocks = db.query(func.count(func.distinct(FullHoldingSnapshot.stock_code))).filter(
+        FullHoldingSnapshot.as_of_date == as_of_date,
+    ).scalar() or 0
+
+    # Read _total row from cache (must be populated first)
+    p_total = db.query(AggregationCache).filter(
+        AggregationCache.as_of_date == as_of_date,
+        AggregationCache.scope == "portfolio",
+        AggregationCache.dimension == "l1",
+        AggregationCache.key == "_total",
+    ).first()
+
+    high_g = db.query(func.coalesce(func.sum(AggregationCache.weight_pct), 0)).filter(
+        AggregationCache.as_of_date == as_of_date,
+        AggregationCache.scope == "portfolio",
+        AggregationCache.dimension == "growth_tier",
+        AggregationCache.key == "high",
+    ).scalar() or 0
+    midstream = db.query(func.coalesce(func.sum(AggregationCache.weight_pct), 0)).filter(
+        AggregationCache.as_of_date == as_of_date,
+        AggregationCache.scope == "portfolio",
+        AggregationCache.dimension == "chain",
+        AggregationCache.key == "midstream",
+    ).scalar() or 0
+
+    return {
+        "as_of_date": as_of_date.isoformat(),
+        "values": {
+            "total_amount_cny": round(total_amount, 2),
+            "drilled_stock_count": drilled_stocks,
+            "portfolio_pe_weighted": p_total.pe_weighted if p_total else None,
+            "portfolio_pb_weighted": p_total.pb_weighted if p_total else None,
+            "portfolio_ps_weighted": p_total.ps_weighted if p_total else None,
+            "high_growth_weight_pct": float(high_g or 0),
+            "midstream_weight_pct": float(midstream or 0),
+        },
+    }
+
+
+@app.post("/api/admin/import-source-data")
+def admin_import_source_data(
+    source_folder: str = Query(...),
+    db: Session = Depends(get_db),
+):
+    """Trigger all 4 importers + penetration + aggregation for a given source folder."""
+    folder = resolve_source_folder(_date_from_folder(source_folder))
+    if folder is None or not folder.exists():
+        raise HTTPException(status_code=404, detail=f"source folder not found: {source_folder}")
+    from datetime import datetime as _dt
+    # Parse as_of_date from folder name: YYYYMM数据
+    yyyymm = source_folder.replace("数据", "")
+    if len(yyyymm) != 6:
+        raise HTTPException(status_code=400, detail="folder must be YYYYMM数据")
+    as_of = date(int(yyyymm[:4]), int(yyyymm[4:6]), 1)
+    reports = []
+    # Run each importer
+    from scripts.import_fund_index_map import import_fund_index_map
+    rep = import_fund_index_map(db, as_of, folder / "基金-指数.xlsx")
+    reports.append(rep.__dict__)
+    from scripts.import_index_constituents import import_index_constituents
+    rep = import_index_constituents(db, folder / "指数构成.xlsx")
+    reports.append({"as_of_date": rep.as_of_date.isoformat(), "table": rep.table,
+                    "rows_inserted": rep.rows_inserted, "rows_skipped": rep.rows_skipped,
+                    "errors": rep.errors})
+    from scripts.import_a_share_financials import import_a_share
+    rep = import_a_share(db, as_of, folder / "全部A股.xlsx")
+    reports.append(rep.__dict__)
+    from scripts.import_hk_share_financials import import_hk_share
+    rep = import_hk_share(db, as_of, folder / "全部港股.xlsx")
+    reports.append(rep.__dict__)
+    # Optional: 399673_cons.xlsx (深交所官方权重,优于 指数构成.xlsx 中同 sheet 的无权重数据)
+    cons_399673 = folder / "399673_cons.xlsx"
+    if cons_399673.exists():
+        from scripts.import_399673_cons import import_399673
+        rep = import_399673(db, cons_399673)
+        reports.append(rep.__dict__)
+    # Run penetration + aggregation
+    pn = run_penetration_v2(db, as_of)
+    from services.aggregation import refresh_all_dimensions
+    refresh_all_dimensions(db, as_of)
+    write_timeseries_for_day(db, as_of, as_of)
+    return {
+        "as_of_date": as_of.isoformat(),
+        "source_folder": source_folder,
+        "imports": reports,
+        "penetration": {
+            "holdings_seen": pn.holdings_seen,
+            "holdings_drilled": pn.holdings_drilled,
+            "rows_inserted_pnsnap": pn.rows_inserted_pnsnap,
+            "rows_inserted_fhsnap": pn.rows_inserted_fhsnap,
+        },
+    }
+
+
+def _date_from_folder(folder: str) -> date:
+    yyyymm = folder.replace("数据", "")
+    return date(int(yyyymm[:4]), int(yyyymm[4:6]), 1)
+
+
+@app.post("/api/admin/recalc-aggregation")
+def admin_recalc_aggregation(
+    as_of_date: date = Query(...),
+    db: Session = Depends(get_db),
+):
+    """重算某 as_of_date 的聚合缓存 + 当日时序。"""
+    refresh_all_dimensions(db, as_of_date)
+    write_timeseries_for_day(db, as_of_date, as_of_date)
+    return {"as_of_date": as_of_date.isoformat(), "status": "ok"}
+
+
+@app.post("/api/admin/fill-prices-tencent")
+def admin_fill_prices_tencent(
+    as_of_date: date = Query(...),
+    max_codes: int = Query(200, ge=1, le=5000),
+    db: Session = Depends(get_db),
+):
+    """通过腾讯 API 拉取 current_price，填充 price_cache + 重算 dynamic PE/PB/PS。"""
+    from services.price_filler import fill_prices_for_as_of
+    return fill_prices_for_as_of(db, as_of_date, max_codes=max_codes)
+
+
+
+@app.get("/api/penetration/hk-concepts")
+def get_hk_concepts(
+    as_of_date: date = Query(...),
+    se_level: int = Query(1, ge=1, le=4),
+    db: Session = Depends(get_db),
+):
+    """港股概念 (战略新兴产业 L1-L4) 表格化展示。
+
+    数据从 HKShareFinancialSnapshot.se_l1..l4 读取，按 `se_level` 选择层级。
+    单元格里的 "概念A;概念B"（如果将来 Excel 用分号分隔）会被拆分到多行，
+    同一股票在多个概念下各显示一行；同一概念下所有股票聚合。
+    支持对任意列（股票、概念、PE、PB 等）做聚类汇总。
+    """
+    from models import HKShareFinancialSnapshot, FullHoldingSnapshot
+    se_col = f"se_l{se_level}"
+
+    rows = db.query(HKShareFinancialSnapshot).filter(
+        HKShareFinancialSnapshot.as_of_date == as_of_date,
+    ).all()
+
+    expanded: list[dict] = []
+    for r in rows:
+        raw = (getattr(r, se_col) or "").strip()
+        if not raw or raw in ("--", "—", "nan", "其他", "其他", ""):
+            continue
+        # Split semicolon-separated values; trim each
+        concepts = [c.strip() for c in raw.split(";") if c.strip() and c.strip() not in ("--", "—", "nan", "其他")]
+        for concept in concepts:
+            expanded.append({
+                "stock_code": r.stock_code,
+                "stock_name": r.stock_name,
+                "concept": concept,
+                "pe_ttm": r.pe_ttm,
+                "pb_mrq": r.pb_mrq,
+                "ps_ttm": r.ps_ttm,
+                "dividend_yield": r.dividend_yield,
+                "baseline_price": r.baseline_price,
+                "current_price": r.current_price,
+            })
+
+    # Aggregate by concept for cluster summary
+    by_concept: dict[str, dict] = {}
+    for r in expanded:
+        c = r["concept"]
+        b = by_concept.setdefault(c, {
+            "concept": c, "stock_count": 0, "_stocks": set(),
+            "virt_pe": 0.0, "virt_pb": 0.0, "virt_ps": 0.0,
+        })
+        b["stock_count"] = len(b["_stocks"])
+        b["_stocks"].add(r["stock_code"])
+        if r["pe_ttm"] and r["pe_ttm"] > 0:
+            b["virt_pe"] += 1 / r["pe_ttm"]
+        if r["pb_mrq"] and r["pb_mrq"] > 0:
+            b["virt_pb"] += 1 / r["pb_mrq"]
+        if r["ps_ttm"] and r["ps_ttm"] > 0:
+            b["virt_ps"] += 1 / r["ps_ttm"]
+
+    # Finalize concept aggregates (harmonic mean of PE/PB/PS as simple aggregation)
+    concept_summary = []
+    for b in by_concept.values():
+        n = b["stock_count"]
+        concept_summary.append({
+            "concept": b["concept"],
+            "stock_count": n,
+            "harmonic_pe": round(n / b["virt_pe"], 2) if b["virt_pe"] else None,
+            "harmonic_pb": round(n / b["virt_pb"], 2) if b["virt_pb"] else None,
+            "harmonic_ps": round(n / b["virt_ps"], 2) if b["virt_ps"] else None,
+        })
+    concept_summary.sort(key=lambda x: x["stock_count"], reverse=True)
+
+    return {
+        "as_of_date": as_of_date.isoformat(),
+        "se_level": se_level,
+        "expanded_table": expanded,           # 拆分后的明细表
+        "concept_summary": concept_summary,   # 按概念聚类
+    }
+
+
+@app.get("/api/penetration/drillable-indices")
+def get_drillable_indices(
+    as_of_date: date = Query(...),
+    db: Session = Depends(get_db),
+):
+    """列出所有可下钻的基金（卡片列表）。
+
+    每张卡片: 基金代码/名称/指数/成分股数/静态金额/估算市值/估算偏差%/组合占比/加权 PE PB PS 股息率
+    """
+    from services.drillable_funds import list_drillable_indices
+    return {
+        "as_of_date": as_of_date.isoformat(),
+        "indices": list_drillable_indices(db, as_of_date),
+    }
+
+
+@app.get("/api/penetration/index-drill")
+def get_fund_drill(
+    index_code: str = Query(...),
+    as_of_date: date = Query(...),
+    db: Session = Depends(get_db),
+):
+    """单一基金下钻明细：每只成分股的约当数量 + 昨日最新股价 + 估值指标。"""
+    from services.drillable_funds import get_index_drill_detail
+    return get_index_drill_detail(db, index_code, as_of_date)
+
+
+# ============================================================================
+# 资讯数据 API (a-stock-data skill §5-7)
+# ============================================================================
+# 所有 endpoint 默认走 require_auth (与项目其它端点一致, 需 x-session-token)
+# 手动拉取走 /api/info/crawl/*  (admin 端点, 无需额外鉴权)
+
+
+@app.get("/api/info/global-news")
+def get_global_flash_news(
+    limit: int = Query(50, ge=1, le=200),
+    hours: int | None = Query(None, description="只返回近 N 小时的快讯"),
+    db: Session = Depends(get_db),
+):
+    """东财 7×24 全球快讯 (替代已下线财联社快讯)."""
+    from services.info_service import list_global_flash_news
+    rows = list_global_flash_news(db, limit=limit, hours=hours)
+    return {
+        "count": len(rows),
+        "items": [
+            {
+                "title": r.title,
+                "summary": r.summary,
+                "source": r.source,
+                "url": r.url,
+                "published_at": r.published_at.isoformat() if r.published_at else None,
+            }
+            for r in rows
+        ],
+    }
+
+
+@app.get("/api/info/stock-news/{code}")
+def get_stock_news(
+    code: str,
+    limit: int = Query(20, ge=1, le=100),
+    db: Session = Depends(get_db),
+):
+    """个股新闻 (东财 search-api-web)."""
+    from services.info_service import list_stock_news
+    rows = list_stock_news(db, code=code, limit=limit)
+    return {
+        "code": code,
+        "count": len(rows),
+        "items": [
+            {
+                "title": r.title,
+                "summary": r.summary,
+                "source": r.source,
+                "url": r.url,
+                "published_at": r.published_at.isoformat() if r.published_at else None,
+            }
+            for r in rows
+        ],
+    }
+
+
+@app.get("/api/info/announcements/{code}")
+def get_announcements(
+    code: str,
+    limit: int = Query(30, ge=1, le=200),
+    db: Session = Depends(get_db),
+):
+    """巨潮公告 (cninfo, 动态 orgId)."""
+    from services.info_service import list_announcements
+    rows = list_announcements(db, code=code, limit=limit)
+    return {
+        "code": code,
+        "count": len(rows),
+        "items": [
+            {
+                "announcement_id": r.announcement_id,
+                "title": r.title,
+                "type": r.announcement_type,
+                "publish_date": r.publish_date.isoformat() if r.publish_date else None,
+                "url": r.url,
+            }
+            for r in rows
+        ],
+    }
+
+
+@app.get("/api/info/research/{code}")
+def get_research_reports(
+    code: str,
+    limit: int = Query(30, ge=1, le=200),
+    db: Session = Depends(get_db),
+):
+    """东财研报列表 (含 EPS 预测, 评级)."""
+    from services.info_service import list_research_reports
+    rows = list_research_reports(db, code=code, limit=limit)
+    return {
+        "code": code,
+        "count": len(rows),
+        "items": [
+            {
+                "info_code": r.info_code,
+                "title": r.title,
+                "org_name": r.org_name,
+                "publish_date": r.publish_date.isoformat() if r.publish_date else None,
+                "rating": r.rating,
+                "predict_eps_current": r.predict_eps_current,
+                "predict_eps_next": r.predict_eps_next,
+                "industry": r.industry,
+                "pdf_downloaded": r.pdf_path is not None,
+            }
+            for r in rows
+        ],
+    }
+
+
+@app.get("/api/info/hot-stocks")
+def get_hot_stocks(
+    signal_date: date | None = Query(None, description="YYYY-MM-DD, 默认今天"),
+    limit: int = Query(50, ge=1, le=200),
+    db: Session = Depends(get_db),
+):
+    """同花顺当日强势股 + 题材归因."""
+    from services.info_service import list_hot_stocks
+    d = signal_date or date.today()
+    rows = list_hot_stocks(db, signal_date=d, limit=limit)
+    return {
+        "signal_date": d.isoformat(),
+        "count": len(rows),
+        "items": [
+            {
+                "code": r.stock_code,
+                "name": r.stock_name,
+                "close": r.close,
+                "change_pct": r.change_pct,
+                "turnover_pct": r.turnover_pct,
+                "amount": r.amount,
+                "market": r.market,
+                "reason_tags": r.reason_tags,
+                "rank": r.rank,
+            }
+            for r in rows
+        ],
+    }
+
+
+@app.get("/api/info/themes")
+def get_theme_hotness(
+    signal_date: date | None = Query(None, description="YYYY-MM-DD, 默认今天"),
+    top_n: int = Query(20, ge=1, le=100),
+    db: Session = Depends(get_db),
+):
+    """题材热度聚合 (从热点列表 reason 字段词频统计)."""
+    from services.info_service import list_hot_stocks
+    d = signal_date or date.today()
+    rows = list_hot_stocks(db, signal_date=d, limit=200)
+    items = [
+        {
+            "code": r.stock_code,
+            "name": r.stock_name,
+            "change_pct": r.change_pct,
+            "reason_tags": r.reason_tags,
+        }
+        for r in rows
+    ]
+    from crawlers.signal_ths import aggregate_theme_hotness
+    themes = aggregate_theme_hotness(items, top_n=top_n)
+    return {"signal_date": d.isoformat(), "themes": themes}
+
+
+# ---------- 主动拉取 (admin) ----------
+
+@app.post("/api/info/crawl/global-news")
+def crawl_global_news_endpoint(
+    page_size: int = Query(50, ge=1, le=200),
+    db: Session = Depends(get_db),
+):
+    """主动拉取全球快讯并写入 DB."""
+    from crawlers.news_eastmoney import fetch_global_flash_news
+    from services.info_service import upsert_global_flash_news
+    rows = fetch_global_flash_news(page_size=page_size)
+    written = upsert_global_flash_news(db, rows)
+    return {"fetched": len(rows), "written": written}
+
+
+@app.post("/api/info/crawl/stock-news/{code}")
+def crawl_stock_news_endpoint(
+    code: str,
+    page_size: int = Query(20, ge=1, le=100),
+    db: Session = Depends(get_db),
+):
+    """主动拉取个股新闻."""
+    from crawlers.news_eastmoney import fetch_stock_news
+    from services.info_service import upsert_stock_news
+    rows = fetch_stock_news(code, page_size=page_size)
+    written = upsert_stock_news(db, code, rows)
+    return {"code": code, "fetched": len(rows), "written": written}
+
+
+@app.post("/api/info/crawl/announcements/{code}")
+def crawl_announcements_endpoint(
+    code: str,
+    page_size: int = Query(30, ge=1, le=200),
+    db: Session = Depends(get_db),
+):
+    """主动拉取巨潮公告."""
+    from crawlers.announcement_cninfo import fetch_announcements
+    from services.info_service import upsert_announcements
+    rows = fetch_announcements(code, page_size=page_size)
+    written = upsert_announcements(db, code, rows)
+    return {"code": code, "fetched": len(rows), "written": written}
+
+
+@app.post("/api/info/crawl/research/{code}")
+def crawl_research_endpoint(
+    code: str,
+    max_pages: int = Query(2, ge=1, le=10),
+    db: Session = Depends(get_db),
+):
+    """主动拉取东财研报."""
+    from crawlers.research_em import fetch_reports
+    from services.info_service import upsert_research_reports
+    rows = fetch_reports(code, max_pages=max_pages)
+    written = upsert_research_reports(db, code, rows)
+    return {"code": code, "fetched": len(rows), "written": written}
+
+
+@app.post("/api/info/crawl/hot-stocks")
+def crawl_hot_stocks_endpoint(
+    signal_date: date | None = Query(None),
+    db: Session = Depends(get_db),
+):
+    """主动拉取同花顺当日热点."""
+    from crawlers.signal_ths import fetch_hot_stocks
+    from services.info_service import upsert_hot_stocks
+    d = signal_date or date.today()
+    rows = fetch_hot_stocks(d)
+    written = upsert_hot_stocks(db, d, rows)
+    return {"signal_date": d.isoformat(), "fetched": len(rows), "written": written}

@@ -307,3 +307,429 @@ class ApiCodeMap(Base):
     note = Column(String(200), nullable=True)
     created_at = Column(DateTime, default=datetime.utcnow)
     updated_at = Column(DateTime, default=datetime.utcnow, onupdate=datetime.utcnow)
+
+
+# ============================================================================
+# Fund Penetration & Industry Aggregation (spec §1)
+# All tables are keyed on `as_of_date` so each monthly import is a snapshot.
+# ============================================================================
+
+
+class FundIndexMap(Base):
+    """基金→指数追踪关系（来自 sourceData/YYYYMM数据/基金-指数.xlsx）。"""
+    __tablename__ = "fund_index_map"
+
+    fund_code = Column(String(20), primary_key=True)
+    fund_name = Column(String(80))
+    benchmark_formula = Column(String(500))           # 业绩比较基准原文
+    index_code = Column(String(20), nullable=False)
+    index_name = Column(String(80))
+    as_of_date = Column(Date, primary_key=True)
+    source = Column(String(40), default="excel")
+    note = Column(String(200))
+
+
+class IndexConstituentSnapshot(Base):
+    """指数成分股快照（多时点）。"""
+    __tablename__ = "index_constituent_snapshot"
+    __table_args__ = (
+        UniqueConstraint("as_of_date", "index_code", "stock_code",
+                         name="ux_ics_asof_index_stock"),
+    )
+
+    id = Column(Integer, primary_key=True, autoincrement=True)
+    as_of_date = Column(Date, nullable=False, index=True)
+    index_code = Column(String(20), nullable=False, index=True)
+    index_name = Column(String(80))
+    stock_code = Column(String(20), nullable=False, index=True)
+    stock_name = Column(String(80))
+    exchange = Column(String(8))                       # SSE/SZSE/HKEx
+    weight = Column(Float)                             # 5/29 权重 % (akshare 拉取)
+
+
+class FundDailyNav(Base):
+    """基金每日净值 (用于下钻精确定价)。
+
+    每只可下钻基金 + 每个交易日 一行：
+      nav = 单位净值 (per-share unit net value)
+      accumulated_nav = 累计净值
+      fund_shares_outstanding = 基金份额 (可以从 holding 表反推)
+    数据源: akshare fund_open_fund_info_em
+    """
+    __tablename__ = "fund_daily_nav"
+    __table_args__ = (
+        UniqueConstraint("fund_code", "trade_date", name="ux_fdn_code_date"),
+    )
+
+    id = Column(Integer, primary_key=True, autoincrement=True)
+    fund_code = Column(String(20), nullable=False, index=True)
+    trade_date = Column(Date, nullable=False, index=True)
+    nav = Column(Float)                                # 单位净值
+    accumulated_nav = Column(Float)
+    daily_return = Column(Float)                       # 日涨幅%
+    source = Column(String(40), default="akshare")
+    created_at = Column(DateTime, default=datetime.utcnow)
+    weight = Column(Float)                             # 权重 %
+    source = Column(String(40))
+    created_at = Column(DateTime, default=datetime.utcnow)
+
+
+class AShareFinancialSnapshot(Base):
+    """A 股估值快照（含动态 PE/PB/PS = 当前价相对 baseline 的调整）。"""
+    __tablename__ = "a_share_financial_snapshot"
+    __table_args__ = (
+        UniqueConstraint("as_of_date", "stock_code",
+                         name="ux_asfs_asof_stock"),
+    )
+
+    id = Column(Integer, primary_key=True, autoincrement=True)
+    as_of_date = Column(Date, nullable=False, index=True)
+    stock_code = Column(String(20), nullable=False, index=True)
+    stock_name = Column(String(80))
+    pe_ttm = Column(Float)
+    pb_mrq = Column(Float)
+    ps_ttm = Column(Float)
+    dividend_yield = Column(Float)
+    market_cap = Column(Float)                          # 亿元
+    eps_fy1 = Column(Float)
+    eps_fy2 = Column(Float)
+    # 申万 2021 (L1-L4) — A 股 Excel 现在提供 4 级
+    swy_l1 = Column(String(40))
+    swy_l2 = Column(String(60))
+    swy_l3 = Column(String(60))
+    swy_l4 = Column(String(60))
+    # 中证 2021 (L1-L4)
+    csi_l1 = Column(String(40))
+    csi_l2 = Column(String(60))
+    csi_l3 = Column(String(60))
+    csi_l4 = Column(String(60))
+    # 战略新兴产业 (L1-L3) — A 股 3 级
+    se_l1 = Column(String(60))
+    se_l2 = Column(String(60))
+    se_l3 = Column(String(60))
+    se_l4 = Column(String(60))                          # A 股无 L4，留空
+    # Backward compat
+    industry_sw = Column(String(50))
+    baseline_price = Column(Float)                      # as_of_date 当日收盘价
+    current_price = Column(Float)                       # 上一交易日收盘价
+    current_price_date = Column(Date)
+    pe_ttm_dynamic = Column(Float)
+    pb_mrq_dynamic = Column(Float)
+    ps_ttm_dynamic = Column(Float)
+    source = Column(String(40))
+    created_at = Column(DateTime, default=datetime.utcnow)
+
+
+class HKShareFinancialSnapshot(Base):
+    """港股估值快照（A 股字段 + 申万 L1-L3 + 中证 L1-L4）。"""
+    __tablename__ = "hk_share_financial_snapshot"
+    __table_args__ = (
+        UniqueConstraint("as_of_date", "stock_code",
+                         name="ux_hkfs_asof_stock"),
+    )
+
+    id = Column(Integer, primary_key=True, autoincrement=True)
+    as_of_date = Column(Date, nullable=False, index=True)
+    stock_code = Column(String(20), nullable=False, index=True)
+    stock_name = Column(String(80))
+    pe_ttm = Column(Float)
+    pb_mrq = Column(Float)
+    ps_ttm = Column(Float)
+    dividend_yield = Column(Float)
+    market_cap = Column(Float)
+    eps_fy1 = Column(Float)
+    eps_fy2 = Column(Float)
+    # 申万 2021 (L1-L3)
+    swy_l1 = Column(String(40))
+    swy_l2 = Column(String(60))
+    swy_l3 = Column(String(60))
+    swy_l4 = Column(String(60))
+    # 中证 2021 (L1-L4)
+    csi_l1 = Column(String(40))
+    csi_l2 = Column(String(60))
+    csi_l3 = Column(String(60))
+    csi_l4 = Column(String(60))
+    # 战略新兴产业 (L1-L4)
+    se_l1 = Column(String(60))
+    se_l2 = Column(String(60))
+    se_l3 = Column(String(60))
+    se_l4 = Column(String(60))
+    # Backward compat aliases
+    industry_l1 = Column(String(40))
+    industry_l2 = Column(String(60))
+    industry_l3 = Column(String(60))
+    industry_l4 = Column(String(60))
+    # 战略新兴产业 (L1-L4) — HK 4 级
+    se_l1 = Column(String(60))
+    se_l2 = Column(String(60))
+    se_l3 = Column(String(60))
+    se_l4 = Column(String(60))
+    baseline_price = Column(Float)
+    current_price = Column(Float)
+    current_price_date = Column(Date)
+    pe_ttm_dynamic = Column(Float)
+    pb_mrq_dynamic = Column(Float)
+    ps_ttm_dynamic = Column(Float)
+    source = Column(String(40))
+    created_at = Column(DateTime, default=datetime.utcnow)
+
+
+class PenetrationSnapshot(Base):
+    """基金下钻结果（按持仓单只下钻）。"""
+    __tablename__ = "penetration_snapshot"
+    __table_args__ = (
+        UniqueConstraint("as_of_date", "holding_code", "stock_code",
+                         name="ux_pnsnap"),
+    )
+
+    id = Column(Integer, primary_key=True, autoincrement=True)
+    as_of_date = Column(Date, nullable=False, index=True)
+    holding_code = Column(String(20), nullable=False, index=True)
+    holding_name = Column(String(80))
+    holding_amount_cny = Column(Float)
+    index_code = Column(String(20))
+    index_name = Column(String(80))
+    stock_code = Column(String(20), nullable=False, index=True)
+    stock_name = Column(String(80))
+    weight_at_baseline = Column(Float)                  # 5/29 权重 %
+    amount_cny_dynamic = Column(Float)                  # 权重不变 × 当日股价调整
+    amount_cny_static = Column(Float)                   # 仅按权重×金额（无价格调整）
+    baseline_price = Column(Float)
+    current_price = Column(Float)
+    calculation_method = Column(String(20), default="weight_invariant")
+    created_at = Column(DateTime, default=datetime.utcnow)
+
+
+class FullHoldingSnapshot(Base):
+    """全持仓快照（下钻基金 + 直接股票 + 不下钻基金 + 现金）。
+    一只成分股可能来自多只上层基金，所以 UK 只约束 (as_of_date, stock_code,
+    source_holding_code)，每行都是唯一的"这只股票从这个来源获得 X 金额"。
+    同一只股票的多个来源会被合并到 full_holding_view 中。
+
+    行业字段存储 7 套体系：
+      swy_l1/l2/l3 (申万 2021, 3 级) + csi_l1/l2/l3/l4 (中证 2021, 4 级)
+    行业聚合时通过 dropdown 选择其中一套。
+    """
+    __tablename__ = "full_holding_snapshot"
+    __table_args__ = (
+        UniqueConstraint("as_of_date", "stock_code", "source_holding_code",
+                         name="ux_fhsnap"),
+    )
+
+    id = Column(Integer, primary_key=True, autoincrement=True)
+    as_of_date = Column(Date, nullable=False, index=True)
+    stock_code = Column(String(20), nullable=False, index=True)
+    stock_name = Column(String(80))
+    source_type = Column(String(20))                     # drilled_fund | direct_stock | undrilled_fund | cash
+    source_holding_code = Column(String(20))             # 上层持仓 code
+    amount_cny = Column(Float)
+    # 7 industry systems
+    swy_l1 = Column(String(40), default="其他")
+    swy_l2 = Column(String(60), default="其他")
+    swy_l3 = Column(String(60), default="其他")
+    swy_l4 = Column(String(60), default="其他")
+    csi_l1 = Column(String(40), default="其他")
+    csi_l2 = Column(String(60), default="其他")
+    csi_l3 = Column(String(60), default="其他")
+    csi_l4 = Column(String(60), default="其他")
+    se_l1 = Column(String(60), default="其他")
+    se_l2 = Column(String(60), default="其他")
+    se_l3 = Column(String(60), default="其他")
+    se_l4 = Column(String(60), default="其他")
+    # Backward compat (deprecated)
+    industry_l1 = Column(String(40), default="其他")
+    industry_l2 = Column(String(60), default="其他")
+    chain_position = Column(String(20), default="other")
+    growth_tier = Column(String(20), default="unknown")
+    competition = Column(String(20), default="unknown")
+    pe_ttm_dynamic = Column(Float)
+    pb_mrq_dynamic = Column(Float)
+    ps_ttm_dynamic = Column(Float)
+    eps_fy1 = Column(Float)
+    created_at = Column(DateTime, default=datetime.utcnow)
+
+
+class AggregationCache(Base):
+    """聚合结果缓存（按维度、行业、组合/CSI300 双源）。"""
+    __tablename__ = "aggregation_cache"
+    __table_args__ = (
+        UniqueConstraint("as_of_date", "scope", "dimension", "key",
+                         name="ux_aggcache"),
+    )
+
+    id = Column(Integer, primary_key=True, autoincrement=True)
+    as_of_date = Column(Date, nullable=False, index=True)
+    scope = Column(String(20))                            # portfolio | csi300
+    dimension = Column(String(20))                        # l1 | l2 | chain | growth_tier | competition | all
+    key = Column(String(80))                              # 电子 / 中游 / high / _total
+    stock_count = Column(Integer)
+    amount_cny = Column(Float)
+    weight_pct = Column(Float)
+    virtual_earnings = Column(Float)                      # Σ(amount / pe)
+    pe_weighted = Column(Float)                            # virtual_earnings / amount
+    pe_simple_avg = Column(Float)                          # 简单算术平均（仅供对照）
+    pb_weighted = Column(Float)
+    ps_weighted = Column(Float)
+    updated_at = Column(DateTime, default=datetime.utcnow, onupdate=datetime.utcnow)
+
+
+class Csi300ConstituentSnapshot(Base):
+    """沪深300 成分股快照（单独表，便于基准对比）。"""
+    __tablename__ = "csi300_constituent_snapshot"
+    __table_args__ = (
+        UniqueConstraint("as_of_date", "stock_code",
+                         name="ux_csi300snap"),
+    )
+
+    id = Column(Integer, primary_key=True, autoincrement=True)
+    as_of_date = Column(Date, nullable=False, index=True)
+    stock_code = Column(String(20), nullable=False, index=True)
+    stock_name = Column(String(80))
+    swy_l1 = Column(String(40), default="其他")
+    swy_l2 = Column(String(60), default="其他")
+    swy_l3 = Column(String(60), default="其他")
+    swy_l4 = Column(String(60), default="其他")
+    csi_l1 = Column(String(40), default="其他")
+    csi_l2 = Column(String(60), default="其他")
+    csi_l3 = Column(String(60), default="其他")
+    csi_l4 = Column(String(60), default="其他")
+    se_l1 = Column(String(60), default="其他")
+    se_l2 = Column(String(60), default="其他")
+    se_l3 = Column(String(60), default="其他")
+    se_l4 = Column(String(60), default="其他")
+    industry_l1 = Column(String(40), default="其他")
+    industry_l2 = Column(String(60), default="其他")
+    chain_position = Column(String(20), default="other")
+    growth_tier = Column(String(20), default="unknown")
+    competition = Column(String(20), default="unknown")
+    weight = Column(Float)
+    baseline_price = Column(Float)
+    current_price = Column(Float)
+    current_price_date = Column(Date)
+    pe_ttm_dynamic = Column(Float)
+    pb_mrq_dynamic = Column(Float)
+    ps_ttm_dynamic = Column(Float)
+    source = Column(String(40))
+    created_at = Column(DateTime, default=datetime.utcnow)
+
+
+class AggregationTimeseries(Base):
+    """组合 / CSI300 估值指标日时序（点击展开趋势图）。"""
+    __tablename__ = "aggregation_timeseries"
+    __table_args__ = (
+        UniqueConstraint("calc_date", "scope", name="ux_aggts"),
+    )
+
+    id = Column(Integer, primary_key=True, autoincrement=True)
+    calc_date = Column(Date, nullable=False, index=True)
+    business_date = Column(Date, nullable=False)          # 该 calc_date 使用的业务日期
+    scope = Column(String(20))                            # portfolio | csi300
+    stock_count = Column(Integer)
+    total_amount_cny = Column(Float)
+    virtual_earnings = Column(Float)
+    pe_weighted = Column(Float)
+    pb_weighted = Column(Float)
+    ps_weighted = Column(Float)
+    price_date = Column(Date)
+    created_at = Column(DateTime, default=datetime.utcnow)
+
+
+# ============================================================================
+# 资讯数据 (a-stock-data skill §5-7)
+# ============================================================================
+
+
+def _title_hash(title: str) -> str:
+    """稳定标题去重键：md5 前 12 位。跨运行/跨表保持一致。"""
+    import hashlib
+    if not title:
+        return ""
+    return hashlib.md5(title.strip().encode("utf-8")).hexdigest()[:12]
+
+
+class GlobalFlashNews(Base):
+    """东财 7×24 全球快讯（替代已下线财联社快讯；skill §5.3）"""
+    __tablename__ = "global_flash_news"
+    __table_args__ = (UniqueConstraint('title_hash', name='ux_gfn_title'),)
+
+    id = Column(Integer, primary_key=True, autoincrement=True)
+    title_hash = Column(String(12), nullable=False, index=True)
+    title = Column(String(500), nullable=False)
+    summary = Column(Text)
+    source = Column(String(50))
+    url = Column(String(500))
+    published_at = Column(DateTime, nullable=False, index=True)
+    fetched_at = Column(DateTime, default=datetime.utcnow)
+
+
+class StockNews(Base):
+    """个股新闻（东财 search-api-web；skill §5.1）"""
+    __tablename__ = "stock_news"
+    __table_args__ = (UniqueConstraint('stock_code', 'title_hash', name='ux_news_code_title'),)
+
+    id = Column(Integer, primary_key=True, autoincrement=True)
+    stock_code = Column(String(20), nullable=False, index=True)
+    title_hash = Column(String(12), nullable=False)
+    title = Column(String(500), nullable=False)
+    summary = Column(Text)
+    source = Column(String(50))
+    url = Column(String(500))
+    published_at = Column(DateTime, nullable=False, index=True)
+    fetched_at = Column(DateTime, default=datetime.utcnow)
+
+
+class Announcement(Base):
+    """巨潮公告全文检索（cninfo；skill §7.1）"""
+    __tablename__ = "announcements"
+    __table_args__ = (UniqueConstraint('stock_code', 'announcement_id', name='ux_ann_code_id'),)
+
+    id = Column(Integer, primary_key=True, autoincrement=True)
+    stock_code = Column(String(20), nullable=False, index=True)
+    org_id = Column(String(20))
+    announcement_id = Column(String(40), nullable=False)
+    title = Column(String(500), nullable=False)
+    announcement_type = Column(String(50))
+    publish_date = Column(Date, nullable=False, index=True)
+    url = Column(String(500))
+    fetched_at = Column(DateTime, default=datetime.utcnow)
+
+
+class ResearchReport(Base):
+    """东财研报列表（reportapi.eastmoney.com；skill §2.1）"""
+    __tablename__ = "research_reports"
+    __table_args__ = (UniqueConstraint('info_code', name='ux_rr_info'),)
+
+    id = Column(Integer, primary_key=True, autoincrement=True)
+    info_code = Column(String(40), nullable=False)
+    stock_code = Column(String(20), nullable=False, index=True)
+    stock_name = Column(String(100))
+    title = Column(String(500), nullable=False)
+    org_name = Column(String(100))
+    publish_date = Column(Date, nullable=False, index=True)
+    rating = Column(String(20))                       # 买入/增持/中性/...
+    predict_eps_current = Column(Float, nullable=True)  # 当年 EPS 预测
+    predict_eps_next = Column(Float, nullable=True)     # 明年 EPS 预测
+    industry = Column(String(80))
+    pdf_path = Column(String(500))                    # 本地相对路径，None 表示未下载
+    pdf_downloaded_at = Column(DateTime, nullable=True)
+    fetched_at = Column(DateTime, default=datetime.utcnow)
+
+
+class HotStockSignal(Base):
+    """同花顺当日强势股 + 题材归因 reason（skill §3.1，零鉴权 73ms）"""
+    __tablename__ = "hot_stock_signals"
+    __table_args__ = (UniqueConstraint('signal_date', 'stock_code', name='ux_hss_date_code'),)
+
+    id = Column(Integer, primary_key=True, autoincrement=True)
+    signal_date = Column(Date, nullable=False, index=True)
+    stock_code = Column(String(20), nullable=False, index=True)
+    stock_name = Column(String(100))
+    close = Column(Float)
+    change_pct = Column(Float)
+    turnover_pct = Column(Float)
+    amount = Column(Float)
+    dde_net = Column(Float)             # 大单净量
+    market = Column(String(10))         # 沪/深/北
+    reason_tags = Column(Text)          # "+" 分隔的题材归因
+    rank = Column(Integer)              # 当日涨幅排名
+    fetched_at = Column(DateTime, default=datetime.utcnow)

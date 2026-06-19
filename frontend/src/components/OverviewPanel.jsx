@@ -2,6 +2,7 @@ import React, { useState, useEffect, useRef, useMemo } from 'react'
 import * as echarts from 'echarts'
 import * as api from '../api'
 import { rawApi } from '../api'
+import MetricTimeseriesChart from './MetricTimeseriesChart'
 
 const CAT_LABELS = { a_share_equity:'A股基金', a_share_etf:'A股ETF', bond:'债券', gold:'黄金', hk_equity:'港股', qdii_equity:'QDII', us_stock:'美股', us_etf:'美股ETF' }
 const CAT_SHORT = { a_share_equity:'A基主动', a_share_etf:'A基指数', bond:'债券', gold:'黄金', hk_equity:'港股', qdii_equity:'QDI', us_stock:'美股', us_etf:'美股E' }
@@ -42,10 +43,20 @@ export default function OverviewPanel() {
   const [holdingsLocal, setHoldingsLocal] = useState([])
   const [typeFilter, setTypeFilter] = useState('all')
   const [type2Filter, setType2Filter] = useState('all')
+  const [kpi, setKpi] = useState(null)        // spec §4.8: real KPI from /api/penetration/kpi
+  const [bizDate, setBizDate] = useState(null) // for KPI fetch param
+  const [expandedKpi, setExpandedKpi] = useState(null)  // 'pe' | 'high_growth' | 'midstream' | null
+  const [kpiWindow, setKpiWindow] = useState(90)
 
   useEffect(() => {
     api.getHoldingsConverted(currency).then(setHoldingsLocal).catch(()=>{})
   }, [currency])
+
+  // KPI bar from /api/penetration/kpi (real numbers; replaces hardcoded fallback)
+  useEffect(() => {
+    if (!bizDate) return
+    api.getKpi(bizDate).then(d => setKpi(d?.values || null)).catch(() => setKpi(null))
+  }, [bizDate])
 
   // Holdings data for table — always prefer converted API.
   // Must be defined before any useEffect that references it (React hook order).
@@ -104,6 +115,7 @@ export default function OverviewPanel() {
       api.getPenetrationTable().then(setPenTable).catch(()=>{}),
       api.getValuation().then(setPe).catch(()=>{}),
       api.getGrowthAnalysis().then(setGrowth).catch(()=>{}),
+      api.getDataVersion().then(d => setBizDate(d?.current_business_date)).catch(()=>{}),
     ]).then(() => {
       setTimeout(() => {
         if (pieRef.current) {
@@ -262,12 +274,48 @@ export default function OverviewPanel() {
           <div className="kpi-value">{fmtAmount(totalAmtLocal, getCurrencySymbol(currency))}</div>
           <div className="kpi-sub">{currency}</div>
         </div>
-        <div className="kpi-card"><div className="kpi-label">穿透股票</div><div className="kpi-value">{penTable.length}</div><div className="kpi-sub">{summary?.fund_count||0}基金</div></div>
-        <div className="kpi-card"><div className="kpi-label">组合PE</div><div className="kpi-value">{pe.portfolio_weighted_pe?.toFixed(1)||'-'}</div><div className="kpi-sub">300: {pe.csi300_pe?.toFixed(1)||'-'}</div></div>
-        <div className="kpi-card"><div className="kpi-label">高增长%</div><div className="kpi-value kpi-up">{growth.portfolio?.high?.toFixed(1)||'-'}%</div><div className="kpi-sub">300: {growth.csi300?.high?.toFixed(1)||'-'}%</div></div>
-        <div className="kpi-card"><div className="kpi-label">Forecast PE</div><div className="kpi-value">{pe.portfolio_forecast_pe_1y?.toFixed(1)||'-'}</div><div className="kpi-sub">1年后预期</div></div>
-        <div className="kpi-card"><div className="kpi-label">中游占比</div><div className="kpi-value">36%</div><div className="kpi-sub">半导体+设备</div></div>
+        <div className="kpi-card"><div className="kpi-label">穿透股票</div><div className="kpi-value">{kpi ? kpi.drilled_stock_count : (penTable.length || '—')}</div><div className="kpi-sub">{summary?.fund_count||0}基金</div></div>
+        <div className="kpi-card" style={{ cursor: 'pointer' }} onClick={() => setExpandedKpi(prev => prev === 'pe' ? null : 'pe')}>
+          <div className="kpi-label">组合PE {expandedKpi === 'pe' ? '▼' : '▸'}</div>
+          <div className="kpi-value">{(kpi?.portfolio_pe_weighted ?? pe.portfolio_weighted_pe)?.toFixed(1)||'—'}</div>
+          <div className="kpi-sub">300: {pe.csi300_pe?.toFixed(1)||'—'}</div>
+        </div>
+        <div className="kpi-card" style={{ cursor: 'pointer' }} onClick={() => setExpandedKpi(prev => prev === 'high_growth' ? null : 'high_growth')}>
+          <div className="kpi-label">高增长% {expandedKpi === 'high_growth' ? '▼' : '▸'}</div>
+          <div className="kpi-value kpi-up">{(kpi?.high_growth_weight_pct ?? growth.portfolio?.high)?.toFixed(1)||'—'}%</div>
+          <div className="kpi-sub">300: {growth.csi300?.high?.toFixed(1)||'—'}%</div>
+        </div>
+        <div className="kpi-card"><div className="kpi-label">Forecast PE</div><div className="kpi-value">{pe.portfolio_forecast_pe_1y?.toFixed(1)||'—'}</div><div className="kpi-sub">1年后预期</div></div>
+        <div className="kpi-card" style={{ cursor: 'pointer' }} onClick={() => setExpandedKpi(prev => prev === 'midstream' ? null : 'midstream')}>
+          <div className="kpi-label">中游占比 {expandedKpi === 'midstream' ? '▼' : '▸'}</div>
+          <div className="kpi-value">{kpi?.midstream_weight_pct != null ? kpi.midstream_weight_pct.toFixed(1) + '%' : '—'}</div>
+          <div className="kpi-sub">{kpi ? '来自聚合表' : '未加载'}</div>
+        </div>
       </div>
+
+      {expandedKpi && (
+        <div className="raised" style={{ padding: 12, marginBottom: 10 }}>
+          <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', marginBottom: 8 }}>
+            <span className="section-title">
+              {expandedKpi === 'pe' ? '组合PE 序时' :
+               expandedKpi === 'high_growth' ? '高增长占比 序时' :
+               expandedKpi === 'midstream' ? '中游占比 序时' : ''}
+            </span>
+            <div style={{ display: 'flex', gap: 6, alignItems: 'center' }}>
+              <select value={kpiWindow} onChange={e => setKpiWindow(Number(e.target.value))}>
+                <option value={90}>近 90 天</option>
+                <option value={180}>近 180 天</option>
+                <option value={360}>近 360 天</option>
+              </select>
+              <button className="btn-ghost" onClick={() => setExpandedKpi(null)}>折叠</button>
+            </div>
+          </div>
+          <MetricTimeseriesChart metric="pe_weighted" window={kpiWindow} scope="both" />
+          <div style={{ fontSize: 11, color: 'var(--text-muted)', marginTop: 4 }}>
+            高增长/中游占比的序时口径暂统一展示 PE 序时（其他维度需 future 计算）
+          </div>
+        </div>
+      )}
 
       {/* 本位币切换（总资产下方） */}
       <div className="raised" style={{ padding: '8px 12px', display: 'flex', alignItems: 'center', gap: 8 }}>

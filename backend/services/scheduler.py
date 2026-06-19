@@ -465,6 +465,55 @@ def start_scheduler():
         kwargs={"days": 90},
     )
 
+    # 任务5：全球快讯 — 每日 07:30 / 19:30 (a-stock-data skill §5.3)
+    scheduler.add_job(
+        job_crawl_global_news,
+        "cron",
+        hour="7,19",
+        minute=30,
+        id="info_global_news",
+        name="全球快讯抓取",
+        max_instances=1,
+        misfire_grace_time=600,
+    )
+
+    # 任务6：个股新闻 — 每日 18:00 (持仓成分股, skill §5.1)
+    scheduler.add_job(
+        job_crawl_stock_news,
+        "cron",
+        hour=18,
+        minute=0,
+        id="info_stock_news",
+        name="个股新闻抓取",
+        max_instances=1,
+        misfire_grace_time=900,
+    )
+
+    # 任务7：公告 + 研报 — 每 3 日 21:00 (skill §2.1 + §7.1)
+    scheduler.add_job(
+        job_crawl_announcements_and_research,
+        "cron",
+        hour=21,
+        minute=0,
+        day="*/3",
+        id="info_announcements_research",
+        name="公告+研报抓取",
+        max_instances=1,
+        misfire_grace_time=1800,
+    )
+
+    # 任务8：同花顺热点 — 交易日 15:35 (skill §3.1)
+    scheduler.add_job(
+        job_crawl_hot_stocks,
+        "cron",
+        hour=15,
+        minute=35,
+        id="info_hot_stocks",
+        name="同花顺热点抓取",
+        max_instances=1,
+        misfire_grace_time=600,
+    )
+
     scheduler.start()
     logger.info(
         "调度器已启动，注册 %d 个定时任务",
@@ -483,3 +532,100 @@ def stop_scheduler():
         logger.info("调度器未在运行，无需停止")
 
     scheduler = None
+
+
+# ============================================================================
+# 资讯数据抓取任务 (a-stock-data skill §3.1 / §5 / §7)
+# ============================================================================
+
+
+def _info_target_codes(db) -> list[str]:
+    """资讯拉取的目标股票集合: 穿透后的成分股 + 自选股 (去重).
+    美股 / 港股不拉东财资讯, 避免无效请求.
+    """
+    from models import PenetrationSnapshot
+    rows = db.query(PenetrationSnapshot.stock_code).distinct().all()
+    codes = {r[0] for r in rows if r[0] and not r[0].startswith(("us", "US")) and not r[0].endswith((".OF", ".HK"))}
+    return sorted(codes)
+
+
+def job_crawl_global_news():
+    """每日 07:30 / 19:30: 拉全球快讯 (skill §5.3)."""
+    db: Session = SessionLocal()
+    try:
+        from crawlers.news_eastmoney import fetch_global_flash_news
+        from services.info_service import upsert_global_flash_news
+        rows = fetch_global_flash_news(page_size=100)
+        written = upsert_global_flash_news(db, rows)
+        logger.info("全球快讯抓取: fetched=%d written=%d", len(rows), written)
+    except Exception as e:
+        logger.error("全球快讯抓取异常: %s", e, exc_info=True)
+    finally:
+        db.close()
+
+
+def job_crawl_stock_news():
+    """每日 18:00: 拉穿透成分股的个股新闻 (skill §5.1)."""
+    db: Session = SessionLocal()
+    try:
+        from crawlers.news_eastmoney import fetch_stock_news
+        from services.info_service import upsert_stock_news
+        codes = _info_target_codes(db)
+        total_written = 0
+        for code in codes[:50]:  # 限流, 单次最多 50 只
+            try:
+                rows = fetch_stock_news(code, page_size=10)
+                written = upsert_stock_news(db, code, rows)
+                total_written += written
+            except Exception as e:
+                logger.warning("个股新闻抓取失败 code=%s: %s", code, e)
+                continue
+        logger.info("个股新闻抓取: codes=%d written=%d", min(len(codes), 50), total_written)
+    except Exception as e:
+        logger.error("个股新闻抓取异常: %s", e, exc_info=True)
+    finally:
+        db.close()
+
+
+def job_crawl_announcements_and_research():
+    """每 3 日 21:00: 拉穿透成分股的公告 + 研报."""
+    db: Session = SessionLocal()
+    try:
+        from crawlers.announcement_cninfo import fetch_announcements
+        from crawlers.research_em import fetch_reports
+        from services.info_service import upsert_announcements, upsert_research_reports
+        codes = _info_target_codes(db)
+        ann_total = res_total = 0
+        for code in codes[:30]:  # 限流: 公告/研报较慢, 单次 30 只
+            try:
+                ann_rows = fetch_announcements(code, page_size=20)
+                ann_total += upsert_announcements(db, code, ann_rows)
+            except Exception as e:
+                logger.warning("公告抓取失败 code=%s: %s", code, e)
+            try:
+                res_rows = fetch_reports(code, max_pages=1)
+                res_total += upsert_research_reports(db, code, res_rows)
+            except Exception as e:
+                logger.warning("研报抓取失败 code=%s: %s", code, e)
+        logger.info("公告+研报抓取: codes=%d ann_written=%d res_written=%d",
+                    min(len(codes), 30), ann_total, res_total)
+    except Exception as e:
+        logger.error("公告+研报抓取异常: %s", e, exc_info=True)
+    finally:
+        db.close()
+
+
+def job_crawl_hot_stocks():
+    """交易日 15:35: 拉同花顺当日热点 + 题材归因 (skill §3.1)."""
+    from datetime import date as _date
+    db: Session = SessionLocal()
+    try:
+        from crawlers.signal_ths import fetch_hot_stocks
+        from services.info_service import upsert_hot_stocks
+        rows = fetch_hot_stocks(_date.today())
+        written = upsert_hot_stocks(db, _date.today(), rows)
+        logger.info("同花顺热点抓取: fetched=%d written=%d", len(rows), written)
+    except Exception as e:
+        logger.error("同花顺热点抓取异常: %s", e, exc_info=True)
+    finally:
+        db.close()

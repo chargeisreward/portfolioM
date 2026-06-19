@@ -149,3 +149,134 @@
 @media (max-width: 1100px) { .kpi-grid { grid-template-columns: repeat(3,1fr); } }
 @media (max-width: 768px) { .chart-grid { grid-template-columns: 1fr; } .kpi-grid { grid-template-columns: repeat(2,1fr); } }
 @media (max-width: 640px) { .sidebar { width: 52px; } .nav-label { display: none; } .brand-text { display: none; } }
+
+/* === Scope card (4-scope comparison) === */
+.scope-card {
+  padding: 10px 12px;
+  border-radius: 8px;
+  background: var(--bg-soft, rgba(255,255,255,0.04));
+  border: 1px solid var(--border-soft, rgba(255,255,255,0.08));
+  margin-bottom: 4px;
+}
+.scope-header {
+  display: flex;
+  justify-content: space-between;
+  align-items: baseline;
+  margin-bottom: 8px;
+}
+.scope-title { font-weight: 600; font-size: 13px; }
+.scope-grid {
+  display: grid;
+  grid-template-columns: repeat(4, 1fr);
+  gap: 10px;
+}
+.scope-cell {
+  padding: 8px 10px;
+  border-radius: 6px;
+  background: var(--bg-card, rgba(0,0,0,0.15));
+  border: 1px solid var(--border-soft, rgba(255,255,255,0.06));
+}
+.scope-label {
+  font-size: 11px;
+  color: var(--text-secondary);
+  margin-bottom: 6px;
+  letter-spacing: 0.3px;
+}
+.scope-stats {
+  display: grid;
+  grid-template-columns: 1fr 1fr;
+  gap: 4px 8px;
+}
+.scope-stat {
+  display: flex;
+  justify-content: space-between;
+  font-family: "GeistMono", monospace;
+  font-size: 11px;
+}
+.scope-stat-meta { color: var(--text-muted); font-size: 10px; }
+.scope-stat-label { color: var(--text-muted); }
+.scope-stat-value { font-weight: 600; color: var(--text-primary); }
+@media (max-width: 900px) {
+  .scope-grid { grid-template-columns: 1fr 1fr; }
+}
+
+.scope-cell-open { grid-column: span 2; }
+.scope-detail { margin-top: 8px; padding: 8px; background: rgba(0,0,0,0.12); border-radius: 4px; }
+.scope-detail-header {
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+  font-size: 11px;
+  color: var(--text-muted);
+  margin-bottom: 6px;
+}
+
+/* === Drillable Funds page === */
+.drill-page { width: 100%; }
+.drill-header { display: flex; justify-content: space-between; align-items: baseline; margin-bottom: 6px; }
+.drill-title { font-weight: 600; font-size: 13px; }
+.drill-snapshot-bar {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  flex-wrap: wrap;
+  padding: 4px 8px;
+  margin-bottom: 10px;
+  font-size: 10.5px;
+  color: var(--text-muted, #888);
+  background: var(--bg-soft, rgba(255,255,255,0.03));
+  border: 1px solid var(--border-soft, rgba(255,255,255,0.06));
+  border-radius: 4px;
+}
+.drill-snapshot-bar .dsb-label {
+  font-weight: 600;
+  color: var(--text-secondary, #aaa);
+  letter-spacing: 0.5px;
+}
+.drill-snapshot-bar .dsb-item { display: inline-flex; align-items: baseline; gap: 4px; }
+.drill-snapshot-bar .dsb-key { color: var(--text-muted, #888); }
+.drill-snapshot-bar .dsb-val {
+  color: var(--text-secondary, #ccc);
+  font-family: 'GeistMono', monospace;
+  font-size: 10.5px;
+}
+.drill-snapshot-bar .dsb-sep {
+  width: 1px; height: 10px;
+  background: var(--border-soft, rgba(255,255,255,0.12));
+}
+.drill-grid {
+  display: grid;
+  grid-template-columns: repeat(auto-fill, minmax(280px, 1fr));
+  gap: 10px;
+}
+.drill-card {
+  padding: 10px;
+  border-radius: 8px;
+  background: var(--bg-soft, rgba(255,255,255,0.04));
+  border: 1px solid var(--border-soft, rgba(255,255,255,0.08));
+  cursor: pointer;
+  transition: all 0.15s;
+}
+.drill-card-open { grid-column: 1 / -1; cursor: default; }
+.drill-card-header { padding-bottom: 6px; border-bottom: 1px solid var(--border-soft, rgba(255,255,255,0.06)); margin-bottom: 6px; }
+.drill-card-title-row {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  margin-bottom: 4px;
+}
+.drill-fund-code { font-family: "GeistMono", monospace; font-weight: 600; font-size: 12px; }
+.drill-fund-name { font-size: 12px; flex: 1; }
+.drill-card-toggle { color: var(--text-muted); font-size: 10px; }
+.drill-card-meta { font-size: 11px; color: var(--text-muted); }
+.drill-card-stats {
+  display: grid;
+  grid-template-columns: repeat(4, 1fr);
+  grid-auto-rows: auto;
+  gap: 4px 8px;
+}
+.drill-stat { display: flex; justify-content: space-between; font-size: 11px; font-family: "GeistMono", monospace; grid-column: span 2; }
+.drill-stat .lbl { color: var(--text-muted); }
+.drill-stat .val { font-weight: 600; }
+.drill-stat-secondary .val { font-weight: 400; color: var(--text-secondary); }
+.drill-detail { margin-top: 10px; padding-top: 10px; border-top: 1px solid var(--border-soft); }

@@ -2105,7 +2105,7 @@ def _is_hk_code(stock_code: str) -> bool:
     return stock_code.upper().endswith(".HK")
 
 
-def _portfolio_scope_totals(db: Session, as_of_date: _date, market: str):
+def _portfolio_scope_totals(db: Session, as_of_date: date, market: str):
     """Compute virtual-earnings totals for portfolio over a market scope.
 
     market: 'A+H' (all stocks), 'A' (A-share only), 'H' (HK only)
@@ -2220,7 +2220,7 @@ def _portfolio_scope_totals(db: Session, as_of_date: _date, market: str):
     }
 
 
-def _csi300_scope_totals(db: Session, as_of_date: _date):
+def _csi300_scope_totals(db: Session, as_of_date: date):
     """Compute CSI300 virtual-earnings totals using 5/29 weight × price ratio as amount.
 
     Returns: { stock_count, total_amount, weighted_pe, weighted_pb, weighted_ps,

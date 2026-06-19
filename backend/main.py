@@ -307,6 +307,25 @@ def _json_error(status: int, msg: str):
 @app.on_event("startup")
 def startup():
     init_db()
+    # Print DB URL (password masked) so we can confirm cloud-vs-local DB
+    import logging
+    from config import DATABASE_URL
+    _url = DATABASE_URL
+    if "@" in _url:
+        # mask password: postgresql://user:pass@host → postgresql://user:***@host
+        _scheme_user, _, _host_part = _url.partition("@")
+        if ":" in _scheme_user.split("://", 1)[-1]:
+            _user, _, _ = _scheme_user.rpartition(":")
+            _url_masked = f"{_user}:***@{_host_part}"
+        else:
+            _url_masked = _url
+    else:
+        _url_masked = _url
+    _kind = "postgres" if "postgres" in DATABASE_URL else ("sqlite" if "sqlite" in DATABASE_URL else "other")
+    logging.getLogger(__name__).info(
+        "DB connected: kind=%s url=%s",
+        _kind, _url_masked,
+    )
     from services.scheduler import start_scheduler
     start_scheduler()
     # 初始化交易日历（CN/HK/US 2020-2030），失败不阻塞启动
@@ -757,6 +776,57 @@ def admin_backfill_gaps(days: int = 90):
     """手动触发 90 天历史价完整性检查 + 补缺任务"""
     from services.scheduler import job_backfill_gaps
     return job_backfill_gaps(days)
+
+
+@app.get("/api/admin/db-info")
+def admin_db_info():
+    """诊断: 当前连接的 DB 类型/版本 + 主要表 row counts"""
+    from sqlalchemy import text, inspect
+    from config import DATABASE_URL
+    from database import SessionLocal
+    info = {
+        "database_url_kind": "postgres" if "postgres" in DATABASE_URL else ("sqlite" if "sqlite" in DATABASE_URL else "other"),
+        "database_url_masked": None,
+        "server_version": None,
+        "tables": {},
+        "total_rows": 0,
+    }
+    # mask password
+    if "@" in DATABASE_URL:
+        scheme_user, _, host_part = DATABASE_URL.partition("@")
+        if ":" in scheme_user.split("://", 1)[-1]:
+            user, _, _ = scheme_user.rpartition(":")
+            info["database_url_masked"] = f"{user}:***@{host_part}"
+        else:
+            info["database_url_masked"] = DATABASE_URL
+    else:
+        info["database_url_masked"] = DATABASE_URL
+
+    try:
+        db = SessionLocal()
+        try:
+            # server version
+            if info["database_url_kind"] == "postgres":
+                row = db.execute(text("SELECT version()")).fetchone()
+                info["server_version"] = row[0] if row else None
+            elif info["database_url_kind"] == "sqlite":
+                row = db.execute(text("SELECT sqlite_version()")).fetchone()
+                info["server_version"] = f"sqlite {row[0]}" if row else None
+
+            # table row counts
+            insp = inspect(db.get_bind())
+            for tbl in insp.get_table_names():
+                try:
+                    cnt = db.execute(text(f'SELECT COUNT(*) FROM "{tbl}"')).scalar()
+                    info["tables"][tbl] = cnt
+                    info["total_rows"] += cnt or 0
+                except Exception as e:
+                    info["tables"][tbl] = f"err: {e}"
+        finally:
+            db.close()
+    except Exception as e:
+        info["error"] = str(e)
+    return info
 
 
 # ==================== 交易日历 ====================

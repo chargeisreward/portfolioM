@@ -1,5 +1,7 @@
 """PortfolioM — FastAPI 应用入口"""
 import hashlib
+import os
+import re as _re
 import secrets
 from datetime import date, datetime, timedelta
 from pathlib import Path
@@ -27,11 +29,39 @@ from crawlers.price_data import get_stock_info, fetch_price_history
 
 app = FastAPI(title="PortfolioM", version="0.1.0")
 
+# ---- CORS: 显式白名单 (避免通配符在某些浏览器/代理场景下被拒) ----
+# 生产前端固定在 portfoliom.zeabur.app; 加上 localhost 让 vite dev/preview 可直连
+# 任何 *.zeabur.app 子域 (Zeabur 临时预览域名) 也放行
+_DEFAULT_ALLOWED_ORIGINS = [
+    "https://portfoliom.zeabur.app",
+    "http://localhost:5173",   # vite dev
+    "http://localhost:4173",   # vite preview
+    "http://127.0.0.1:5173",
+    "http://127.0.0.1:4173",
+]
+_EXTRA_ORIGINS = [o.strip() for o in os.environ.get("CORS_ALLOW_ORIGINS", "").split(",") if o.strip()]
+_ALLOWED_ORIGINS = _DEFAULT_ALLOWED_ORIGINS + _EXTRA_ORIGINS
+_ZEABUR_ORIGIN_RE = _re.compile(r"^https://[a-z0-9-]+\.zeabur\.app$")
+
+
+def _is_allowed_origin(origin: str | None) -> bool:
+    if not origin:
+        return False
+    if origin in _ALLOWED_ORIGINS:
+        return True
+    if _ZEABUR_ORIGIN_RE.match(origin):
+        return True
+    return False
+
+
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],
-    allow_methods=["*"],
+    allow_origins=_ALLOWED_ORIGINS,   # 显式列表, 不再 "*"
+    allow_origin_regex=r"^https://[a-z0-9-]+\.zeabur\.app$",
+    allow_methods=["GET", "POST", "PUT", "DELETE", "OPTIONS", "PATCH"],
     allow_headers=["*"],
+    allow_credentials=False,           # 前端 axios 不发 cookie, 显式 False 避免 wildcard 冲突
+    max_age=600,
 )
 
 DATA_DIR = Path(__file__).parent.parent
@@ -39,7 +69,6 @@ DATA_DIR = Path(__file__).parent.parent
 
 # ==================== 访问密码 + IP 限流 ====================
 
-import os
 # 启动时设置的访问密码。优先级: env APP_PASSWORD > 默认 dev 密码
 APP_PASSWORD = os.environ.get("APP_PASSWORD", "123456")
 # 简单 SHA-256 存明文 hash 比较（dev 简化，生产应换 bcrypt）
@@ -268,7 +297,7 @@ async def auth_middleware(request: Request, call_next):
         admin_token = os.environ.get("ADMIN_TOKEN", APP_PASSWORD)
         provided = request.headers.get("x-admin-token")
         if provided != admin_token:
-            return _json_error(401, "admin token required")
+            return _json_error(401, "admin token required", request)
         return await call_next(request)
     # 公开路径
     PUBLIC_PATHS = (
@@ -284,20 +313,24 @@ async def auth_middleware(request: Request, call_next):
     db = next(get_db())
     try:
         if not _verify_token(db, token):
-            return _json_error(401, "需要登录")
+            return _json_error(401, "需要登录", request)
     finally:
         db.close()
     return await call_next(request)
 
 
-def _json_error(status: int, msg: str):
+def _json_error(status: int, msg: str, request: Request | None = None):
     from fastapi.responses import JSONResponse
     # 显式带 CORS 头（避免 CORSMiddleware 漏包到错误响应时浏览器拒绝跨域）
+    # 关键: echo 回请求 Origin (而不是 "*"), 防止浏览器对带 credentials 的请求拒绝
+    origin = request.headers.get("origin") if request is not None else None
+    allowed_origin = origin if _is_allowed_origin(origin) else "null"
     return JSONResponse(
         status_code=status,
         content={"detail": msg},
         headers={
-            "Access-Control-Allow-Origin": "*",
+            "Access-Control-Allow-Origin": allowed_origin,
+            "Vary": "Origin",
             "Access-Control-Allow-Methods": "GET, POST, PUT, DELETE, OPTIONS, PATCH",
             "Access-Control-Allow-Headers": "*",
         },

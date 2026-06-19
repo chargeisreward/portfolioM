@@ -1,24 +1,59 @@
 """
 Data version meta-table (spec §2.1).
 
-Reads `sourceData/data_version.csv` and resolves the active
-`as_of_date` for a given `today`:
+Reads `data_version.csv` and resolves the active `as_of_date`
+for a given `today`:
 
     business_date = MAX(as_of_date) WHERE as_of_date <= today
+
+CSV lookup order (first match wins):
+  1. PORTFOLIO_DATA_VERSION_CSV env var (explicit override)
+  2. <backend>/data/data_version.csv        (Docker image: COPY . .)
+  3. <project_root>/sourceData/data_version.csv (legacy local dev path)
 """
 from __future__ import annotations
 
 import csv
 import logging
+import os
 from dataclasses import dataclass
 from datetime import date as _date
 from pathlib import Path
 
 logger = logging.getLogger(__name__)
 
+# <backend>/ (services/ is at backend/services/)
+BACKEND_DIR = Path(__file__).resolve().parents[1]
 PROJECT_ROOT = Path(__file__).resolve().parents[2]
 SOURCE_DATA_DIR = PROJECT_ROOT / "sourceData"
-DATA_VERSION_CSV = SOURCE_DATA_DIR / "data_version.csv"
+BACKEND_DATA_CSV = BACKEND_DIR / "data_version.csv"   # tracked alongside service code (Docker COPY)
+BACKEND_DATA_DIR_CSV = BACKEND_DIR / "data" / "data_version.csv"
+LEGACY_CSV = SOURCE_DATA_DIR / "data_version.csv"
+
+
+def _resolve_csv_path() -> Path:
+    """Pick the first data_version.csv that exists."""
+    env_path = os.environ.get("PORTFOLIO_DATA_VERSION_CSV")
+    candidates: list[Path] = []
+    if env_path:
+        candidates.append(Path(env_path))
+    candidates.append(BACKEND_DATA_CSV)
+    candidates.append(BACKEND_DATA_DIR_CSV)
+    candidates.append(LEGACY_CSV)
+    for p in candidates:
+        if p.exists():
+            logger.info("data_version.csv resolved to %s", p)
+            return p
+    logger.warning(
+        "data_version.csv not found in any of: %s. Returning legacy path %s "
+        "(empty list expected).",
+        [str(c) for c in candidates],
+        LEGACY_CSV,
+    )
+    return LEGACY_CSV
+
+
+DATA_VERSION_CSV = _resolve_csv_path()
 
 
 @dataclass(frozen=True)

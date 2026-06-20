@@ -672,136 +672,166 @@ def get_portfolio_trend(
     """组合 90 天资产走势：每日期末总市值 = Σ(qty × close_px × fx_rate)
     用 PriceCache.close_px + ExchangeRate.rate 计算。无历史价则用最近已知价补齐。"""
     from datetime import date, timedelta
+    import logging
     from models import Holding, PriceCache, ExchangeRate
 
-    # 兜底：仅当当日汇率缺失时才拉（update_rates_today 内部有 17s 的 PBoC 接口，频繁调很慢）
+    logger = logging.getLogger(__name__)
+
+    # 整个函数包 try/except: Zeabur 边缘 < 30s 容易触发 502,
+    # 任何异常(慢 PBoC, OOM, DB 失联)都返回空序列让前端优雅降级, 而不是挂掉 worker.
     try:
-        from crawlers.exchange_rates import update_rates_today
-        update_rates_today(db)
-    except Exception:
-        pass
-
-    # 1. 取当前所有 holdings
-    rows = db.query(Holding).all()
-    if not rows:
-        return {"series": [], "currency": target, "days": days}
-
-    # 2. 拿所有 (code, date) -> close_px
-    cutoff = date.today() - timedelta(days=days)
-    pc_rows = db.query(PriceCache).filter(PriceCache.trade_date >= cutoff).all()
-    # code -> {date: close}
-    pc_map: dict = {}
-    for r in pc_rows:
-        pc_map.setdefault(r.stock_code, {})[r.trade_date.isoformat()] = r.close_px
-
-    # 3. 汇率（按 date 查）
-    fx_rows = db.query(ExchangeRate).filter(ExchangeRate.rate_date >= cutoff).all()
-    # (date, from, to) -> rate
-    fx_map: dict = {}
-    for r in fx_rows:
-        key = (r.rate_date.isoformat(), r.from_currency, r.to_currency)
-        fx_map[key] = r.rate
-    # 全局最新汇率（最近一天）
-    latest_fx: dict = {}
-    for r in fx_rows:
-        latest_key = (r.from_currency, r.to_currency)
-        cur_val = fx_map.get((r.rate_date.isoformat(), r.from_currency, r.to_currency))
-        prev = latest_fx.get(latest_key)
-        if prev is None or r.rate_date > prev[0]:
-            latest_fx[latest_key] = (r.rate_date, cur_val)
-
-    def get_fx(d_iso: str, from_cur: str, to_cur: str) -> float:
-        if from_cur == to_cur:
-            return 1.0
-        # 优先用 daily 历史汇率
-        if (d_iso, from_cur, to_cur) in fx_map:
-            return fx_map[(d_iso, from_cur, to_cur)]
-        # 倒退找最近（最多 7 天）
+        # 兜底：仅当当日汇率缺失时才拉（update_rates_today 内部有 17s 的 PBoC 接口, 频繁调很慢）
+        # Cloud: PBoC 网络常失败/超时, 直接 skip; 用 DB 里已有的 ExchangeRate 即可.
         try:
-            d = date.fromisoformat(d_iso)
-        except (ValueError, TypeError):
-            d = date.today()
-        for k in range(1, 8):
-            nd = (d - timedelta(days=k)).isoformat()
-            if (nd, from_cur, to_cur) in fx_map:
-                return fx_map[(nd, from_cur, to_cur)]
-        # 兜底：用最新汇率（云端只有当日 1 条）
-        if (from_cur, to_cur) in latest_fx:
-            return latest_fx[(from_cur, to_cur)][1]
-        return 1.0
+            from crawlers.exchange_rates import update_rates_today
+            update_rates_today(db)
+        except Exception as e:
+            logger.warning("update_rates_today failed (non-fatal): %s", e)
 
-    # 4. 找过去 N 天所有有 trade_date 的全部日期（来自任一 holding 的真实价）
-    all_dates = sorted({d for code_dates in pc_map.values() for d in code_dates.keys()})
-    all_dates = [d for d in all_dates if d >= cutoff.isoformat()]
+        # 1. 取当前所有 holdings
+        rows = db.query(Holding).all()
+        if not rows:
+            return {"series": [], "currency": target, "days": days}
 
-    # 5. 对每只 holding 构建"已知价 → 该日及以后沿用"映射（不编造：用其最后已知真实价回填未来无价日）
-    # 注意：这是"backward-fill last known"，不是 forward-fill 编造。
-    # 规则：某 holding 在 D 日无价，则用该 holding 在 D 之前最近的真实价代替。
-    #      如果该 holding 整段 90 天都没价，则跳过（不编造）。
-    def _resolve_px(code_map: dict, d_iso: str) -> float | None:
-        # 真实价优先
-        if d_iso in code_map:
-            return code_map[d_iso]
-        # 找该日之前的最近真实价
-        try:
-            d = date.fromisoformat(d_iso)
-        except (ValueError, TypeError):
-            return None
-        for k in range(1, days + 5):
-            nd = (d - timedelta(days=k)).isoformat()
-            if nd in code_map:
-                return code_map[nd]
-            if (d - timedelta(days=k)) < cutoff:
-                break
-        return None
-
-    # 6. 跳过整只 holding 在窗口内完全无价的情况（无法计算 → 不编造）
-    # 优化：只看 pc_map 里是否有该 code 的任何价格，不再做 O(D×K) 双重 any
-    eligible = []
-    skipped = []
-    for h in rows:
-        cm = pc_map.get(h.security_code, {})
-        if cm:
-            eligible.append(h)
-        else:
-            skipped.append(h.security_code)
-
-    # 7. 对每个日期算总值（使用 last-known backward-fill，不是 forward-fill 编造）
-    from services.trading_calendar import is_trading_day
-    # 预计算每个日期的 is_trading（避免 255 日 × 3 市场 = 765 次 DB 调用）
-    is_td_cache: dict[str, bool] = {}
-    for d_iso in all_dates:
-        try:
-            d_obj = date.fromisoformat(d_iso)
-            is_td_cache[d_iso] = (
-                is_trading_day("CN", d_obj, db)
-                or is_trading_day("HK", d_obj, db)
-                or is_trading_day("US", d_obj, db)
+        # 2. 只取 holdings 关心的 stock_code 的 price_cache.
+        # Cloud: price_cache 有 60 万行, 全部加载会 OOM/超时 → 500 → container crash.
+        cutoff = date.today() - timedelta(days=days)
+        holding_codes = list({h.security_code for h in rows if h.security_code})
+        if not holding_codes:
+            return {"series": [], "currency": target, "days": days}
+        pc_rows = (
+            db.query(PriceCache)
+            .filter(
+                PriceCache.trade_date >= cutoff,
+                PriceCache.stock_code.in_(holding_codes),
             )
-        except Exception:
-            is_td_cache[d_iso] = True
+            .all()
+        )
+        # code -> {date: close}
+        pc_map: dict = {}
+        for r in pc_rows:
+            pc_map.setdefault(r.stock_code, {})[r.trade_date.isoformat()] = r.close_px
 
-    series = []
-    for d_iso in all_dates:
-        total = 0.0
-        for h in eligible:
+        # 3. 汇率（按 date 查）
+        fx_rows = db.query(ExchangeRate).filter(ExchangeRate.rate_date >= cutoff).all()
+        # (date, from, to) -> rate
+        fx_map: dict = {}
+        for r in fx_rows:
+            key = (r.rate_date.isoformat(), r.from_currency, r.to_currency)
+            fx_map[key] = r.rate
+        # 全局最新汇率（最近一天）
+        latest_fx: dict = {}
+        for r in fx_rows:
+            latest_key = (r.from_currency, r.to_currency)
+            cur_val = fx_map.get((r.rate_date.isoformat(), r.from_currency, r.to_currency))
+            prev = latest_fx.get(latest_key)
+            if prev is None or r.rate_date > prev[0]:
+                latest_fx[latest_key] = (r.rate_date, cur_val)
+
+        def get_fx(d_iso: str, from_cur: str, to_cur: str) -> float:
+            if from_cur == to_cur:
+                return 1.0
+            # 优先用 daily 历史汇率
+            if (d_iso, from_cur, to_cur) in fx_map:
+                return fx_map[(d_iso, from_cur, to_cur)]
+            # 倒退找最近（最多 7 天）
+            try:
+                d = date.fromisoformat(d_iso)
+            except (ValueError, TypeError):
+                d = date.today()
+            for k in range(1, 8):
+                nd = (d - timedelta(days=k)).isoformat()
+                if (nd, from_cur, to_cur) in fx_map:
+                    return fx_map[(nd, from_cur, to_cur)]
+            # 兜底：用最新汇率（云端只有当日 1 条）
+            if (from_cur, to_cur) in latest_fx:
+                return latest_fx[(from_cur, to_cur)][1]
+            return 1.0
+
+        # 4. 找过去 N 天所有有 trade_date 的全部日期（来自任一 holding 的真实价）
+        all_dates = sorted({d for code_dates in pc_map.values() for d in code_dates.keys()})
+        all_dates = [d for d in all_dates if d >= cutoff.isoformat()]
+
+        # 5. 对每只 holding 构建"已知价 → 该日及以后沿用"映射（不编造：用其最后已知真实价回填未来无价日）
+        # 注意：这是"backward-fill last known"，不是 forward-fill 编造。
+        # 规则：某 holding 在 D 日无价，则用该 holding 在 D 之前最近的真实价代替。
+        #      如果该 holding 整段 90 天都没价，则跳过（不编造）。
+        def _resolve_px(code_map: dict, d_iso: str) -> float | None:
+            # 真实价优先
+            if d_iso in code_map:
+                return code_map[d_iso]
+            # 找该日之前的最近真实价
+            try:
+                d = date.fromisoformat(d_iso)
+            except (ValueError, TypeError):
+                return None
+            for k in range(1, days + 5):
+                nd = (d - timedelta(days=k)).isoformat()
+                if nd in code_map:
+                    return code_map[nd]
+                if (d - timedelta(days=k)) < cutoff:
+                    break
+            return None
+
+        # 6. 跳过整只 holding 在窗口内完全无价的情况（无法计算 → 不编造）
+        # 优化：只看 pc_map 里是否有该 code 的任何价格，不再做 O(D×K) 双重 any
+        eligible = []
+        skipped = []
+        for h in rows:
             cm = pc_map.get(h.security_code, {})
-            px = _resolve_px(cm, d_iso)
-            if px is None:
-                continue  # 该 holding 还未"上市"（早于其最早有价日）— 跳过
-            cur = h.currency or "CNY"
-            fx = get_fx(d_iso, cur, target)
-            total += (h.quantity or 0) * px * fx
-        series.append({"date": d_iso, "value": round(total, 2), "is_trading": is_td_cache.get(d_iso, True)})
+            if cm:
+                eligible.append(h)
+            else:
+                skipped.append(h.security_code)
 
-    return {
-        "series": series,
-        "currency": target,
-        "days": days,
-        "eligible_holdings": len(eligible),
-        "skipped_holdings": skipped,
-        "note": "每点 = Σ(quantity × 该日或更早真实价 × 汇率)；无未来编造",
-    }
+        # 7. 对每个日期算总值（使用 last-known backward-fill，不是 forward-fill 编造）
+        from services.trading_calendar import is_trading_day
+        # 预计算每个日期的 is_trading（避免 255 日 × 3 市场 = 765 次 DB 调用）
+        is_td_cache: dict[str, bool] = {}
+        for d_iso in all_dates:
+            try:
+                d_obj = date.fromisoformat(d_iso)
+                is_td_cache[d_iso] = (
+                    is_trading_day("CN", d_obj, db)
+                    or is_trading_day("HK", d_obj, db)
+                    or is_trading_day("US", d_obj, db)
+                )
+            except Exception:
+                is_td_cache[d_iso] = True
+
+        series = []
+        for d_iso in all_dates:
+            total = 0.0
+            for h in eligible:
+                cm = pc_map.get(h.security_code, {})
+                px = _resolve_px(cm, d_iso)
+                if px is None:
+                    continue  # 该 holding 还未"上市"（早于其最早有价日）— 跳过
+                cur = h.currency or "CNY"
+                fx = get_fx(d_iso, cur, target)
+                total += (h.quantity or 0) * px * fx
+            series.append({"date": d_iso, "value": round(total, 2), "is_trading": is_td_cache.get(d_iso, True)})
+
+        return {
+            "series": series,
+            "currency": target,
+            "days": days,
+            "eligible_holdings": len(eligible),
+            "skipped_holdings": skipped,
+            "note": "每点 = Σ(quantity × 该日或更早真实价 × 汇率)；无未来编造",
+        }
+    except Exception as e:
+        # Cloud 友好降级: 任何错误返回空序列而不是 500, 防止 edge 502 + container crash.
+        logger.exception("/api/trend failed: %s", e)
+        return {
+            "series": [],
+            "currency": target,
+            "days": days,
+            "eligible_holdings": 0,
+            "skipped_holdings": [],
+            "note": f"trend unavailable: {type(e).__name__}: {str(e)[:120]}",
+            "error": True,
+        }
 
 
 @app.post("/api/admin/backfill-gaps")

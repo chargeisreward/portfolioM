@@ -682,11 +682,17 @@ def get_portfolio_trend(
     try:
         # 兜底：仅当当日汇率缺失时才拉（update_rates_today 内部有 17s 的 PBoC 接口, 频繁调很慢）
         # Cloud: PBoC 网络常失败/超时, 直接 skip; 用 DB 里已有的 ExchangeRate 即可.
+        # 重要: PBoC 失败时 update_rates_today 内部 raise 但 SQLAlchemy session
+        #       会进入 PendingRollbackError, 必须 rollback 才能继续 query.
         try:
             from crawlers.exchange_rates import update_rates_today
             update_rates_today(db)
         except Exception as e:
             logger.warning("update_rates_today failed (non-fatal): %s", e)
+            try:
+                db.rollback()
+            except Exception:
+                pass
 
         # 1. 取当前所有 holdings
         rows = db.query(Holding).all()

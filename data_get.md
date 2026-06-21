@@ -284,6 +284,50 @@ async def collect_all(source=None, db=None)
 
 ---
 
+## 4.6 下钻维度分析数据流（Drilled-Dimension Analysis）
+
+**文件**: `backend/services/drillable_funds.py`, `backend/main.py`
+
+**端点**: `GET /api/penetration/dimension-drilled?dim={dim}&as_of_date={date}&market={A+H|A|H}`
+
+下钻维度分析只分析「穿透后的底层证券」，即把可下钻基金（FundIndexMap 映射的指数基金）按 5/29 净值还原成对应成分股，再与 CSI300 按同一维度对比。
+
+**输入数据源**:
+
+| 表 / 文件 | 用途 |
+|-----------|------|
+| `Holding` | 基金持仓数量与金额 |
+| `FundIndexMap` | 基金 → 追踪指数映射 |
+| `IndexConstituentSnapshot` | 指数 5/29 成分股权重 |
+| `FundDailyNav` | 基金 5/29 单位净值 + 累计净值、当前净值 |
+| `AShareFinancialSnapshot` / `HKShareFinancialSnapshot` | 成分股 PE/PB/PS、分类字段、收盘价 |
+| `Csi300ConstituentSnapshot` | CSI300 权重与分类 fallback |
+| `ExchangeRate` | USD/HKD → CNY 汇率 |
+
+**计算链路**:
+
+```text
+Holding.quantity × FundDailyNav.nav_529
+        ↓
+   fund_value_529
+        ↓
+   × IndexConstituentSnapshot.weight
+        ↓
+   ÷ snapshot.baseline_price
+        ↓
+   shares_equivalent × snapshot.current_price
+        ↓
+   est_market_value_cny
+        ↓
+   按 dim 列聚合 → 组合 bucket
+```
+
+CSI300 侧使用 `Csi300ConstituentSnapshot.weight` 作为权重，PE/PB/PS 优先从 `a_share_financial_snapshot` / `hk_share_financial_snapshot` 读取（因为 `csi300_constituent_snapshot` 的估值字段常为 NULL）。
+
+**完整文档**: 见 `docs/reference-dimension-drilled.md`、`docs/explanation-drilled-dimension-math.md`。
+
+---
+
 ## 五、AI 分析数据
 
 ### 5.1 DeepSeek API

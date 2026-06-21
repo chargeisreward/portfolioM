@@ -521,7 +521,7 @@ class FullHoldingSnapshot(Base):
     stock_code = Column(String(20), nullable=False, index=True)
     stock_name = Column(String(80))
     source_type = Column(String(20))                     # drilled_fund | direct_stock | undrilled_fund | cash
-    source_holding_code = Column(String(20))             # 上层持仓 code
+    source_holding_code = Column(String(100))            # 上层持仓 code
     amount_cny = Column(Float)
     # 7 industry systems
     swy_l1 = Column(String(40), default="其他")

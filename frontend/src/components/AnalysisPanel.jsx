@@ -1,10 +1,10 @@
 import React, { useEffect, useState } from 'react'
 import * as api from '../api'
 import IndustryBreakdownPanel from './IndustryBreakdownPanel'
-import MetricTimeseriesChart from './MetricTimeseriesChart'
 import FullHoldingTable from './FullHoldingTable'
 import PortfolioVsCsi300Card from './PortfolioVsCsi300Card'
 import DrillableFundsPage from './DrillableFundsPage'
+import DrilledDimensionPanel from './DrilledDimensionPanel'
 
 const DIMS = [
   { id: 'drill', label: '下钻', special: 'drill' },
@@ -17,16 +17,12 @@ const DIMS = [
   { id: 'csi3', label: '中证L3' },
   { id: 'csi4', label: '中证L4' },
   { id: 'a_strategic_emerging', label: 'A股战略新兴', dim: 'se1', market: 'A' },
-  { id: 'hk_concept', label: '港股概念', dim: 'se1', market: 'H' },
-  { id: 'chain', label: '产业链' },
-  { id: 'growth_tier', label: '增长分层' },
-  { id: 'competition', label: '竞争格局' },
-  { id: 'valuation', label: '估值时序' },
 ]
 
 export default function AnalysisPanel() {
   const [active, setActive] = useState('drill')
   const [bizDate, setBizDate] = useState(null)
+  const [totalEstCNY, setTotalEstCNY] = useState(0)
 
   useEffect(() => {
     api.getDataVersion().then(d => setBizDate(d?.current_business_date)).catch(() => {})
@@ -50,9 +46,6 @@ export default function AnalysisPanel() {
         </div>
       </div>
 
-      {/* 4-scope summary card — always visible above */}
-      <PortfolioVsCsi300Card bizDate={bizDate} />
-
       {/* Dimension body */}
       {active === 'drill' ? (
         <div className="raised" style={{ padding: 12, marginTop: 10 }}>
@@ -60,19 +53,8 @@ export default function AnalysisPanel() {
         </div>
       ) : active === 'full' ? (
         <div className="raised" style={{ padding: 12, marginTop: 10 }}>
-          <FullHoldingTable bizDate={bizDate} />
-        </div>
-      ) : active === 'valuation' ? (
-        <div className="raised" style={{ padding: 12, marginTop: 10 }}>
-          <div className="section-title">估值时序（90/180/360 天）</div>
-          <div style={{ display: 'flex', gap: 12, flexWrap: 'wrap' }}>
-            {['pe_weighted', 'pb_weighted', 'ps_weighted'].map(m => (
-              <div key={m} style={{ flex: '1 1 320px', minWidth: 320 }}>
-                <div className="metric-label">{m.replace('_weighted', '').toUpperCase()}</div>
-                <MetricTimeseriesChart metric={m} window={90} scope="both" />
-              </div>
-            ))}
-          </div>
+          <PortfolioVsCsi300Card bizDate={bizDate} totalEstCNY={totalEstCNY} />
+          <FullHoldingTable bizDate={bizDate} onTotalEstChange={setTotalEstCNY} />
         </div>
       ) : (
         <div className="raised" style={{ padding: 12, marginTop: 10 }}>
@@ -80,6 +62,10 @@ export default function AnalysisPanel() {
             const cfg = DIMS.find(d => d.id === active)
             const dim = cfg?.dim || active
             const market = cfg?.market || 'A+H'
+            const DRILLED_DIMS = ['swy1', 'swy2', 'swy3', 'csi1', 'csi2', 'csi3', 'csi4', 'se1']
+            if (DRILLED_DIMS.includes(dim)) {
+              return <DrilledDimensionPanel dim={dim} bizDate={bizDate} market={market} label={cfg?.label} />
+            }
             return <IndustryBreakdownPanel dim={dim} market={market} bizDate={bizDate} />
           })()}
         </div>

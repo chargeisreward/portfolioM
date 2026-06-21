@@ -102,6 +102,11 @@ export const importSourceData = (sourceFolder) => api.post('/admin/import-source
 export const recalcAggregation = (asOfDate) => api.post('/admin/recalc-aggregation', null, { params: { as_of_date: asOfDate } }).then(r => r.data)
 
 export const getPortfolioVsCsi300 = (asOfDate) => api.get('/penetration/portfolio-vs-csi300', { params: { as_of_date: asOfDate } }).then(r => r.data)
+export const getFullHoldingSummary = (asOfDate) => api.get('/penetration/full-holding-summary', { params: { as_of_date: asOfDate } }).then(r => r.data)
 
 export const getDrillableIndices = (asOfDate) => api.get('/penetration/drillable-indices', { params: { as_of_date: asOfDate } }).then(r => r.data)
 export const getIndexDrill = (indexCode, asOfDate) => api.get('/penetration/index-drill', { params: { index_code: indexCode, as_of_date: asOfDate } }).then(r => r.data)
+export const getAllDrilledStocks = (asOfDate) => api.get('/penetration/all-drilled-stocks', { params: { as_of_date: asOfDate } }).then(r => r.data)
+export const getFullHoldingTable = (asOfDate) => api.get('/penetration/full-holding-table', { params: { as_of_date: asOfDate } }).then(r => r.data)
+export const getDimensionDrilled = (dim, asOfDate, market = 'A+H') => api.get('/penetration/dimension-drilled', { params: { dim, as_of_date: asOfDate, market } }).then(r => r.data)
+export const getLatestExchangeRates = () => api.get('/exchange-rates/latest').then(r => r.data)

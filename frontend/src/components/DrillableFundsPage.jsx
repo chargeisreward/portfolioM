@@ -149,7 +149,17 @@ export default function DrillableFundsPage({ bizDate }) {
                   <span className="drill-card-toggle">{isOpen ? '▼' : '▸'}</span>
                 </div>
                 <div className="drill-card-meta">
-                  跟踪基金 ({card.fund_codes.length}): {card.fund_codes.join(', ')} · {card.stock_count} 只成分股
+                  <span style={{ marginRight: 10 }}>
+                    <span style={{ color: 'var(--text-muted)' }}>跟踪基金</span>
+                    <span style={{ color: 'var(--accent)', fontWeight: 600, marginLeft: 4 }}>{(card.fund_codes || []).length}</span>
+                    <span style={{ color: 'var(--text-muted)', marginLeft: 4 }}>
+                      {(card.fund_codes || []).join(' · ')}
+                    </span>
+                  </span>
+                  <span>
+                    <span style={{ color: 'var(--text-muted)' }}>股票数</span>
+                    <span style={{ color: 'var(--text-secondary)', fontWeight: 600, marginLeft: 4 }}>{card.stock_count}</span>
+                  </span>
                 </div>
               </div>
               <div className="drill-card-stats">
@@ -176,7 +186,7 @@ export default function DrillableFundsPage({ bizDate }) {
                   ) : detail?.constituents ? (
                     <>
                       <div style={{ fontSize: 11, color: 'var(--text-muted)', marginBottom: 6 }}>
-                        下钻明细：{card.fund_codes.join(' + ')} → 合并后 {detail.constituents.length} 只成分股
+                        下钻明细：共 {detail.constituents.length} 只股票
                       </div>
                       <table className="data-table">
                         <thead>

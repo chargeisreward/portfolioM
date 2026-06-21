@@ -181,7 +181,7 @@ export default function OverviewPanel() {
     const valuePrefix = getCurrencySymbol(currency)
     // 复用已有 instance（避免每次 init）
     let c = echarts.getInstanceByDom(trendRef.current)
-    if (!c) c = echarts.init(trendRef.current)
+    if (!c) c = echarts.init(trendRef.current, null, { renderer: 'canvas' })
     c.setOption({
       tooltip: {
         trigger: 'axis',
@@ -222,7 +222,12 @@ export default function OverviewPanel() {
           data: [{ yAxis: 0, label: { show: false } }],
         } : undefined,
       }],
-    })  // 关 c.setOption({...}) 调用
+    })
+    // 容器尺寸变化后主动 resize，避免初始化时宽度被压缩导致只渲染左半
+    requestAnimationFrame(() => c.resize())
+    const ro = new ResizeObserver(() => c.resize())
+    ro.observe(trendRef.current)
+    return () => ro.disconnect()
   }, [trendData, trendReturn, trendView, currency])
 
   const topHoldings = penTable.slice(0, 10)
@@ -390,7 +395,7 @@ export default function OverviewPanel() {
             </span>
           </div>
         </div>
-        <div ref={trendRef} className="chart-box" style={{ width: '100%', height: 240 }} />
+        <div ref={trendRef} className="chart-box" style={{ width: '100%', height: 360, minWidth: 0 }} />
       </div>
 
       {/* Charts */}

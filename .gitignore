@@ -24,6 +24,7 @@ build/
 *.sqlite3
 backend/data/
 sourceData/
+dump.sql
 .env
 .env.local
 .env.*.local

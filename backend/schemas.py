@@ -90,7 +90,6 @@ class SecurityMasterOut(BaseModel):
     security_name: Optional[str] = None
     currency: str = "CNY"
     asset_type: Optional[str] = None
-    type2: Optional[str] = None
     exchange: Optional[str] = None
 
 
@@ -100,7 +99,6 @@ class SecurityMasterUpsert(BaseModel):
     security_name: Optional[str] = None
     currency: str = "CNY"
     asset_type: Optional[str] = None
-    type2: Optional[str] = None
     exchange: Optional[str] = None
 
 

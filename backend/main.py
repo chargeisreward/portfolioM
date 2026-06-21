@@ -23,6 +23,12 @@ from services.importer import import_excel, get_holdings_summary
 from services.penetration import PenetrationEngine
 from services.growth_bucketer import GrowthBucketer, IndustryChainAnalyzer
 from services.csi300 import Csi300Analyzer
+from services.analyst_service import (
+    ingest_analyst_data,
+    get_core_companies,
+    get_industry_chains,
+    get_stock_detail,
+)
 from crawlers.etf_index import crawl_fund_index_map
 from crawlers.index_constituents import crawl_constituents
 from crawlers.price_data import get_stock_info, fetch_price_history
@@ -3750,3 +3756,41 @@ def crawl_hot_stocks_endpoint(
     rows = fetch_hot_stocks(d)
     written = upsert_hot_stocks(db, d, rows)
     return {"signal_date": d.isoformat(), "fetched": len(rows), "written": written}
+
+
+# -----------------------------------------------------------------------------
+# 分析师研究页面 (Analyst)
+# -----------------------------------------------------------------------------
+
+@app.post("/api/admin/analyst/ingest")
+def admin_analyst_ingest(db: Session = Depends(get_db)):
+    """解析 researcher/ 目录并写入 analyst_* 表。"""
+    return ingest_analyst_data(db)
+
+
+@app.get("/api/analyst/core-companies")
+def analyst_core_companies(
+    as_of_date: date = Query(...),
+    db: Session = Depends(get_db),
+):
+    """核心公司卡片：报告 + 组合权重 + PE/PB/PS + 最新收盘价。"""
+    return get_core_companies(db, as_of_date)
+
+
+@app.get("/api/analyst/stock/{code}")
+def analyst_stock_detail(
+    code: str,
+    as_of_date: date = Query(...),
+    db: Session = Depends(get_db),
+):
+    """单只股票详情：来源基金（约当数量）+ 报告内容。"""
+    return get_stock_detail(db, code, as_of_date)
+
+
+@app.get("/api/analyst/industry-chains")
+def analyst_industry_chains(
+    as_of_date: date = Query(...),
+    db: Session = Depends(get_db),
+):
+    """产业链卡片：只返回当前 portfolio 持仓中的公司。"""
+    return get_industry_chains(db, as_of_date)

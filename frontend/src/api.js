@@ -92,6 +92,10 @@ export const logout = () => api.post('/auth/logout').then(r => r.data)
 // ============================================================================
 
 export const getDataVersion = () => api.get('/data-version').then(r => r.data)
+export const getAnalystCoreCompanies = (asOfDate) => api.get('/analyst/core-companies', { params: { as_of_date: asOfDate } }).then(r => r.data)
+export const getAnalystStockDetail = (code, asOfDate) => api.get(`/analyst/stock/${encodeURIComponent(code)}`, { params: { as_of_date: asOfDate } }).then(r => r.data)
+export const getAnalystIndustryChains = (asOfDate) => api.get('/analyst/industry-chains', { params: { as_of_date: asOfDate } }).then(r => r.data)
+export const postAnalystIngest = () => api.post('/admin/analyst/ingest').then(r => r.data)
 export const getFullHolding = (asOfDate) => api.get('/penetration/full-holding', { params: { as_of_date: asOfDate } }).then(r => r.data)
 export const getDimension = (dim, asOfDate, market = 'A+H') => api.get('/penetration/dimension', { params: { dim, as_of_date: asOfDate, market } }).then(r => r.data)
 export const getDimensionDetail = (dim, key, asOfDate, market = 'A+H') => api.get('/penetration/dimension-detail', { params: { dim, key, as_of_date: asOfDate, market } }).then(r => r.data)

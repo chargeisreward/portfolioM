@@ -733,3 +733,66 @@ class HotStockSignal(Base):
     reason_tags = Column(Text)          # "+" 分隔的题材归因
     rank = Column(Integer)              # 当日涨幅排名
     fetched_at = Column(DateTime, default=datetime.utcnow)
+
+
+# ============================================================================
+# 分析师研究数据（来自 researcher/ 目录）
+# ============================================================================
+
+
+class AnalystCompanyReport(Base):
+    """公司研究报告（DOCX 解析后的 6 段式框架）"""
+    __tablename__ = "analyst_company_report"
+    __table_args__ = (UniqueConstraint('stock_code', name='ux_acr_code'),)
+
+    id = Column(Integer, primary_key=True, autoincrement=True)
+    stock_code = Column(String(20), nullable=False, index=True)
+    stock_name = Column(String(80), nullable=True)
+    exchange = Column(String(8), nullable=True)
+    section_1_market_focus = Column(Text, nullable=True)      # 市场关注
+    section_2_core_competence = Column(Text, nullable=True)   # 核心竞争力
+    section_3_supply_demand = Column(Text, nullable=True)     # 供需格局
+    section_4_marginal_change = Column(Text, nullable=True)   # 边际变化
+    section_5_valuation = Column(Text, nullable=True)         # 估值
+    section_6_risk = Column(Text, nullable=True)              # 风险
+    raw_text = Column(Text, nullable=True)
+    source_file = Column(String(500), nullable=True)
+    parsed_at = Column(DateTime, default=datetime.utcnow)
+    updated_at = Column(DateTime, default=datetime.utcnow, onupdate=datetime.utcnow)
+
+
+class AnalystIndustryChain(Base):
+    """产业链总结报告（Markdown 原文）"""
+    __tablename__ = "analyst_industry_chain"
+    __table_args__ = (UniqueConstraint('chain_name', name='ux_aic_chain'),)
+
+    id = Column(Integer, primary_key=True, autoincrement=True)
+    chain_name = Column(String(80), nullable=False, index=True)
+    narrative_md = Column(Text, nullable=True)
+    source_file = Column(String(500), nullable=True)
+    parsed_at = Column(DateTime, default=datetime.utcnow)
+    updated_at = Column(DateTime, default=datetime.utcnow, onupdate=datetime.utcnow)
+
+
+class AnalystIndustryChainCompany(Base):
+    """产业链公司清单（Markdown 表格行）"""
+    __tablename__ = "analyst_industry_chain_company"
+
+    id = Column(Integer, primary_key=True, autoincrement=True)
+    chain_name = Column(String(80), nullable=False, index=True)
+    chain_position = Column(String(80), nullable=False)
+    sub_segment = Column(String(80), nullable=True)
+    company_name = Column(String(80), nullable=False)
+    stock_code = Column(String(20), nullable=True, index=True)
+    market_cap_range = Column(String(40), nullable=True)
+    relevance_stars = Column(Integer, nullable=True)
+    relevance_reason = Column(Text, nullable=True)
+    latest_progress = Column(Text, nullable=True)
+    order_visibility = Column(String(40), nullable=True)
+    earnings_elasticity = Column(String(40), nullable=True)
+    customer_onboarding = Column(String(200), nullable=True)
+    extra_json = Column(JSON, nullable=True)   # 存放未映射列（技术路线/产品适配点等）
+    source_file = Column(String(500), nullable=True)
+    row_index = Column(Integer, nullable=True)
+    parsed_at = Column(DateTime, default=datetime.utcnow)
+    updated_at = Column(DateTime, default=datetime.utcnow, onupdate=datetime.utcnow)

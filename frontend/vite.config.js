@@ -8,7 +8,7 @@ export default defineConfig(({ mode }) => {
   const env = loadEnv(mode, process.cwd(), 'VITE_')
   return {
     plugins: [react()],
-    server: { port: 5173, proxy: { '/api': { target: 'http://localhost:8015', changeOrigin: true } } },
+    server: { port: 5173, proxy: { '/api': { target: 'http://localhost:8001', changeOrigin: true } } },
     build: { outDir: 'dist', sourcemap: false },
   }
 })

@@ -6,14 +6,15 @@ BASE_DIR = Path(__file__).parent.parent
 DATA_DIR = BASE_DIR / "backend" / "data"
 DATA_DIR.mkdir(parents=True, exist_ok=True)
 
-# Database - SQLite for local dev, override via env for cloud
-# Cloud: 优先读 POSTGRES_CONNECTION_STRING (zeabur 自动注入) → DATABASE_URL → SQLite 本地
+# Database - 本地默认 Docker Postgres, override via env for cloud
+# 优先级: POSTGRES_CONNECTION_STRING (zeabur 自动注入) → DATABASE_URL → 本地 Docker PG
+# (本地 docker compose 起 `portfoliom-pg` 容器, 端口 5432, user/db 见 pg-init)
 DB_PATH = os.environ.get("DB_PATH", str(BASE_DIR / "portfolio.db"))
 DATABASE_URL = (
     os.environ.get("POSTGRES_CONNECTION_STRING")
     or os.environ.get("POSTGRES_URI")
     or os.environ.get("DATABASE_URL")
-    or f"sqlite:///{DB_PATH}"
+    or "postgresql+psycopg://portfoliom:localdev@localhost:5432/portfoliom"
 )
 
 # Tushare token (optional, for deeper A-share financials)

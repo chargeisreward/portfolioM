@@ -2,6 +2,7 @@ import React, { useState, useCallback, useEffect } from 'react'
 import * as api from './api'
 import OverviewPanel from './components/OverviewPanel'
 import AnalysisPanel from './components/AnalysisPanel'
+import AnalystPanel from './components/AnalystPanel'
 import TradingPanel from './components/TradingPanel'
 import WatchPanel from './components/WatchPanel'
 import SettingsPanel from './components/SettingsPanel'
@@ -71,12 +72,7 @@ export default function App() {
     switch (activeTab) {
       case 'overview': return <OverviewPanel />
       case 'analysis': return <AnalysisPanel />
-      case 'analyst': return (
-        <div className="glass-card placeholder">
-          <h3>📋 分析师分析</h3>
-          <p>即将推出</p>
-        </div>
-      )
+      case 'analyst': return <AnalystPanel />
       case 'trading': return <TradingPanel />
       case 'watch': return <WatchPanel />
       case 'data': return <DataBrowser />

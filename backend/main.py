@@ -361,6 +361,7 @@ def startup():
     )
     from services.scheduler import start_scheduler
     start_scheduler()
+    register_job_handlers()  # 填充 _JOB_DISPATCH 派发表
     # 初始化交易日历（CN/HK/US 2020-2030），失败不阻塞启动
     try:
         from database import SessionLocal
@@ -607,6 +608,31 @@ def list_exchange_rates(db: Session = Depends(get_db)):
         ExchangeRate.rate_date <= date_cls.today()
     ).order_by(ExchangeRate.rate_date.desc()).limit(10).all()
     return [{"date": r.rate_date.isoformat(), "from": r.from_currency, "to": r.to_currency, "rate": r.rate, "source": r.source} for r in rows]
+
+
+@app.get("/api/exchange-rates/latest")
+def list_exchange_rates_latest(target: str = Query("CNY"), db: Session = Depends(get_db)):
+    """返回每个 from_currency 的最新汇率 (到 target 币种, 默认 CNY).
+
+    用于前端把 HKD/USD 等原币种价格折算为人民币:
+      {USD: 7.18, HKD: 0.92, CAD: 5.20, ...}
+    每个 from_currency 只返回最新一条记录 (按 rate_date desc 取首条).
+    """
+    from models import ExchangeRate
+    from datetime import date as date_cls
+    rows = db.query(ExchangeRate).filter(
+        ExchangeRate.to_currency == target,
+        ExchangeRate.rate_date <= date_cls.today(),
+    ).order_by(ExchangeRate.rate_date.desc()).all()
+    latest = {}
+    for r in rows:
+        if r.from_currency not in latest:
+            latest[r.from_currency] = {
+                "date": r.rate_date.isoformat(),
+                "rate": r.rate,
+                "source": r.source,
+            }
+    return latest
 
 
 @app.get("/api/holdings/converted")
@@ -1357,6 +1383,38 @@ def crawl_all(db: Session = Depends(get_db)):
 
 # ==================== 调度器状态 ====================
 
+# Job ID → handler function 派发表（Phase 5 of data-pulling refactor）。
+# 所有 8 个 job 都可以通过 /api/scheduler/trigger 手动执行，立即跑而不是等下次 cron。
+_JOB_DISPATCH: dict = {}  # 延迟到 register_job_handlers() 填充（启动时执行）
+
+
+def register_job_handlers() -> None:
+    """把 8 个 job_* 函数注册到 _JOB_DISPATCH。FastAPI 启动时调用一次。"""
+    global _JOB_DISPATCH
+    if _JOB_DISPATCH:
+        return  # 幂等
+    from services.scheduler import (
+        job_fetch_realtime_prices,
+        job_update_financial_fundamentals,
+        job_update_industry_crawler_data,
+        job_backfill_gaps,
+        job_crawl_global_news,
+        job_crawl_stock_news,
+        job_crawl_announcements_and_research,
+        job_crawl_hot_stocks,
+    )
+    _JOB_DISPATCH = {
+        "realtime_prices": job_fetch_realtime_prices,
+        "industry_crawler_data": job_update_industry_crawler_data,
+        "financial_fundamentals": job_update_financial_fundamentals,
+        "backfill_gaps": job_backfill_gaps,
+        "info_global_news": job_crawl_global_news,
+        "info_stock_news": job_crawl_stock_news,
+        "info_announcements_research": job_crawl_announcements_and_research,
+        "info_hot_stocks": job_crawl_hot_stocks,
+    }
+
+
 @app.get("/api/scheduler/status")
 def scheduler_status():
     """获取定时任务调度器状态"""
@@ -1374,20 +1432,41 @@ def scheduler_status():
 
 
 @app.post("/api/scheduler/trigger/{job_id}")
-def trigger_job(job_id: str):
-    """手动触发指定定时任务（实时行情任务会强制跳过交易时段判断）"""
-    from services.scheduler import scheduler, job_fetch_realtime_prices
-    if not scheduler or not scheduler.running:
-        return {"status": "error", "message": "Scheduler not running"}
-    if job_id == "realtime_prices":
-        # 直接调用并强制执行，不走调度器队列
-        job_fetch_realtime_prices(force=True)
-        return {"status": "ok", "message": f"Job {job_id} executed (force=True)"}
-    job = scheduler.get_job(job_id)
-    if not job:
-        return {"status": "error", "message": f"Job {job_id} not found"}
-    job.modify(next_run_time=datetime.now())
-    return {"status": "ok", "message": f"Job {job_id} triggered"}
+def trigger_job(job_id: str, force: bool = False, background: bool = False):
+    """手动触发指定定时任务。
+
+    Args:
+        job_id: 8 个 job 之一 (见 _JOB_DISPATCH)
+        force: True 时绕过 dedup 守门（强制重拉）
+        background: True 时把 handler 放到 daemon 线程跑，立即返回；否则同步等结果
+    """
+    import threading
+    register_job_handlers()
+    handler = _JOB_DISPATCH.get(job_id)
+    if not handler:
+        return {
+            "status": "error",
+            "message": f"Unknown job_id: {job_id}. "
+                       f"Available: {sorted(_JOB_DISPATCH.keys())}",
+        }
+    if background:
+        threading.Thread(
+            target=handler,
+            kwargs={"force": force},
+            daemon=True,
+        ).start()
+        return {"status": "ok", "mode": "queued", "job_id": job_id, "force": force}
+    try:
+        result = handler(force=force)
+        return {
+            "status": "ok",
+            "mode": "sync",
+            "job_id": job_id,
+            "force": force,
+            "result": result if isinstance(result, dict) else {"value": result},
+        }
+    except Exception as e:
+        return {"status": "error", "job_id": job_id, "message": str(e)[:300]}
 
 
 # ==================== 数据浏览 ====================
@@ -1937,35 +2016,6 @@ def get_data_version(db: Session = Depends(get_db)):
     }
 
 
-def _resolve_market_value(stock_code: str, amount_cny: float, snap,
-                          current_price: float | None,
-                          baseline_price: float | None):
-    """Compute shares / est_market_value / deviation based on prices.
-
-    For drilled_fund rows: amount_cny is already the *dynamic* amount
-    (weight × original_amount × current/baseline). So:
-      shares = amount_static / baseline_price
-      est_market_value_at_current = shares × current_price = amount_dynamic
-      deviation = amount_dynamic - amount_static
-
-    For direct_stock rows: amount_cny is the import-time amount.
-      shares = amount_cny / baseline_price (if baseline known)
-      est_market_value_at_current = shares × current_price
-      deviation = est_market_value_at_current - amount_cny
-
-    For undrilled_fund / cash: no prices, return zeros.
-    """
-    if not snap or not baseline_price or baseline_price <= 0:
-        return None, amount_cny, 0.0
-    shares = amount_cny / baseline_price
-    if current_price and current_price > 0:
-        est_value = shares * current_price
-    else:
-        est_value = amount_cny
-    deviation_pct = ((est_value - amount_cny) / amount_cny * 100) if amount_cny else 0.0
-    return round(shares, 2), round(est_value, 4), round(deviation_pct, 4)
-
-
 def _pct_change_3m(stock_code: str, current_price: float | None, db) -> float | None:
     """Compute 3-month price change using price_cache.
 
@@ -1998,122 +2048,665 @@ def get_full_holding(
     as_of_date: date = Query(...),
     db: Session = Depends(get_db),
 ):
-    """返回 full_holding_snapshot 全量（下钻基金 + 直接股票 + 不下钻基金 + 现金）。
+    """FullHoldingTable = Overview - 可下钻基金 + 下钻基金下钻/展开后的股票.
 
-    - 同代码的证券已合并为单行（amount 求和，PE/PB/PS 取首个非空）。
-    - *_dynamic 缺失时回退到 baseline (5/29)。
-    - 估算市值 = 股数 × 上一交易日收盘价（shares = amount / baseline_price）。
-    - 估算偏差% = (估算市值 - 持仓金额) / 持仓金额。
-    - 3月涨跌% = (current_price - 90天前收盘价) / 90天前收盘价 × 100。
+    算法 (用户口径):
+      1. 拉取 Holding 全表 (Overview 的 44 笔持仓)
+      2. 通过 FundIndexMap 识别 14 只可下钻基金 (12 个指数 + 多基金)
+      3. 移除这些可下钻基金
+      4. 加入 12 个可下钻指数的 constituents (按 drill 算法展开)
+      5. 同代码的证券已合并为单行 (amount 求和)
+      6. 未下钻: 估算市值 = 数量 × 收盘价 (Holding.quantity × NAV/current_price × 汇率)
+      7. 下钻: 估算市值 = drill 算法 (shares_equivalent × current_price × 汇率)
+      8. PE/PB/PS = *_dynamic 优先, baseline 5/29 兜底
+
+    字段:
+      source_type: 'undrilled_fund' | 'direct_stock' | 'cash' | 'drilled'
+      est_market_value_cny: 在原币种下 (前端做 CNY 折算)
+      currency: 原币种 (前端用此判断是否需要折算)
     """
-    from models import FullHoldingSnapshot, AShareFinancialSnapshot, HKShareFinancialSnapshot
-    rows = db.query(FullHoldingSnapshot).filter(FullHoldingSnapshot.as_of_date == as_of_date).all()
+    from models import (
+        AShareFinancialSnapshot, HKShareFinancialSnapshot, Holding, FundIndexMap,
+    )
+    from services.drillable_funds import list_drillable_indices, get_index_drill_detail
 
-    # Build dual indexes: a_snap is keyed by BOTH the raw code (e.g. "2104")
-    # AND the suffixed code (e.g. "002104"). Same for h_snap with HK padding.
-    # This handles the case where full_holding uses raw integer codes (from
-    # index constituents) while snapshots use suffixed codes (from Excel).
-    def _index_a_snap(db, as_of_date):
-        idx = {}
-        for a in db.query(AShareFinancialSnapshot).filter(AShareFinancialSnapshot.as_of_date == as_of_date).all():
-            norm = a.stock_code.split(".")[0]
-            idx[norm] = a
-            idx[a.stock_code] = a
-            if norm.isdigit() and len(norm) == 6:
-                # also index the unpadded last-N-digits so 4-digit constituent codes match
-                idx[norm.lstrip("0")] = a
-        return idx
+    # 1) 拉取快照数据 (用于 PE/PB/PS)
+    a_snap = {a.stock_code.split(".")[0]: a for a in
+              db.query(AShareFinancialSnapshot).filter_by(as_of_date=as_of_date).all()}
+    h_snap = {h.stock_code.split(".")[0]: h for h in
+              db.query(HKShareFinancialSnapshot).filter_by(as_of_date=as_of_date).all()}
+    # 同样索引 suffix-stripped
+    def _norm_keys(snap_dict):
+        for k, v in list(snap_dict.items()):
+            snap_dict.setdefault(v.stock_code, v)
+        return snap_dict
+    a_snap = _norm_keys(a_snap)
+    h_snap = _norm_keys(h_snap)
 
-    def _index_h_snap(db, as_of_date):
-        idx = {}
-        for h in db.query(HKShareFinancialSnapshot).filter(HKShareFinancialSnapshot.as_of_date == as_of_date).all():
-            norm = h.stock_code.split(".")[0]
-            idx[norm] = h
-            idx[h.stock_code] = h
-            if norm.isdigit():
-                # Pad unpadded (4-digit → 5-digit) and vice versa
-                if len(norm) <= 5:
-                    idx[norm.zfill(5)] = h
-                idx[norm.lstrip("0")] = h
-        return idx
+    # 2) 拉 Holding 全部 + 合并同代码 (quantity/amount 累加)
+    holdings = db.query(Holding).all()
+    by_code: dict[str, dict] = {}
+    for h in holdings:
+        code = h.security_code
+        if code not in by_code:
+            by_code[code] = {
+                "security_code": code,
+                "security_name": h.security_name,
+                "quantity": 0.0,
+                "amount": 0.0,
+                "amount_cny": 0.0,
+                "currency": h.currency or "CNY",
+                "asset_type": h.asset_type or "",
+            }
+        acc = by_code[code]
+        acc["quantity"] += (h.quantity or 0.0)
+        acc["amount"] += (h.amount or 0.0)
+        acc["amount_cny"] += (h.amount_cny or 0.0)
 
-    a_snap = _index_a_snap(db, as_of_date)
-    h_snap = _index_h_snap(db, as_of_date)
+    # 3) 识别可下钻基金 (FundIndexMap 中存在的 fund_code)
+    drillable_codes = {
+        m.fund_code for m in
+        db.query(FundIndexMap).filter(FundIndexMap.as_of_date == as_of_date).all()
+    }
 
-    from models import Holding
-    static_by_holding = {}
-    for h in db.query(Holding).all():
-        static_by_holding[h.security_code] = static_by_holding.get(h.security_code, 0) + (h.amount_cny or 0)
-
-    out = []
-    for r in rows:
-        # Try multiple lookup keys:
-        #   1. r.stock_code (full, possibly with suffix)
-        #   2. norm = suffix-stripped
-        #   3. For HK: norm.zfill(5) (constituents use 4-digit, snapshot uses 5-digit)
-        #   4. For A-share: norm.zfill(6) (constituents use raw 4-digit, snapshot uses 6-digit)
-        norm = r.stock_code.split(".")[0]
-        keys = [r.stock_code, norm]
-        if norm.isdigit():
-            keys.append(norm.zfill(5))
-            keys.append(norm.zfill(6))
-        snap = None
-        for k in keys:
-            snap = a_snap.get(k) or h_snap.get(k)
-            if snap:
-                break
-        # Priority: snap dynamic (recomputed from current price) > snap baseline > null
+    # 4) 同代码合并后, 移除可下钻基金, 保留其余 (非下钻) holding 行
+    out: list[dict] = []
+    for code, acc in by_code.items():
+        if code in drillable_codes:
+            continue   # 跳过可下钻基金 (会被下钻成分股取代)
+        source_type = _infer_source_type_from_holding(acc)
+        # PE/PB/PS 从快照 (suffixed & unsuffixed 都查)
+        snap = _lookup_snap(code, a_snap, h_snap)
+        pe_v = pb_v = ps_v = dy_v = None
         if snap:
             pe_v = snap.pe_ttm_dynamic if snap.pe_ttm_dynamic is not None else snap.pe_ttm
             pb_v = snap.pb_mrq_dynamic if snap.pb_mrq_dynamic is not None else snap.pb_mrq
             ps_v = snap.ps_ttm_dynamic if snap.ps_ttm_dynamic is not None else snap.ps_ttm
-            basis = "dynamic" if snap.pe_ttm_dynamic is not None else "baseline_5_29"
-        else:
-            pe_v = r.pe_ttm_dynamic
-            pb_v = r.pb_mrq_dynamic
-            ps_v = r.ps_ttm_dynamic
-            basis = "dynamic"
-
-        baseline_price = snap.baseline_price if snap else None
-        current_price = snap.current_price if snap else None
-        current_price_date = snap.current_price_date if snap else None
-
-        if r.source_type == "drilled_fund":
-            static_amount = static_by_holding.get(r.source_holding_code, r.amount_cny)
-        else:
-            static_amount = r.amount_cny
-        shares, est_value, dev_pct = _resolve_market_value(
-            r.stock_code, static_amount, snap, current_price, baseline_price
+            dy_v = snap.dividend_yield
+        # 估算市值 = 数量 × 收盘价 (用户口径)
+        est_value, shares, fallback_price = _estimate_market_value_for_holding(
+            code, acc, snap, db,
         )
-        pct_3m = _pct_change_3m(r.stock_code, current_price, db)
-
+        baseline_price = snap.baseline_price if snap else None
+        current_price = snap.current_price if snap else fallback_price
+        pct_3m = _pct_change_3m(code, current_price, db)
         out.append({
-            "stock_code": r.stock_code,
-            "stock_name": r.stock_name,
-            "source_type": r.source_type,
-            "source_holding_code": r.source_holding_code,
-            "amount_cny": r.amount_cny,
-            "static_amount_cny": static_amount,
+            "stock_code": code,
+            "stock_name": acc["security_name"],
+            "source_type": source_type,
+            "source_holding_code": code,
+            "amount_cny": acc["amount_cny"],
+            "static_amount_cny": acc["amount_cny"],
             "shares": shares,
             "baseline_price": baseline_price,
             "current_price": current_price,
-            "current_price_date": current_price_date.isoformat() if current_price_date else None,
+            "current_price_date": snap.current_price_date.isoformat() if snap and snap.current_price_date else None,
             "est_market_value_cny": est_value,
-            "est_deviation_pct": dev_pct,
+            "est_deviation_pct": ((est_value - acc["amount_cny"]) / acc["amount_cny"] * 100)
+                if acc["amount_cny"] and est_value else 0.0,
             "pct_change_3m": pct_3m,
-            "industry_l1": r.industry_l1,
-            "industry_l2": r.industry_l2,
-            "chain_position": r.chain_position,
-            "growth_tier": r.growth_tier,
-            "competition": r.competition,
             "pe_ttm_dynamic": pe_v,
             "pb_mrq_dynamic": pb_v,
             "ps_ttm_dynamic": ps_v,
-            "dividend_yield": snap.dividend_yield if snap else None,
-            "eps_fy1": r.eps_fy1,
-            "metric_basis": basis,
+            "dividend_yield": dy_v,
+            "metric_basis": "dynamic" if (snap and snap.pe_ttm_dynamic is not None) else "baseline_5_29",
+            "fund_currency": acc["currency"],
         })
+
+    # 5) 加入 12 个可下钻指数的 constituents (drill 算法)
+    indices = list_drillable_indices(db, as_of_date)
+    for idx in indices:
+        detail = get_index_drill_detail(db, idx["index_code"], as_of_date)
+        if "constituents" not in detail:
+            continue
+        for c in detail["constituents"]:
+            code = c["stock_code"]
+            snap = _lookup_snap(code, a_snap, h_snap)
+            pe_v = pb_v = ps_v = dy_v = None
+            if snap:
+                pe_v = snap.pe_ttm_dynamic if snap.pe_ttm_dynamic is not None else snap.pe_ttm
+                pb_v = snap.pb_mrq_dynamic if snap.pb_mrq_dynamic is not None else snap.pb_mrq
+                ps_v = snap.ps_ttm_dynamic if snap.ps_ttm_dynamic is not None else snap.ps_ttm
+                dy_v = snap.dividend_yield
+            pct_3m = _pct_change_3m(code, c.get("current_price"), db)
+            out.append({
+                "stock_code": code,
+                "stock_name": c.get("stock_name"),
+                "source_type": "drilled",
+                "source_holding_code": idx["index_code"],
+                "amount_cny": None,
+                "static_amount_cny": None,
+                "shares": c.get("shares_equivalent"),
+                "baseline_price": c.get("baseline_price"),
+                "current_price": c.get("current_price"),
+                "current_price_date": c.get("current_price_date"),
+                "est_market_value_cny": c.get("est_market_value_cny"),  # 原币种
+                "est_deviation_pct": None,
+                "pct_change_3m": pct_3m,
+                "pe_ttm_dynamic": pe_v,
+                "pb_mrq_dynamic": pb_v,
+                "ps_ttm_dynamic": ps_v,
+                "dividend_yield": dy_v,
+                "metric_basis": "dynamic",
+                "fund_currency": _guess_currency_from_code(code),
+            })
+
     return out
+
+
+@app.get("/api/penetration/full-holding-table")
+def get_full_holding_table(
+    as_of_date: date = Query(...),
+    db: Session = Depends(get_db),
+):
+    """全持仓表格专用接口：一次返回 undrilled + drilled 聚合，避免重复下钻。
+
+    与分别调用 /full-holding 和 /all-drilled-stocks 相比：
+      - 只下钻一次所有指数
+      - 快照 / holdings / fund_navs 只加载一次
+      - drilled 部分在后端按 stock_code 聚合，避免前端重复合并
+      - undrilled 部分不再包含 drilled 成分股，防止重复计算
+    """
+    from models import (
+        AShareFinancialSnapshot, HKShareFinancialSnapshot, Holding, FundIndexMap,
+        FundDailyNav,
+    )
+    from services.drillable_funds import list_drillable_indices, get_index_drill_detail
+
+    # 1) 快照一次性加载
+    a_snap_raw = {a.stock_code.split(".")[0]: a for a in
+                  db.query(AShareFinancialSnapshot).filter_by(as_of_date=as_of_date).all()}
+    h_snap_raw = {h.stock_code.split(".")[0]: h for h in
+                  db.query(HKShareFinancialSnapshot).filter_by(as_of_date=as_of_date).all()}
+
+    def _norm_keys(snap_dict):
+        for k, v in list(snap_dict.items()):
+            snap_dict.setdefault(v.stock_code, v)
+        return snap_dict
+
+    a_snap = _norm_keys(a_snap_raw)
+    h_snap = _norm_keys(h_snap_raw)
+
+    # 2) Holding 聚合（按代码）
+    holdings = db.query(Holding).all()
+    by_code: dict[str, dict] = {}
+    for h in holdings:
+        code = h.security_code
+        if code not in by_code:
+            by_code[code] = {
+                "security_code": code,
+                "security_name": h.security_name,
+                "quantity": 0.0,
+                "amount": 0.0,
+                "amount_cny": 0.0,
+                "currency": h.currency or "CNY",
+                "asset_type": h.asset_type or "",
+            }
+        acc = by_code[code]
+        acc["quantity"] += (h.quantity or 0.0)
+        acc["amount"] += (h.amount or 0.0)
+        acc["amount_cny"] += (h.amount_cny or 0.0)
+
+    # 3) 可下钻基金
+    drillable_codes = {
+        m.fund_code for m in
+        db.query(FundIndexMap).filter(FundIndexMap.as_of_date == as_of_date).all()
+    }
+
+    # 4) 构建 undrilled 行（直接持股 + 未下钻基金 + 现金）
+    undrilled_out: list[dict] = []
+    for code, acc in by_code.items():
+        if code in drillable_codes:
+            continue
+        source_type = _infer_source_type_from_holding(acc)
+        snap = _lookup_snap(code, a_snap, h_snap)
+        pe_v = pb_v = ps_v = dy_v = None
+        if snap:
+            pe_v = snap.pe_ttm_dynamic if snap.pe_ttm_dynamic is not None else snap.pe_ttm
+            pb_v = snap.pb_mrq_dynamic if snap.pb_mrq_dynamic is not None else snap.pb_mrq
+            ps_v = snap.ps_ttm_dynamic if snap.ps_ttm_dynamic is not None else snap.ps_ttm
+            dy_v = snap.dividend_yield
+        est_value, shares, fallback_price = _estimate_market_value_for_holding(
+            code, acc, snap, db,
+        )
+        baseline_price = snap.baseline_price if snap else None
+        current_price = snap.current_price if snap else fallback_price
+        undrilled_out.append({
+            "stock_code": code,
+            "stock_name": acc["security_name"],
+            "source_type": source_type,
+            "amount_cny": acc["amount_cny"],
+            "shares": shares,
+            "baseline_price": baseline_price,
+            "current_price": current_price,
+            "est_market_value_cny": est_value,
+            "pe_ttm_dynamic": pe_v,
+            "pb_mrq_dynamic": pb_v,
+            "ps_ttm_dynamic": ps_v,
+            "dividend_yield": dy_v,
+            "fund_currency": acc["currency"],
+        })
+
+    # 5) 一次性加载所有相关 fund NAVs
+    all_fund_codes = sorted(drillable_codes)
+    fund_navs_map: dict[str, dict] = {}
+    if all_fund_codes:
+        nav_rows = (
+            db.query(FundDailyNav)
+            .filter(
+                FundDailyNav.fund_code.in_(all_fund_codes),
+                FundDailyNav.trade_date.in_([as_of_date, date(2026, 6, 18)]),
+            )
+            .all()
+        )
+        for fc in all_fund_codes:
+            fund_navs_map[fc] = {"nav_529": None, "cumnav_529": None, "nav_618": None, "cumnav_618": None}
+        for r in nav_rows:
+            fc = r.fund_code
+            if r.trade_date == as_of_date:
+                fund_navs_map[fc]["nav_529"] = r.nav
+                fund_navs_map[fc]["cumnav_529"] = r.accumulated_nav
+            elif r.trade_date == date(2026, 6, 18):
+                fund_navs_map[fc]["nav_618"] = r.nav
+                fund_navs_map[fc]["cumnav_618"] = r.accumulated_nav
+
+    # 6) 下钻所有指数一次，并按 stock_code 聚合
+    holdings_agg = {code: info for code, info in by_code.items() if info["quantity"] > 0}
+    drilled_map: dict[str, dict] = {}
+    indices = list_drillable_indices(db, as_of_date)
+    for idx in indices:
+        detail = get_index_drill_detail(
+            db, idx["index_code"], as_of_date,
+            holdings_agg=holdings_agg,
+            fund_navs=fund_navs_map,
+            a_snap=a_snap,
+            h_snap=h_snap,
+        )
+        if "constituents" not in detail:
+            continue
+        idx_code = idx["index_code"]
+        for c in detail["constituents"]:
+            code = c["stock_code"]
+            if code not in drilled_map:
+                drilled_map[code] = {
+                    "stock_code": code,
+                    "stock_name": c.get("stock_name"),
+                    "shares_equivalent": 0,
+                    "current_price": c.get("current_price"),
+                    "baseline_price": c.get("baseline_price"),
+                    "est_market_value_cny": 0.0,
+                    "pe_ttm": c.get("pe_ttm"),
+                    "pb_mrq": c.get("pb_mrq"),
+                    "ps_ttm": c.get("ps_ttm"),
+                    "dividend_yield": c.get("dividend_yield"),
+                    "indices": set(),
+                }
+            acc = drilled_map[code]
+            acc["shares_equivalent"] += (c.get("shares_equivalent") or 0)
+            acc["est_market_value_cny"] += (c.get("est_market_value_cny") or 0)
+            acc["indices"].add(idx_code)
+            for k in ("current_price", "baseline_price", "pe_ttm", "pb_mrq", "ps_ttm", "dividend_yield"):
+                if acc.get(k) is None and c.get(k) is not None:
+                    acc[k] = c.get(k)
+
+    for s in drilled_map.values():
+        s["indices"] = sorted(s["indices"])
+        s["est_market_value_cny"] = round(s["est_market_value_cny"], 4)
+
+    return {
+        "as_of_date": as_of_date.isoformat(),
+        "undrilled": undrilled_out,
+        "drilled": drilled_map,
+    }
+
+
+@app.get("/api/penetration/dimension-drilled")
+def get_dimension_drilled(
+    dim: str = Query(...),
+    as_of_date: date = Query(...),
+    market: str = Query("A+H", regex="^(A\\+H|A|H)$"),
+    db: Session = Depends(get_db),
+):
+    """下钻证券维度聚合 + CSI300 对照（仅用于需要 drill 视角的维度，如 swy1）。
+
+    组合部分：仅对下钻证券（drilled constituents）按 dim 列聚合，金额按最新汇率折算为 CNY，
+             PE 采用虚拟盈利法 Σamount / Σ(amount/PE_dynamic)。
+    CSI300 部分：使用 csi300_constituent_snapshot 的最新权重作为分母，同行业算法计算 PE。
+    market=A 时仅保留 A 股（.SH/.SZ），market=H 时仅保留港股（.HK）。
+
+    返回包含 stock_details，用于前端点击行业行展开下钻证券明细。
+    """
+    from services.drillable_funds import get_all_drilled_stocks, list_drillable_indices
+    from models import (
+        AShareFinancialSnapshot, HKShareFinancialSnapshot,
+        Csi300ConstituentSnapshot, ExchangeRate,
+        FundIndexMap, FundDailyNav, Holding,
+    )
+
+    DIM_COL_DRILLED = {
+        "swy1": "swy_l1", "swy2": "swy_l2", "swy3": "swy_l3", "swy4": "swy_l4",
+        "csi1": "csi_l1", "csi2": "csi_l2", "csi3": "csi_l3", "csi4": "csi_l4",
+        "se1": "se_l1", "se2": "se_l2", "se3": "se_l3", "se4": "se_l4",
+        "l1": "swy_l1", "l2": "swy_l2",
+        "chain": "chain_position", "growth_tier": "growth_tier", "competition": "competition",
+    }
+    if dim not in DIM_COL_DRILLED:
+        raise HTTPException(status_code=400, detail=f"Unsupported dim: {dim}")
+    col = DIM_COL_DRILLED[dim]
+
+    # 1) 快照（用于 dim 分类 + CSI300 PE/PB/PS 补全）
+    a_snap = {a.stock_code.split(".")[0]: a for a in
+              db.query(AShareFinancialSnapshot).filter_by(as_of_date=as_of_date).all()}
+    h_snap = {h.stock_code.split(".")[0]: h for h in
+              db.query(HKShareFinancialSnapshot).filter_by(as_of_date=as_of_date).all()}
+
+    def _norm_keys(snap_dict):
+        for k, v in list(snap_dict.items()):
+            snap_dict.setdefault(v.stock_code, v)
+        return snap_dict
+
+    a_snap = _norm_keys(a_snap)
+    h_snap = _norm_keys(h_snap)
+
+    def _norm_bucket_key(k):
+        if not k or k in ("--", "—", "nan", "None", "", "其他"):
+            return "其他"
+        return k
+
+    def _resolve_snap(code):
+        norm = code.split(".")[0]
+        snap = a_snap.get(norm) or h_snap.get(norm)
+        if not snap and norm.isdigit():
+            snap = h_snap.get(norm.zfill(5))
+        return snap
+
+    # 2) 预加载 holdings / fund_navs / indices，避免 get_all_drilled_stocks 重复查库
+    drillable_codes = {
+        m.fund_code for m in
+        db.query(FundIndexMap).filter(FundIndexMap.as_of_date == as_of_date).all()
+    }
+    holdings_agg: dict[str, dict] = {}
+    for h in db.query(Holding).all():
+        code = h.security_code
+        if code not in holdings_agg:
+            holdings_agg[code] = {
+                "fund_code": code,
+                "quantity": 0.0,
+                "amount_cny": 0.0,
+                "asset_type": (h.asset_type or "").lower(),
+            }
+        holdings_agg[code]["quantity"] += (h.quantity or 0.0)
+        holdings_agg[code]["amount_cny"] += (h.amount_cny or 0.0)
+    holdings_agg = {k: v for k, v in holdings_agg.items() if v["quantity"] > 0}
+
+    fund_navs_map: dict[str, dict] = {}
+    if drillable_codes:
+        nav_rows = (
+            db.query(FundDailyNav)
+            .filter(
+                FundDailyNav.fund_code.in_(list(drillable_codes)),
+                FundDailyNav.trade_date.in_([as_of_date, date(2026, 6, 18)]),
+            )
+            .all()
+        )
+        for fc in drillable_codes:
+            fund_navs_map[fc] = {"nav_529": None, "cumnav_529": None, "nav_618": None, "cumnav_618": None}
+        for r in nav_rows:
+            fc = r.fund_code
+            if r.trade_date == as_of_date:
+                fund_navs_map[fc]["nav_529"] = r.nav
+                fund_navs_map[fc]["cumnav_529"] = r.accumulated_nav
+            elif r.trade_date == date(2026, 6, 18):
+                fund_navs_map[fc]["nav_618"] = r.nav
+                fund_navs_map[fc]["cumnav_618"] = r.accumulated_nav
+
+    indices = list_drillable_indices(db, as_of_date)
+
+    # 3) 下钻证券聚合结果（一次性预加载）
+    drilled_resp = get_all_drilled_stocks(
+        db, as_of_date,
+        indices=indices,
+        holdings_agg=holdings_agg,
+        fund_navs=fund_navs_map,
+        a_snap=a_snap,
+        h_snap=h_snap,
+    )
+    drilled_stocks = drilled_resp.get("stocks") or []
+
+    # 4) 最新汇率（USD/HKD → CNY）
+    fx_rates = {"CNY": 1.0}
+    for fc in ("USD", "HKD"):
+        rate_row = (
+            db.query(ExchangeRate)
+            .filter(ExchangeRate.from_currency == fc, ExchangeRate.to_currency == "CNY")
+            .order_by(ExchangeRate.rate_date.desc())
+            .first()
+        )
+        if rate_row:
+            fx_rates[fc] = rate_row.rate
+
+    def _to_cny(amount, code):
+        cur = _guess_currency_from_code(code)
+        return amount * fx_rates.get(cur, 1.0)
+
+    def _in_market(code):
+        if market == "A+H":
+            return True
+        c = str(code).upper()
+        if market == "A":
+            return c.endswith(".SH") or c.endswith(".SZ") or (c.isdigit() and len(c) == 6)
+        if market == "H":
+            return c.endswith(".HK") or (c.isdigit() and len(c) == 5)
+        return True
+
+    # 5) 组合：按下钻证券聚合
+    portfolio_buckets: dict[str, dict] = {}
+    stock_details: dict[str, list] = {}
+    total_amount = 0.0
+
+    for s in drilled_stocks:
+        code = s["stock_code"]
+        if not _in_market(code):
+            continue
+        amount_cny = _to_cny(s.get("est_market_value_cny") or 0, code)
+        pe = s.get("pe_ttm")
+        pb = s.get("pb_mrq")
+        ps = s.get("ps_ttm")
+
+        snap = _resolve_snap(code)
+        key = _norm_bucket_key(getattr(snap, col, None) if snap else None)
+
+        b = portfolio_buckets.setdefault(key, {"amount": 0.0, "stocks": set(), "virt_pe": 0.0, "virt_pb": 0.0, "virt_ps": 0.0})
+        b["amount"] += amount_cny
+        b["stocks"].add(code)
+        if amount_cny > 0:
+            if pe and pe > 0:
+                b["virt_pe"] += amount_cny / pe
+            if pb and pb > 0:
+                b["virt_pb"] += amount_cny / pb
+            if ps and ps > 0:
+                b["virt_ps"] += amount_cny / ps
+        total_amount += amount_cny
+
+        stock_details.setdefault(key, []).append({
+            "stock_code": code,
+            "stock_name": s.get("stock_name"),
+            "shares_equivalent": s.get("shares_equivalent"),
+            "current_price": s.get("current_price"),
+            "current_price_cny": round(_to_cny(s.get("current_price") or 0, code), 4) if s.get("current_price") else None,
+            "currency": _guess_currency_from_code(code),
+            "amount_cny": round(amount_cny, 4),
+            "pe_ttm": pe,
+            "pb_mrq": pb,
+            "ps_ttm": ps,
+        })
+
+    # 5) CSI300：按最新指数权重聚合；行业/PE/PB/PS 从金融快照补
+    csi300_buckets: dict[str, dict] = {}
+    csi_total_weight = 0.0
+    csi_rows = db.query(Csi300ConstituentSnapshot).filter_by(as_of_date=as_of_date).all()
+    for r in csi_rows:
+        if not _in_market(r.stock_code):
+            continue
+        snap = _resolve_snap(r.stock_code)
+        key = _norm_bucket_key(getattr(snap, col, None) if snap else None)
+        if key == "其他":
+            key = _norm_bucket_key(getattr(r, col, None))
+        weight = r.weight or 0.0
+        pe = snap.pe_ttm_dynamic if snap and snap.pe_ttm_dynamic is not None else (snap.pe_ttm if snap else None)
+        pb = snap.pb_mrq_dynamic if snap and snap.pb_mrq_dynamic is not None else (snap.pb_mrq if snap else None)
+        ps = snap.ps_ttm_dynamic if snap and snap.ps_ttm_dynamic is not None else (snap.ps_ttm if snap else None)
+        b = csi300_buckets.setdefault(key, {"weight": 0.0, "stocks": set(), "virt_pe": 0.0, "virt_pb": 0.0, "virt_ps": 0.0})
+        b["weight"] += weight
+        b["stocks"].add(r.stock_code)
+        if weight > 0:
+            if pe and pe > 0:
+                b["virt_pe"] += weight / pe
+            if pb and pb > 0:
+                b["virt_pb"] += weight / pb
+            if ps and ps > 0:
+                b["virt_ps"] += weight / ps
+        csi_total_weight += weight
+
+    # 6) 构建输出行
+    portfolio_rows = []
+    for key, b in portfolio_buckets.items():
+        portfolio_rows.append({
+            "key": key,
+            "stock_count": len(b["stocks"]),
+            "amount_cny": round(b["amount"], 4),
+            "weight_pct": round(b["amount"] / total_amount * 100, 4) if total_amount else 0.0,
+            "pe_weighted": round(b["amount"] / b["virt_pe"], 4) if b["virt_pe"] else None,
+            "pb_weighted": round(b["amount"] / b["virt_pb"], 4) if b["virt_pb"] else None,
+            "ps_weighted": round(b["amount"] / b["virt_ps"], 4) if b["virt_ps"] else None,
+        })
+
+    csi300_rows = []
+    for key, b in csi300_buckets.items():
+        csi300_rows.append({
+            "key": key,
+            "stock_count": len(b["stocks"]),
+            "weight_pct": round(b["weight"] / csi_total_weight * 100, 4) if csi_total_weight else 0.0,
+            "pe_weighted": round(b["weight"] / b["virt_pe"], 4) if b["virt_pe"] else None,
+            "pb_weighted": round(b["weight"] / b["virt_pb"], 4) if b["virt_pb"] else None,
+            "ps_weighted": round(b["weight"] / b["virt_ps"], 4) if b["virt_ps"] else None,
+        })
+
+    # 7) 合计
+    total_virt_pe = sum(b["virt_pe"] for b in portfolio_buckets.values())
+    total_virt_pb = sum(b["virt_pb"] for b in portfolio_buckets.values())
+    total_virt_ps = sum(b["virt_ps"] for b in portfolio_buckets.values())
+    csi_total_virt_pe = sum(b["virt_pe"] for b in csi300_buckets.values())
+    csi_total_virt_pb = sum(b["virt_pb"] for b in csi300_buckets.values())
+    csi_total_virt_ps = sum(b["virt_ps"] for b in csi300_buckets.values())
+
+    # 明细权重（以下钻证券合计为分母）
+    for key, stocks in stock_details.items():
+        for st in stocks:
+            st["weight_pct"] = round(st["amount_cny"] / total_amount * 100, 4) if total_amount else 0.0
+
+    return {
+        "as_of_date": as_of_date.isoformat(),
+        "dim": dim,
+        "portfolio": sorted(portfolio_rows, key=lambda r: -r["amount_cny"]),
+        "csi300": sorted(csi300_rows, key=lambda r: -r["weight_pct"]),
+        "stock_details": stock_details,
+        "totals": {
+            "portfolio": {
+                "stock_count": len({code for b in portfolio_buckets.values() for code in b["stocks"]}),
+                "amount_cny": round(total_amount, 4),
+                "pe_weighted": round(total_amount / total_virt_pe, 4) if total_virt_pe else None,
+                "pb_weighted": round(total_amount / total_virt_pb, 4) if total_virt_pb else None,
+                "ps_weighted": round(total_amount / total_virt_ps, 4) if total_virt_ps else None,
+            },
+            "csi300": {
+                "stock_count": len({code for b in csi300_buckets.values() for code in b["stocks"]}),
+                "amount_cny": None,
+                "pe_weighted": round(csi_total_weight / csi_total_virt_pe, 4) if csi_total_virt_pe else None,
+                "pb_weighted": round(csi_total_weight / csi_total_virt_pb, 4) if csi_total_virt_pb else None,
+                "ps_weighted": round(csi_total_weight / csi_total_virt_ps, 4) if csi_total_virt_ps else None,
+            },
+        },
+    }
+
+
+def _infer_source_type_from_holding(acc: dict) -> str:
+    """从 holding 推断 source_type (与 full_holding 兼容)."""
+    cur = acc.get("currency", "CNY")
+    at = (acc.get("asset_type") or "").lower()
+    code = acc.get("security_code", "")
+    # USD/HKD 一律视为直接持股 (含 QQQ 等美股 ETF)
+    if cur in ("USD", "HKD"):
+        return "direct_stock"
+    # CNY 基金 / 债券 / 黄金 视为未下钻基金
+    if code.endswith(".OF") or any(k in at for k in ("fund", "etf", "bond", "gold")):
+        return "undrilled_fund"
+    # A 股直接持股
+    if at in ("a_share_equity", ""):
+        return "direct_stock"
+    return "undrilled_fund"
+
+
+def _lookup_snap(code: str, a_snap: dict, h_snap: dict):
+    """双键查找快照 (raw code 与 suffixed 都试)."""
+    snap = a_snap.get(code) or h_snap.get(code)
+    if snap:
+        return snap
+    norm = code.split(".")[0]
+    snap = a_snap.get(norm) or h_snap.get(norm)
+    if snap:
+        return snap
+    if norm.isdigit():
+        for k in (norm.zfill(5), norm.zfill(6)):
+            snap = a_snap.get(k) or h_snap.get(k)
+            if snap:
+                return snap
+    return None
+
+
+def _estimate_market_value_for_holding(code: str, acc: dict, snap, db) -> tuple:
+    """对未下钻 holding 估算 数量 × 收盘价 (用户口径).
+
+    返回 (est_value_in_original_currency, shares, current_price).
+    est_value 仍在原币种下 (前端用 toCNY 折算).
+    current_price 可能来自快照或 price_cache (用于前端展示).
+    """
+    from models import FundDailyNav, PriceCache
+    qty = acc.get("quantity", 0.0) or 0.0
+    cur = acc.get("currency", "CNY")
+    if code.endswith(".OF"):
+        # OF 基金: 用最新 NAV (FundDailyNav 优先, 兜底 Holding.price)
+        nav = None
+        nav_row = (
+            db.query(FundDailyNav)
+            .filter(FundDailyNav.fund_code == code, FundDailyNav.nav.isnot(None))
+            .order_by(FundDailyNav.trade_date.desc())
+            .first()
+        )
+        if nav_row:
+            nav = nav_row.nav
+        else:
+            if qty > 0 and acc.get("amount", 0):
+                nav = acc["amount"] / qty
+        if qty > 0 and nav and nav > 0:
+            return qty * nav, qty, nav
+        return acc.get("amount_cny", 0), qty, nav
+
+    # 股票 / ETF: 优先用快照 current_price, 缺失则从 price_cache 兜底
+    if snap and snap.current_price and snap.current_price > 0:
+        price = snap.current_price
+    else:
+        price_row = (
+            db.query(PriceCache)
+            .filter(PriceCache.stock_code == code, PriceCache.close_px.isnot(None))
+            .order_by(PriceCache.trade_date.desc())
+            .first()
+        )
+        price = price_row.close_px if price_row else None
+
+    if qty > 0 and price and price > 0:
+        return qty * price, qty, price
+    return acc.get("amount_cny", 0), qty, price
 
 
 @app.get("/api/penetration/dimension")
@@ -2242,6 +2835,85 @@ def get_dimension_detail(
 
 def _is_hk_code(stock_code: str) -> bool:
     return stock_code.upper().endswith(".HK")
+
+
+def _compute_drill_virtual_earnings(stocks: list, fx_rates: dict | None = None) -> dict:
+    """Compute virtual-earnings stats from a list of drill-page constituents.
+
+    输入: [{stock_code, shares_equivalent, baseline_price, current_price,
+            est_market_value_cny, pe_ttm, pb_mrq, ps_ttm, dividend_yield}, ...]
+
+    算法 (以最新收盘价为口径, 全部以 CNY 为单位):
+      amount = est_market_value_cny × fx_rate[原币种]   (current price × shares, 折算为 CNY)
+      price_ratio = current_price / baseline_price
+      pe_per_stock = pe_ttm × price_ratio
+      virt_pe = Σ (amount / pe_per_stock)
+      weighted_pe = Σ amount / virt_pe
+      股息率 = Σ (amount × dy_per_stock) / Σ amount   where dy_per_stock = dy / price_ratio
+
+    fx_rates: {USD: rate_to_CNY, HKD: rate_to_CNY}; 缺省默认 {USD: 7.18, HKD: 0.92}
+    """
+    if fx_rates is None:
+        fx_rates = {"USD": 7.18, "HKD": 0.92, "CNY": 1.0}
+
+    def to_cny(amount: float, code: str) -> float:
+        cur = _guess_currency_from_code(code)
+        rate = fx_rates.get(cur, 1.0)
+        return amount * rate
+
+    total_amount = 0.0
+    virt_pe = virt_pb = virt_ps = 0.0
+    sum_dy_weighted = 0.0
+    stock_count = 0
+    for s in stocks:
+        amount_raw = s.get("est_market_value_cny")
+        if amount_raw is None or amount_raw <= 0:
+            continue
+        amount = to_cny(amount_raw, s.get("stock_code", ""))
+        baseline = s.get("baseline_price")
+        current = s.get("current_price")
+        if not (baseline and baseline > 0 and current and current > 0):
+            continue
+        price_ratio = current / baseline
+        pe_v = s.get("pe_ttm")
+        pb_v = s.get("pb_mrq")
+        ps_v = s.get("ps_ttm")
+        dy_v = s.get("dividend_yield")
+        pe_per = (pe_v * price_ratio) if (pe_v and pe_v > 0) else None
+        pb_per = (pb_v * price_ratio) if (pb_v and pb_v > 0) else None
+        ps_per = (ps_v * price_ratio) if (ps_v and ps_v > 0) else None
+        dy_per = (dy_v / price_ratio) if (dy_v is not None) else None
+        total_amount += amount
+        stock_count += 1
+        if pe_per and pe_per > 0:
+            virt_pe += amount / pe_per
+        if pb_per and pb_per > 0:
+            virt_pb += amount / pb_per
+        if ps_per and ps_per > 0:
+            virt_ps += amount / ps_per
+        if dy_per is not None:
+            sum_dy_weighted += amount * dy_per
+    return {
+        "stock_count": stock_count,
+        "total_amount_cny": round(total_amount, 4),   # 已折算 CNY
+        "weighted_pe": round(total_amount / virt_pe, 4) if virt_pe else None,
+        "weighted_pb": round(total_amount / virt_pb, 4) if virt_pb else None,
+        "weighted_ps": round(total_amount / virt_ps, 4) if virt_ps else None,
+        "weighted_dividend_yield": round(sum_dy_weighted / total_amount, 4) if total_amount else None,
+        "virtual_earnings": round(virt_pe, 4),
+    }
+
+
+def _guess_currency_from_code(code: str) -> str:
+    """与 backend crawlers/exchange_rates.py:guess_currency_from_code 对齐."""
+    if not code:
+        return "CNY"
+    c = str(code).upper()
+    if c in {"GOOGL","NVDA","INTC","SNDK","AMD","AAPL","MSFT","AMZN","TSLA","QQQ"}:
+        return "USD"
+    if c.endswith(".HK") or (c.isdigit() and len(c) == 5):
+        return "HKD"
+    return "CNY"
 
 
 def _portfolio_scope_totals(db: Session, as_of_date: date, market: str):
@@ -2450,6 +3122,97 @@ def get_portfolio_vs_csi300(
         "a_only": _portfolio_scope_totals(db, as_of_date, "A"),
         "h_only": _portfolio_scope_totals(db, as_of_date, "H"),
         "csi300": _csi300_scope_totals(db, as_of_date),
+    }
+
+
+@app.get("/api/penetration/full-holding-summary")
+def get_full_holding_summary(
+    as_of_date: date = Query(...),
+    db: Session = Depends(get_db),
+):
+    """全持仓 4 口径估值对比 (虚拟盈利法) — 以最新收盘价计算.
+
+    4 个口径:
+      - drilled: 全持仓-下钻部分 全部证券 (drill 页面所有指数的聚合)
+      - a:       drilled 中 A 股部分
+      - h:       drilled 中港股部分
+      - csi300:  CSI 300 指数 (= 与下钻页面的 CSI 300 卡片数值相同, 仅作指标参照系,
+                不含金额 / 占比)
+
+    3 张卡片 (drilled / a / h) 算法 (以最新收盘价为口径):
+      amount = est_market_value_cny          (current price × shares, 原始币种, 前端折算 CNY)
+      price_ratio = current_price / baseline_price
+      pe_per_stock = pe_ttm × price_ratio    (PE at latest closing price)
+      virt_pe = Σ (amount / pe_per_stock)
+      weighted_pe = Σ amount / virt_pe
+      股息率 = Σ (amount × dy_per_stock) / Σ amount   where dy_per_stock = dy / price_ratio
+
+    CSI 300 直接复用 list_drillable_indices 返回的 000300 卡片 (5/29 amount × current PE),
+    但不返回 金额/占比 字段 (按用户口径: 仅作指标参照系).
+    """
+    from services.drillable_funds import list_drillable_indices, get_all_drilled_stocks
+    from models import AShareFinancialSnapshot, HKShareFinancialSnapshot, ExchangeRate
+
+    indices = list_drillable_indices(db, as_of_date)
+    drilled_resp = get_all_drilled_stocks(db, as_of_date)
+    all_stocks = drilled_resp.get("stocks") or []
+
+    # 拉最新汇率 (按 from_currency 取最大 rate_date), 用于将 est_market_value_cny 折算 CNY
+    fx_rates = {"CNY": 1.0}
+    for fc in ("USD", "HKD"):
+        rate_row = (
+            db.query(ExchangeRate)
+            .filter(ExchangeRate.from_currency == fc, ExchangeRate.to_currency == "CNY")
+            .order_by(ExchangeRate.rate_date.desc())
+            .first()
+        )
+        if rate_row:
+            fx_rates[fc] = rate_row.rate
+
+    # A / HK 检测: 按主快照判断 (drilled stocks 已含 pe_ttm/pb_mrq 等基础指标)
+    a_snap_keys = {a.stock_code.split(".")[0] for a in
+                   db.query(AShareFinancialSnapshot).filter_by(as_of_date=as_of_date).all()}
+    h_snap_keys = {h.stock_code.split(".")[0] for h in
+                   db.query(HKShareFinancialSnapshot).filter_by(as_of_date=as_of_date).all()}
+    a_stocks, h_stocks = [], []
+    for s in all_stocks:
+        code_norm = s["stock_code"].split(".")[0]
+        if code_norm in h_snap_keys:
+            h_stocks.append(s)
+        elif code_norm in a_snap_keys:
+            a_stocks.append(s)
+        elif s["stock_code"].upper().endswith(".HK"):
+            h_stocks.append(s)
+        else:
+            a_stocks.append(s)
+
+    drilled_card = _compute_drill_virtual_earnings(all_stocks, fx_rates=fx_rates)
+    a_card = _compute_drill_virtual_earnings(a_stocks, fx_rates=fx_rates)
+    h_card = _compute_drill_virtual_earnings(h_stocks, fx_rates=fx_rates)
+
+    # CSI 300: 仅指标 (参照系, 不含金额 / 占比)
+    csi300_src = next((c for c in indices if c["index_code"] == "000300"), None)
+    if csi300_src:
+        csi300_card = {
+            "stock_count": csi300_src.get("stock_count"),
+            "weighted_pe": csi300_src.get("weighted_pe"),
+            "weighted_pb": csi300_src.get("weighted_pb"),
+            "weighted_ps": csi300_src.get("weighted_ps"),
+            "weighted_dividend_yield": csi300_src.get("weighted_dividend_yield"),
+        }
+    else:
+        csi300_card = {
+            "stock_count": 0,
+            "weighted_pe": None, "weighted_pb": None, "weighted_ps": None,
+            "weighted_dividend_yield": None,
+        }
+
+    return {
+        "as_of_date": as_of_date.isoformat(),
+        "drilled": drilled_card,
+        "a_only": a_card,
+        "h_only": h_card,
+        "csi300": csi300_card,
     }
 
 
@@ -2739,6 +3502,19 @@ def get_fund_drill(
     """单一基金下钻明细：每只成分股的约当数量 + 昨日最新股价 + 估值指标。"""
     from services.drillable_funds import get_index_drill_detail
     return get_index_drill_detail(db, index_code, as_of_date)
+
+
+@app.get("/api/penetration/all-drilled-stocks")
+def get_all_drilled_stocks(
+    as_of_date: date = Query(...),
+    db: Session = Depends(get_db),
+):
+    """跨所有可下钻指数聚合成分股 (drill 算法同 index-drill, 同一股票求和).
+
+    全持仓页面用：直接持股 + 此处的成分股 → 拆分「下钻 / 未下钻」两段渲染。
+    """
+    from services.drillable_funds import get_all_drilled_stocks
+    return get_all_drilled_stocks(db, as_of_date)
 
 
 # ============================================================================

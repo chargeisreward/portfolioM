@@ -428,19 +428,19 @@ def start_scheduler():
         misfire_grace_time=60,
     )
 
-    # 任务2：财务基本面更新 — 每日7:00和19:00
+    # 任务2：财务基本面更新 — 每日 6:15 / 20:15（紧跟主批次 5min 后）
     scheduler.add_job(
         job_update_financial_fundamentals,
         "cron",
-        hour="7,19",
-        minute=0,
+        hour="6,20",
+        minute=15,
         id="financial_fundamentals",
         name="财务基本面更新",
         max_instances=1,
         misfire_grace_time=300,
     )
 
-    # 任务3：行业/爬虫数据更新 — 每日6:00和20:00
+    # 任务3：行业/爬虫数据更新 — 每日 6:00 / 20:00（主批次）
     scheduler.add_job(
         job_update_industry_crawler_data,
         "cron",
@@ -452,12 +452,12 @@ def start_scheduler():
         misfire_grace_time=300,
     )
 
-    # 任务4：90 天历史价完整性检查 — 每日凌晨 5:00
+    # 任务4：90 天历史价完整性检查 — 每日 6:05 / 20:05（跟着主批次做完整性检查）
     scheduler.add_job(
         job_backfill_gaps,
         "cron",
-        hour=5,
-        minute=0,
+        hour="6,20",
+        minute=5,
         id="backfill_gaps",
         name="历史价补缺",
         max_instances=1,
@@ -465,44 +465,43 @@ def start_scheduler():
         kwargs={"days": 90},
     )
 
-    # 任务5：全球快讯 — 每日 07:30 / 19:30 (a-stock-data skill §5.3)
+    # 任务5：全球快讯 — 每日 6:20 / 20:20 (a-stock-data skill §5.3)
     scheduler.add_job(
         job_crawl_global_news,
         "cron",
-        hour="7,19",
-        minute=30,
+        hour="6,20",
+        minute=20,
         id="info_global_news",
         name="全球快讯抓取",
         max_instances=1,
         misfire_grace_time=600,
     )
 
-    # 任务6：个股新闻 — 每日 18:00 (持仓成分股, skill §5.1)
+    # 任务6：个股新闻 — 每日 6:25 / 20:25 (持仓成分股, skill §5.1)
     scheduler.add_job(
         job_crawl_stock_news,
         "cron",
-        hour=18,
-        minute=0,
+        hour="6,20",
+        minute=25,
         id="info_stock_news",
         name="个股新闻抓取",
         max_instances=1,
         misfire_grace_time=900,
     )
 
-    # 任务7：公告 + 研报 — 每 3 日 21:00 (skill §2.1 + §7.1)
+    # 任务7：公告 + 研报 — 每日 6:35 / 20:35（每天，不再 */3）(skill §2.1 + §7.1)
     scheduler.add_job(
         job_crawl_announcements_and_research,
         "cron",
-        hour=21,
-        minute=0,
-        day="*/3",
+        hour="6,20",
+        minute=35,
         id="info_announcements_research",
         name="公告+研报抓取",
         max_instances=1,
         misfire_grace_time=1800,
     )
 
-    # 任务8：同花顺热点 — 交易日 15:35 (skill §3.1)
+    # 任务8：同花顺热点 — 交易日 15:35 (skill §3.1, 用户确认保留盘中后抓取)
     scheduler.add_job(
         job_crawl_hot_stocks,
         "cron",
@@ -510,6 +509,18 @@ def start_scheduler():
         minute=35,
         id="info_hot_stocks",
         name="同花顺热点抓取",
+        max_instances=1,
+        misfire_grace_time=600,
+    )
+
+    # 任务8b：同花顺热点兜底 — 交易日 6:10 (dedup signal_date==today 防止重复)
+    scheduler.add_job(
+        job_crawl_hot_stocks,
+        "cron",
+        hour=6,
+        minute=10,
+        id="info_hot_stocks_fallback",
+        name="同花顺热点兜底抓取",
         max_instances=1,
         misfire_grace_time=600,
     )

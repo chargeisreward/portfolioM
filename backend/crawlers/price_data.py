@@ -8,7 +8,6 @@
 """
 import re
 import json
-import requests
 import urllib3
 urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
 import yfinance as yf
@@ -16,6 +15,7 @@ from datetime import date, datetime
 from typing import Optional
 
 from config import TENCENT_USER_AGENT, TENCENT_QUOTE_URL, TENCENT_KLINE_URL
+from crawlers._http import tencent_get
 
 
 # ---------- 腾讯财经 API（实时行情，首选） ----------
@@ -44,7 +44,7 @@ def fetch_tencent_quote(ticker: str) -> dict | None:
     url = TENCENT_QUOTE_URL.format(tencent_code)
 
     try:
-        resp = requests.get(url, headers=headers, timeout=(3, 5), verify=False)
+        resp = tencent_get(url, headers=headers, timeout=(3, 5))
         resp.encoding = "gbk"
         text = resp.text
 
@@ -145,7 +145,7 @@ def fetch_tencent_kline(ticker: str, days: int = 365) -> list[dict]:
     headers = {"User-Agent": TENCENT_USER_AGENT}
 
     try:
-        resp = requests.get(TENCENT_KLINE_URL, params=params, headers=headers, timeout=5, verify=False)
+        resp = tencent_get(TENCENT_KLINE_URL, params=params, headers=headers, timeout=5)
         data = resp.json()
 
         for key, payload in data.get("data", {}).items():
@@ -275,7 +275,7 @@ def get_stock_info(ticker: str, timeout_sec: int = 3) -> dict:
         headers = {"User-Agent": TENCENT_USER_AGENT}
         url = TENCENT_QUOTE_URL.format(tencent_code)
         try:
-            resp = requests.get(url, headers=headers, timeout=timeout_sec, verify=False)
+            resp = tencent_get(url, headers=headers, timeout=timeout_sec)
             resp.encoding = "gbk"
             text = resp.text
             match = __import__("re").search(r'"(.*?)"', text)
@@ -317,10 +317,29 @@ def get_stock_info(ticker: str, timeout_sec: int = 3) -> dict:
     return {"code": ticker, "source": "none", "error": "No data available"}
 
 
-def fetch_price_history(ticker: str, days: int = 365) -> list[dict]:
+def fetch_price_history(ticker: str, days: int = 365, *, force: bool = False) -> list[dict]:
     """
     获取历史价格序列。
+
+    force: True 跳过 dedup 守门（手动强制重拉）
+    dedup: 如果 PriceCache 已有 ticker 的最新交易日记录，则跳过（避免重复拉 365 天 K 线）。
+           注意：交易日历精确比对留给 backfill_gaps job 做完整性检查。
     """
+    if not force:
+        from models import PriceCache
+        from database import SessionLocal
+        from datetime import date as _date
+        from sqlalchemy import func as _func
+        db = SessionLocal()
+        try:
+            latest = db.query(_func.max(PriceCache.trade_date)).filter(
+                PriceCache.stock_code == ticker
+            ).scalar()
+            if latest is not None and latest >= _date.today():
+                return []
+        finally:
+            db.close()
+
     return fetch_tencent_kline(ticker, days)
 
 

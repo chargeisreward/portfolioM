@@ -92,6 +92,7 @@ def restore(dump_path: Path, conn_str: str, verbose: bool = True):
     segments = parse_dump(text)
     print(f"[parse] {len(segments)} segments in {time.time() - t0:.1f}s")
 
+
     stats = {"copy_blocks": 0, "copy_rows": 0, "sql_stmts": 0, "meta_skipped": 0}
 
     t0 = time.time()
@@ -130,6 +131,11 @@ def restore(dump_path: Path, conn_str: str, verbose: bool = True):
 
             if kind == "copy":
                 copy_stmt, rows_text = payload
+                # 表名 (无 schema 前缀的纯表名)
+                tbl = copy_stmt.split()[1].split("(")[0].strip('"').split(".")[-1]
+                # 列名 (从 "col1", "col2" 里取第一个)
+                cols_part = copy_stmt.split("(", 1)[1].rsplit(")", 1)[0]
+                col_names = [c.strip().strip('"') for c in cols_part.split(",")]
                 with conn.cursor() as cur:
                     with cur.copy(copy_stmt) as copy:
                         # rows_text tab-separated. \\N 表示 NULL.
@@ -143,12 +149,22 @@ def restore(dump_path: Path, conn_str: str, verbose: bool = True):
                             cells = [None if c == r"\N" else c for c in cells]
                             copy.write_row(cells)
                             n_rows += 1
+                    # COPY 不会自动更新 sequence — 写完后手动 setval(seq, true)
+                    # 否则下次 INSERT 默认值会撞 PK
+                    if "id" in col_names:
+                        try:
+                            cur.execute(
+                                f'SELECT setval(pg_get_serial_sequence(%s, %s), '
+                                f'COALESCE((SELECT MAX(id) FROM "{tbl}"), 1), true)',
+                                (f'"{tbl}"', "id"),
+                            )
+                        except Exception:
+                            pass  # 非 serial 列就跳过
                 # 每个 COPY block 自己的事务 commit (失败时只丢自己)
                 conn.commit()
                 stats["copy_blocks"] += 1
                 stats["copy_rows"] += n_rows
                 if verbose:
-                    tbl = copy_stmt.split()[1].split("(")[0]
                     print(f"  [COPY] {tbl} ~{n_rows} rows "
                           f"(total {stats['copy_rows']}, {time.time() - t0:.1f}s)")
                 continue

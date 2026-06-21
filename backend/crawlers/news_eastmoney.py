@@ -18,6 +18,9 @@ from typing import Any
 
 from crawlers._http import em_get
 from config import EM_GLOBAL_NEWS_URL, EM_STOCK_NEWS_URL
+from models import GlobalFlashNews, StockNews
+from database import SessionLocal
+from services.dedup import already_updated_today
 
 logger = logging.getLogger(__name__)
 
@@ -55,11 +58,22 @@ def _parse_eastmoney_time(s: Any) -> datetime:
 
 # ---------- 7x24 全球快讯 (skill §5.3) ----------
 
-def fetch_global_flash_news(page_size: int = 50) -> list[dict]:
+def fetch_global_flash_news(page_size: int = 50, *, force: bool = False) -> list[dict]:
     """东财全球财经资讯 7x24 滚动.
 
+    force: True 跳过 dedup 守门（手动强制重拉）
     返回: [{title, summary, source, url, published_at: datetime}, ...]
     """
+    # dedup: 今天已抓过快讯则跳过
+    if not force:
+        db = SessionLocal()
+        try:
+            if already_updated_today(db, GlobalFlashNews, "fetched_at"):
+                logger.info("全球快讯今日已抓，跳过")
+                return []
+        finally:
+            db.close()
+
     params = {
         "client": "web",
         "biz": "web_724",
@@ -97,12 +111,26 @@ def fetch_global_flash_news(page_size: int = 50) -> list[dict]:
 
 # ---------- 个股新闻 (skill §5.1) ----------
 
-def fetch_stock_news(code: str, page_size: int = 20) -> list[dict]:
+def fetch_stock_news(code: str, page_size: int = 20, *, force: bool = False) -> list[dict]:
     """个股相关新闻 (JSONP 接口).
 
+    force: True 跳过 dedup 守门（手动强制重拉）
     注意: 东财实际返回里 result.cmsArticleWebOld 直接就是文章列表 (V3.2.1 修复).
     失败时返回 [].
     """
+    # dedup: 今天已抓到该股新闻则跳过
+    if not force:
+        db = SessionLocal()
+        try:
+            if already_updated_today(
+                db, StockNews, "fetched_at",
+                filter_col="stock_code", filter_val=code,
+            ):
+                logger.info("股票 %s 今日新闻已抓，跳过", code)
+                return []
+        finally:
+            db.close()
+
     cb = "jQuery_news"
     inner_params = json.dumps({
         "uid": "",

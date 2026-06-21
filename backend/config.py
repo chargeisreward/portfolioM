@@ -69,6 +69,10 @@ EM_DATACENTER_URL = "https://datacenter-web.eastmoney.com/api/data/v1/get"
 # 限流节流 (skill "数据源优先级 & 东财防封")
 # 东财有风控：≥1s 间隔 + 随机抖动；批量筛选可调到 1.5-2s
 EM_MIN_INTERVAL = 1.0
+# 腾讯不封 IP 但也别太快：~3 req/s 安全
+TENCENT_MIN_INTERVAL = 0.3
+# 同花顺零鉴权但别太快：~2 req/s 安全
+THS_MIN_INTERVAL = 0.5
 
 # 资讯数据本地缓存
 DATA_DIR_INFO = DATA_DIR / "info_cache"

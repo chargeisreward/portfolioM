@@ -15,14 +15,18 @@ from typing import Any
 
 from config import THS_HOT_URL, THS_USER_AGENT
 from crawlers._http import ths_get
+from models import HotStockSignal
+from database import SessionLocal
+from services.dedup import already_persisted_today
 
 logger = logging.getLogger(__name__)
 
 
-def fetch_hot_stocks(date_: str | date | None = None) -> list[dict]:
+def fetch_hot_stocks(date_: str | date | None = None, *, force: bool = False) -> list[dict]:
     """同花顺当日强势股 + 题材归因.
 
     date_: 'YYYY-MM-DD' 格式, None=今天
+    force: True 跳过 dedup 守门（手动强制重拉）
     返回: [{stock_code, stock_name, close, change_pct, turnover_pct,
             amount, dde_net, market, reason_tags, rank}, ...]
     失败/节假日返回 [].
@@ -34,9 +38,19 @@ def fetch_hot_stocks(date_: str | date | None = None) -> list[dict]:
     else:
         date_str = str(date_)
 
+    # dedup: 今天已抓过则跳过
+    if not force:
+        db = SessionLocal()
+        try:
+            if already_persisted_today(db, HotStockSignal, "signal_date"):
+                logger.info("热点 %s 已抓，跳过", date_str)
+                return []
+        finally:
+            db.close()
+
     url = THS_HOT_URL.format(date=date_str)
     headers = {"User-Agent": THS_USER_AGENT}
-    resp = ths_get(url, headers=headers, timeout=10) if False else _raw_ths_get(url, headers)
+    resp = ths_get(url, headers=headers, timeout=10)
     if resp is None or resp.status_code != 200:
         logger.warning("同花顺热点请求失败 date=%s status=%s",
                        date_str, resp.status_code if resp else "None")
@@ -66,16 +80,6 @@ def fetch_hot_stocks(date_: str | date | None = None) -> list[dict]:
             "rank": i,
         })
     return rows
-
-
-def _raw_ths_get(url: str, headers: dict):
-    """ths_get() 走 ths_client (同花顺专用). 单独函数便于单测. 显式 import 避免循环."""
-    from crawlers._http import _get_ths_client
-    try:
-        return _get_ths_client().get(url, headers=headers, timeout=10.0)
-    except Exception as e:
-        logger.warning("同花顺请求失败: %s", e)
-        return None
 
 
 def _safe_float(v: Any) -> float | None:

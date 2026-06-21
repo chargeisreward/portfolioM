@@ -10,13 +10,15 @@ import logging
 from datetime import datetime
 from typing import Optional
 
-import httpx
-
 from config import (
     CNINFO_ORGID_URL,
     CNINFO_QUERY_URL,
     EASTMONTH_USER_AGENT,
 )
+from crawlers._http import em_get, em_post
+from models import Announcement
+from database import SessionLocal
+from services.dedup import already_persisted_today
 
 logger = logging.getLogger(__name__)
 
@@ -30,7 +32,7 @@ def _load_orgid_map(force: bool = False) -> dict[str, str]:
     if _CNINFO_ORGID_MAP and not force:
         return _CNINFO_ORGID_MAP
     try:
-        r = httpx.get(
+        r = em_get(
             CNINFO_ORGID_URL,
             headers={"User-Agent": EASTMONTH_USER_AGENT},
             timeout=15.0,
@@ -71,13 +73,29 @@ def fetch_announcements(
     code: str,
     page_size: int = 30,
     se_date: str = "",
+    *,
+    force: bool = False,
 ) -> list[dict]:
     """拉取指定股票的公告列表.
 
     code: 6 位股票代码 (如 688017)
     se_date: 起始日期 "YYYY-MM-DD", 空串=不限
+    force: True 跳过 dedup 守门（手动强制重拉）
     返回: [{announcement_id, title, announcement_type, publish_date, url, org_id}, ...]
     """
+    # dedup: 今天已抓到该股公告则跳过
+    if not force:
+        db = SessionLocal()
+        try:
+            if already_persisted_today(
+                db, Announcement, "publish_date",
+                filter_col="stock_code", filter_val=code,
+            ):
+                logger.info("股票 %s 今日公告已抓，跳过", code)
+                return []
+        finally:
+            db.close()
+
     org_id = _orgid_for(code)
     payload = {
         "stock": f"{code},{org_id}",
@@ -101,7 +119,7 @@ def fetch_announcements(
         "Origin": "https://www.cninfo.com.cn",
     }
     try:
-        r = httpx.post(CNINFO_QUERY_URL, data=payload, headers=headers, timeout=15.0)
+        r = em_post(CNINFO_QUERY_URL, data=payload, headers=headers, timeout=15.0)
     except Exception as e:
         logger.warning("巨潮公告请求失败 code=%s: %s", code, e)
         return []

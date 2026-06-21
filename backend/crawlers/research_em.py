@@ -15,6 +15,9 @@ from pathlib import Path
 
 from config import DATA_DIR_PDF, EM_PDF_URL, EM_REPORT_API_URL
 from crawlers._http import em_get
+from models import ResearchReport
+from database import SessionLocal
+from services.dedup import already_updated_today
 
 logger = logging.getLogger(__name__)
 
@@ -26,12 +29,26 @@ def _safe_filename(s: str, max_len: int = 80) -> str:
     return s[:max_len] if len(s) > max_len else s
 
 
-def fetch_reports(code: str, max_pages: int = 3) -> list[dict]:
+def fetch_reports(code: str, max_pages: int = 3, *, force: bool = False) -> list[dict]:
     """拉取指定股票的研报列表 (含 PDF infoCode, 评级, 预测 EPS).
 
+    force: True 跳过 dedup 守门（手动强制重拉）
     返回: [{info_code, title, org_name, publish_date, rating,
              predict_eps_current, predict_eps_next, industry}, ...]
     """
+    # dedup: 今天已有该股研报则跳过
+    if not force:
+        db = SessionLocal()
+        try:
+            if already_updated_today(
+                db, ResearchReport, "fetched_at",
+                filter_col="stock_code", filter_val=code,
+            ):
+                logger.info("股票 %s 今日研报已抓，跳过", code)
+                return []
+        finally:
+            db.close()
+
     all_rows: list[dict] = []
     for page in range(1, max_pages + 1):
         params = {

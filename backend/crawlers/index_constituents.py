@@ -2,28 +2,46 @@
 
 从中证指数公司网站爬取指数成分股列表及权重。
 """
-import httpx
 from datetime import date
 from lxml import etree
 from sqlalchemy.orm import Session
 
 from models import IndexConstituent
 from config import TENCENT_USER_AGENT, CSI_CONSTITUENTS_URL
+from crawlers._http import em_get
+from services.dedup import already_persisted_today
 
 
-def crawl_constituents(index_code: str, db: Session, as_of: date | None = None) -> list[dict]:
+def crawl_constituents(
+    index_code: str,
+    db: Session,
+    as_of: date | None = None,
+    *,
+    force: bool = False,
+) -> list[dict]:
     """
     爬取指定指数的成分股列表。
     返回 [{stock_code, stock_name, weight, market_cap}, ...]
+
+    force: True 跳过 dedup 守门（手动强制重拉）
     """
     if as_of is None:
         as_of = date.today()
+
+    # dedup: 该指数今天已抓过则跳过
+    if not force and already_persisted_today(
+        db, IndexConstituent, "as_of_date",
+        filter_col="index_code", filter_val=index_code,
+    ):
+        from logging import getLogger
+        getLogger(__name__).info("指数 %s 今日已抓，跳过", index_code)
+        return []
 
     headers = {"User-Agent": TENCENT_USER_AGENT}
     url = CSI_CONSTITUENTS_URL.format(index_code)
 
     try:
-        resp = httpx.get(url, headers=headers, timeout=30)
+        resp = em_get(url, headers=headers, timeout=30)
         resp.encoding = "utf-8"
         data = resp.json()
     except Exception:
@@ -59,7 +77,7 @@ def _crawl_from_html(index_code: str, db: Session, as_of: date) -> list[dict]:
     headers = {"User-Agent": TENCENT_USER_AGENT}
     url = CSI_INDEX_URL.format(index_code)
 
-    resp = httpx.get(url, headers=headers, timeout=30)
+    resp = em_get(url, headers=headers, timeout=30)
     html = etree.HTML(resp.content)
 
     constituents = []

@@ -71,17 +71,28 @@ def _load_fund_navs(db: Session, fund_codes: list[str]) -> dict[str, dict]:
         "nav_618": float|None,    # 单位净值 6/18 (sanity check)
         "cumnav_618": float|None, # 累计净值 6/18 (用于算期间变化)
     }}.
+
+    批量查询: 原来每个 fund 2 次 query, 现在一次性 IN 查询。
     """
-    out: dict[str, dict] = {}
-    for fc in fund_codes:
-        nav529 = db.query(FundDailyNav).filter_by(fund_code=fc, trade_date=AS_OF_DATE).first()
-        nav618 = db.query(FundDailyNav).filter_by(fund_code=fc, trade_date=AS_OF_DATE_T1).first()
-        out[fc] = {
-            "nav_529": nav529.nav if nav529 else None,
-            "cumnav_529": nav529.accumulated_nav if nav529 else None,
-            "nav_618": nav618.nav if nav618 else None,
-            "cumnav_618": nav618.accumulated_nav if nav618 else None,
-        }
+    out: dict[str, dict] = {fc: {"nav_529": None, "cumnav_529": None, "nav_618": None, "cumnav_618": None} for fc in fund_codes}
+    if not fund_codes:
+        return out
+    rows = (
+        db.query(FundDailyNav)
+        .filter(
+            FundDailyNav.fund_code.in_(fund_codes),
+            FundDailyNav.trade_date.in_([AS_OF_DATE, AS_OF_DATE_T1]),
+        )
+        .all()
+    )
+    for r in rows:
+        fc = r.fund_code
+        if r.trade_date == AS_OF_DATE:
+            out[fc]["nav_529"] = r.nav
+            out[fc]["cumnav_529"] = r.accumulated_nav
+        elif r.trade_date == AS_OF_DATE_T1:
+            out[fc]["nav_618"] = r.nav
+            out[fc]["cumnav_618"] = r.accumulated_nav
     return out
 
 
@@ -279,8 +290,20 @@ def list_drillable_indices(db: Session, as_of_date: _date) -> list[dict]:
     return cards
 
 
-def get_index_drill_detail(db: Session, index_code: str, as_of_date: _date) -> dict:
-    """Drill-down detail using precise formula per stock."""
+def get_index_drill_detail(
+    db: Session,
+    index_code: str,
+    as_of_date: _date,
+    *,
+    holdings_agg: dict[str, dict] | None = None,
+    fund_navs: dict[str, dict] | None = None,
+    a_snap: dict[str, AShareFinancialSnapshot] | None = None,
+    h_snap: dict[str, HKShareFinancialSnapshot] | None = None,
+) -> dict:
+    """Drill-down detail using precise formula per stock.
+
+    支持传入预加载的 holdings_agg / fund_navs / snapshots，避免重复查库。
+    """
     idx_code = index_code.split(".")[0]
     fund_maps = db.query(FundIndexMap).filter(
         FundIndexMap.index_code.startswith(idx_code),
@@ -289,13 +312,17 @@ def get_index_drill_detail(db: Session, index_code: str, as_of_date: _date) -> d
     if not fund_maps:
         return {"error": "no funds tracking this index"}
     fund_codes = [f.fund_code for f in fund_maps]
-    holdings_agg = _aggregate_holdings_by_fund(db)
-    fund_navs = _load_fund_navs(db, fund_codes)
 
-    a_snap = {a.stock_code.split(".")[0]: a for a in
-              db.query(AShareFinancialSnapshot).filter_by(as_of_date=as_of_date).all()}
-    h_snap = {h.stock_code.split(".")[0]: h for h in
-              db.query(HKShareFinancialSnapshot).filter_by(as_of_date=as_of_date).all()}
+    if holdings_agg is None:
+        holdings_agg = _aggregate_holdings_by_fund(db)
+    if fund_navs is None:
+        fund_navs = _load_fund_navs(db, fund_codes)
+    if a_snap is None:
+        a_snap = {a.stock_code.split(".")[0]: a for a in
+                  db.query(AShareFinancialSnapshot).filter_by(as_of_date=as_of_date).all()}
+    if h_snap is None:
+        h_snap = {h.stock_code.split(".")[0]: h for h in
+                  db.query(HKShareFinancialSnapshot).filter_by(as_of_date=as_of_date).all()}
 
     constituents = db.query(IndexConstituentSnapshot).filter(
         IndexConstituentSnapshot.as_of_date == as_of_date,
@@ -311,7 +338,6 @@ def get_index_drill_detail(db: Session, index_code: str, as_of_date: _date) -> d
     by_stock: dict[str, dict] = {}
     for s in constituents:
         code = s.stock_code
-        code_norm = code.split(".")[0]
         snap = _resolve_snap_for_code(db, code, as_of_date, a_snap, h_snap)
         weight_pct = eq_w_pct
         if has_weight_col:
@@ -371,4 +397,87 @@ def get_index_drill_detail(db: Session, index_code: str, as_of_date: _date) -> d
         "total_fund_shares": round(total_fund_shares, 4),
         "total_fund_value_prev": round(total_fund_value, 4),
         "constituents": rows,
+    }
+
+
+def get_all_drilled_stocks(
+    db: Session,
+    as_of_date: _date,
+    *,
+    indices: list[dict] | None = None,
+    holdings_agg: dict[str, dict] | None = None,
+    fund_navs: dict[str, dict] | None = None,
+    a_snap: dict | None = None,
+    h_snap: dict | None = None,
+) -> dict:
+    """跨所有可下钻指数聚合成分股 (drill 算法 = 与 get_index_drill_detail 一致).
+
+    支持传入预加载的 indices / holdings_agg / fund_navs / snapshots，避免重复查库。
+
+    Returns: {
+      "as_of_date": ...,
+      "stocks": [{stock_code, stock_name, shares_equivalent, current_price,
+                  baseline_price, current_price_date, est_market_value_cny,
+                  pe_ttm, pb_mrq, ps_ttm, dividend_yield, indices}, ...],
+      "count": N
+    }
+
+    同一股票若同时被多只基金 (跨多个指数) 持有, shares_equivalent 与
+    est_market_value_cny 求和; 价格 / 估值指标取首个非空值.
+    """
+    if indices is None:
+        indices = list_drillable_indices(db, as_of_date)
+    if not indices:
+        return {"as_of_date": as_of_date.isoformat(), "stocks": [], "count": 0}
+
+    by_stock: dict[str, dict] = {}
+    for idx in indices:
+        detail = get_index_drill_detail(
+            db, idx["index_code"], as_of_date,
+            holdings_agg=holdings_agg,
+            fund_navs=fund_navs,
+            a_snap=a_snap,
+            h_snap=h_snap,
+        )
+        if "constituents" not in detail:
+            continue
+        idx_code = idx["index_code"]
+        for c in detail["constituents"]:
+            code = c["stock_code"]
+            if code not in by_stock:
+                by_stock[code] = {
+                    "stock_code": code,
+                    "stock_name": c.get("stock_name"),
+                    "shares_equivalent": 0,
+                    "current_price": c.get("current_price"),
+                    "baseline_price": c.get("baseline_price"),
+                    "current_price_date": c.get("current_price_date"),
+                    "est_market_value_cny": 0.0,
+                    "pe_ttm": c.get("pe_ttm"),
+                    "pb_mrq": c.get("pb_mrq"),
+                    "ps_ttm": c.get("ps_ttm"),
+                    "dividend_yield": c.get("dividend_yield"),
+                    "indices": set(),
+                }
+            acc = by_stock[code]
+            acc["shares_equivalent"] += (c.get("shares_equivalent") or 0)
+            acc["est_market_value_cny"] += (c.get("est_market_value_cny") or 0)
+            acc["indices"].add(idx_code)
+            # 价格/估值字段: 取首个非空值
+            for k in ("current_price", "baseline_price", "current_price_date",
+                      "pe_ttm", "pb_mrq", "ps_ttm", "dividend_yield"):
+                if acc.get(k) is None and c.get(k) is not None:
+                    acc[k] = c.get(k)
+
+    stocks = []
+    for s in by_stock.values():
+        s["indices"] = sorted(s["indices"])
+        s["est_market_value_cny"] = round(s["est_market_value_cny"], 4)
+        stocks.append(s)
+    stocks.sort(key=lambda r: r["est_market_value_cny"], reverse=True)
+
+    return {
+        "as_of_date": as_of_date.isoformat(),
+        "stocks": stocks,
+        "count": len(stocks),
     }

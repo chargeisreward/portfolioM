@@ -3,10 +3,11 @@
 从天天基金网获取基金详情，自动识别每只基金跟踪的指数代码和名称。
 """
 import re
-import httpx
 from sqlalchemy.orm import Session
 from models import Fund
 from config import TENCENT_USER_AGENT
+from crawlers._http import em_get
+from services.dedup import already_updated_today
 
 
 # Known fund → index mapping (hardcoded lookups for common cases)
@@ -35,11 +36,19 @@ KNOWN_INDEX_MAP: dict[str, tuple[str, str]] = {
 }
 
 
-def crawl_fund_index_map(db: Session) -> int:
+def crawl_fund_index_map(db: Session, *, force: bool = False) -> int:
     """
     遍历数据库中所有基金，尝试获取跟踪指数信息。
     先用内置已知映射，缺失的尝试从天基金网爬取。
+
+    force: True 跳过 dedup 守门（手动强制重拉）
     """
+    # dedup: 任何基金今天已更新过即跳过
+    if not force and already_updated_today(db, Fund, "updated_at"):
+        from logging import getLogger
+        getLogger(__name__).info("ETF映射今日已更新，跳过")
+        return 0
+
     from models import Holding, AssetType
     funds = db.query(Holding).filter(
         Holding.asset_type.in_([
@@ -91,7 +100,7 @@ def _crawl_from_eastmoney(fund_code: str) -> tuple[str | None, str | None]:
     """Crawl fund detail page from eastmoney to find tracking index"""
     headers = {"User-Agent": TENCENT_USER_AGENT}
     url = f"https://fund.eastmoney.com/{fund_code}.html"
-    resp = httpx.get(url, headers=headers, timeout=15)
+    resp = em_get(url, headers=headers, timeout=15)
     resp.encoding = "utf-8"
 
     # Try to find the tracking index info in the page

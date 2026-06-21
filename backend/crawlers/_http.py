@@ -20,7 +20,9 @@ import httpx
 from config import (
     EASTMONTH_USER_AGENT,
     EM_MIN_INTERVAL,
+    TENCENT_MIN_INTERVAL,
     TENCENT_USER_AGENT,
+    THS_MIN_INTERVAL,
     THS_USER_AGENT,
 )
 
@@ -100,6 +102,7 @@ def em_get(
 
 _tencent_client: httpx.Client | None = None
 _tencent_lock = threading.Lock()
+_tencent_last_call: float = 0.0
 
 
 def _get_tencent_client() -> httpx.Client:
@@ -115,20 +118,55 @@ def _get_tencent_client() -> httpx.Client:
     return _tencent_client
 
 
-def tencent_get(url: str, params: dict | None = None, timeout: float = 10.0) -> httpx.Response | None:
-    """腾讯财经 GET，GBK 解码在调用方按需处理。"""
-    try:
-        r = _get_tencent_client().get(url, params=params, timeout=timeout)
-        return r
-    except Exception as e:
-        logger.warning("腾讯请求失败 url=%s err=%s", url[:80], e)
-        return None
+def tencent_get(
+    url: str,
+    params: dict | None = None,
+    headers: dict | None = None,
+    timeout: float = 10.0,
+    max_retries: int = 2,
+) -> httpx.Response | None:
+    """腾讯财经 GET：节流 + 失败重试（403/429 + 连接错误），其他业务错误直返。
+
+    腾讯不封 IP，但批量拉 K 线/分时仍需控制并发节奏（≈3 req/s）。
+    """
+    global _tencent_last_call
+    client = _get_tencent_client()
+    last_exc: Exception | None = None
+    for attempt in range(max_retries + 1):
+        wait = TENCENT_MIN_INTERVAL - (time.time() - _tencent_last_call)
+        if wait > 0:
+            time.sleep(wait + random.uniform(0.1, 0.5))
+        try:
+            resp = client.get(url, params=params, headers=headers, timeout=timeout)
+            _tencent_last_call = time.time()
+            if resp.status_code == 200:
+                return resp
+            if resp.status_code in (403, 429):
+                logger.warning("腾讯被限流 HTTP %s url=%s", resp.status_code, url[:80])
+                if attempt < max_retries:
+                    time.sleep(2 + random.uniform(0, 1))
+                    continue
+            return resp
+        except (httpx.ConnectError, httpx.ReadTimeout, httpx.ConnectTimeout) as e:
+            last_exc = e
+            logger.warning("腾讯连接异常 (attempt %d/%d): %s", attempt + 1, max_retries + 1, e)
+            if attempt < max_retries:
+                time.sleep(1 + random.uniform(0, 1))
+                continue
+            return None
+        except Exception as e:
+            last_exc = e
+            logger.error("腾讯请求未知异常: %s", e)
+            break
+    logger.error("tencent_get 全部重试失败 url=%s err=%s", url[:80], last_exc)
+    return None
 
 
 # ---------- 同花顺专用入口 (零鉴权, 部分接口需 GBK 解码) ----------
 
 _ths_client: httpx.Client | None = None
 _ths_lock = threading.Lock()
+_ths_last_call: float = 0.0
 
 
 def _get_ths_client() -> httpx.Client:
@@ -143,13 +181,96 @@ def _get_ths_client() -> httpx.Client:
     return _ths_client
 
 
-def ths_get(url: str, params: dict | None = None, timeout: float = 10.0) -> httpx.Response | None:
-    """同花顺 GET。"""
-    try:
-        return _get_ths_client().get(url, params=params, timeout=timeout)
-    except Exception as e:
-        logger.warning("同花顺请求失败 url=%s err=%s", url[:80], e)
-        return None
+def ths_get(
+    url: str,
+    params: dict | None = None,
+    headers: dict | None = None,
+    timeout: float = 10.0,
+    max_retries: int = 2,
+) -> httpx.Response | None:
+    """同花顺 GET：节流 + 失败重试（403/429 + 连接错误）。
+
+    同花顺零鉴权但有反爬节奏限制（≈2 req/s）。
+    """
+    global _ths_last_call
+    client = _get_ths_client()
+    last_exc: Exception | None = None
+    for attempt in range(max_retries + 1):
+        wait = THS_MIN_INTERVAL - (time.time() - _ths_last_call)
+        if wait > 0:
+            time.sleep(wait + random.uniform(0.1, 0.5))
+        try:
+            resp = client.get(url, params=params, headers=headers, timeout=timeout)
+            _ths_last_call = time.time()
+            if resp.status_code == 200:
+                return resp
+            if resp.status_code in (403, 429):
+                logger.warning("同花顺被限流 HTTP %s url=%s", resp.status_code, url[:80])
+                if attempt < max_retries:
+                    time.sleep(2 + random.uniform(0, 1))
+                    continue
+            return resp
+        except (httpx.ConnectError, httpx.ReadTimeout, httpx.ConnectTimeout) as e:
+            last_exc = e
+            logger.warning("同花顺连接异常 (attempt %d/%d): %s", attempt + 1, max_retries + 1, e)
+            if attempt < max_retries:
+                time.sleep(1 + random.uniform(0, 1))
+                continue
+            return None
+        except Exception as e:
+            last_exc = e
+            logger.error("同花顺请求未知异常: %s", e)
+            break
+    logger.error("ths_get 全部重试失败 url=%s err=%s", url[:80], last_exc)
+    return None
+
+
+# ---------- 东财 POST helper (公告查询等) ----------
+
+def em_post(
+    url: str,
+    params: dict | None = None,
+    data: dict | None = None,
+    headers: dict | None = None,
+    timeout: float = 15.0,
+    max_retries: int = 2,
+) -> httpx.Response | None:
+    """东财统一 POST 入口：复用 em_get 的节流 + 重试模式。
+
+    用于巨潮公告查询等需要 POST body 的接口。
+    失败重试：连接错误 + HTTP 403/429，其他业务错误直返。
+    """
+    global _em_last_call
+    client = _get_em_client()
+    last_exc: Exception | None = None
+    for attempt in range(max_retries + 1):
+        wait = EM_MIN_INTERVAL - (time.time() - _em_last_call)
+        if wait > 0:
+            time.sleep(wait + random.uniform(0.1, 0.5))
+        try:
+            resp = client.post(url, params=params, data=data, headers=headers, timeout=timeout)
+            _em_last_call = time.time()
+            if resp.status_code == 200:
+                return resp
+            if resp.status_code in (403, 429):
+                logger.warning("东财 POST 被限流 HTTP %s url=%s", resp.status_code, url[:80])
+                if attempt < max_retries:
+                    time.sleep(2 + random.uniform(0, 1))
+                    continue
+            return resp
+        except (httpx.ConnectError, httpx.ReadTimeout, httpx.ConnectTimeout) as e:
+            last_exc = e
+            logger.warning("东财 POST 连接异常 (attempt %d/%d): %s", attempt + 1, max_retries + 1, e)
+            if attempt < max_retries:
+                time.sleep(1 + random.uniform(0, 1))
+                continue
+            return None
+        except Exception as e:
+            last_exc = e
+            logger.error("东财 POST 未知异常: %s", e)
+            break
+    logger.error("em_post 全部重试失败 url=%s err=%s", url[:80], last_exc)
+    return None
 
 
 def shutdown_clients():

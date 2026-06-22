@@ -29,6 +29,7 @@ services:
         condition: service_healthy
     environment:
       DATABASE_URL: "postgresql+psycopg://portfoliom:${PG_PASSWORD:-portfoliom_prod}@pg:5432/portfoliom"
+      APP_PASSWORD: "${APP_PASSWORD:-EmmaYe}"
     ports:
       - "127.0.0.1:8010:8000"
     volumes:
@@ -37,7 +38,10 @@ services:
 
   # ─── Frontend (Vite build → Nginx serve) ───
   frontend:
-    build: ./frontend
+    build:
+      context: ./frontend
+      args:
+        VITE_BASE: "/portfoliom/"
     container_name: portfoliom-frontend
     restart: unless-stopped
     ports:

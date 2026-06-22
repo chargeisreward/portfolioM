@@ -4,7 +4,9 @@ WORKDIR /app
 COPY package.json package-lock.json* ./
 RUN npm ci --silent || npm install --silent
 COPY . .
-# 生产构建：API 请求走 /api → Nginx 反代到 backend:8000
+# VITE_BASE: production base path (default '/' for root, '/portfoliom/' for cloud)
+ARG VITE_BASE=/
+ENV VITE_BASE=$VITE_BASE
 RUN npm run build
 
 # ─── Serve stage ───

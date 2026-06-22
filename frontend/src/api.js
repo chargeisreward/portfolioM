@@ -1,10 +1,11 @@
 import axios from 'axios'
 
-// Dev: '' → '/api' (vite proxy handles it)
-// Prod: VITE_API_URL is the absolute backend URL
+// Dev: base='/' → '/api' (vite proxy handles it)
+// Prod: base='/portfoliom/' → '/portfoliom/api' (system nginx proxies to backend)
+// Override: VITE_API_URL for absolute backend URL
 const baseURL = import.meta.env.VITE_API_URL
   ? `${import.meta.env.VITE_API_URL.replace(/\/$/, '')}/api`
-  : '/api'
+  : `${import.meta.env.BASE_URL.replace(/\/$/, '')}/api`
 
 const api = axios.create({ baseURL, timeout: 30000 })
 

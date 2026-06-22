@@ -9,6 +9,9 @@ __pycache__/
 venv/
 env/
 
+# Trae IDE
+.trae/
+
 # Node
 node_modules/
 dist/

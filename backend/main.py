@@ -1477,28 +1477,72 @@ def trigger_job(job_id: str, force: bool = False, background: bool = False):
 
 # ==================== 数据浏览 ====================
 
-# 数据表注册：分类 → 表列表
+# 数据表注册：分类 → 表列表（覆盖全部 34 张表，含 date_field 和 desc）
 DATA_TABLES = {
-    "持仓": [
-        {"table": "holdings", "label": "持仓", "model": "Holding", "pk": "id"},
-        {"table": "security_master", "label": "证券基础", "model": "SecurityMaster", "pk": "security_code"},
-        {"table": "security_type_config", "label": "证券类型配置", "model": "SecurityTypeConfig", "pk": "asset_type"},
+    "持仓主数据": [
+        {"table": "security_master", "label": "证券基础", "model": "SecurityMaster", "pk": "security_code", "date_field": "updated_at", "desc": "证券基础信息（原币种、类型等）"},
+        {"table": "security_type_config", "label": "类型配置", "model": "SecurityTypeConfig", "pk": "asset_type", "date_field": "updated_at", "desc": "证券类型主数据（净值显示位数等）"},
+        {"table": "holdings", "label": "持仓", "model": "Holding", "pk": "id", "date_field": "created_at", "desc": "组合持仓明细"},
+        {"table": "watchlist", "label": "自选股", "model": "Watchlist", "pk": "code", "date_field": "added_at", "desc": "自选股清单"},
     ],
-    "行情": [
-        {"table": "price_cache", "label": "价格缓存", "model": "PriceCache"},
-        {"table": "stock_info_cache", "label": "行情信息缓存", "model": "StockInfoCache"},
-        {"table": "exchange_rates", "label": "汇率", "model": "ExchangeRate"},
+    "行情数据": [
+        {"table": "price_cache", "label": "价格缓存", "model": "PriceCache", "date_field": "trade_date", "desc": "日频复权价格（开高低收量）"},
+        {"table": "stock_info_cache", "label": "行情缓存", "model": "StockInfoCache", "pk": "stock_code", "date_field": "updated_at", "desc": "行情/财务 JSON 缓存"},
+        {"table": "exchange_rates", "label": "汇率", "model": "ExchangeRate", "date_field": "rate_date", "desc": "PBoC 中间价汇率"},
+        {"table": "fund_daily_nav", "label": "基金净值", "model": "FundDailyNav", "date_field": "trade_date", "desc": "基金每日净值/累计净值"},
     ],
-    "分析": [
-        {"table": "penetration_results", "label": "穿透结果", "model": "PenetrationResult"},
-        {"table": "stock_financials", "label": "个股财务", "model": "StockFinancial"},
-        {"table": "csi300_baselines", "label": "沪深300基准", "model": "Csi300Baseline"},
+    "财务快照": [
+        {"table": "stock_financials", "label": "个股财务", "model": "StockFinancial", "date_field": "as_of_date", "desc": "个股财务指标（PE/增长/市值）"},
+        {"table": "a_share_financial_snapshot", "label": "A股估值快照", "model": "AShareFinancialSnapshot", "date_field": "as_of_date", "desc": "A股估值+7套行业体系快照"},
+        {"table": "hk_share_financial_snapshot", "label": "港股估值快照", "model": "HKShareFinancialSnapshot", "date_field": "as_of_date", "desc": "港股估值+行业体系快照"},
     ],
-    "基础": [
-        {"table": "funds", "label": "基金", "model": "Fund"},
-        {"table": "index_constituents", "label": "指数成分股", "model": "IndexConstituent"},
+    "穿透分析": [
+        {"table": "penetration_results", "label": "穿透结果", "model": "PenetrationResult", "date_field": "calculated_at", "desc": "底层股票穿透表"},
+        {"table": "penetration_snapshot", "label": "基金下钻", "model": "PenetrationSnapshot", "date_field": "as_of_date", "desc": "基金下钻结果快照"},
+        {"table": "full_holding_snapshot", "label": "全持仓快照", "model": "FullHoldingSnapshot", "date_field": "as_of_date", "desc": "全持仓快照（含行业体系）"},
+        {"table": "aggregation_cache", "label": "聚合缓存", "model": "AggregationCache", "date_field": "updated_at", "desc": "组合/CSI300 聚合结果"},
+        {"table": "aggregation_timeseries", "label": "估值时序", "model": "AggregationTimeseries", "date_field": "calc_date", "desc": "估值日时序数据"},
+        {"table": "csi300_baselines", "label": "沪深300基准", "model": "Csi300Baseline", "date_field": "as_of_date", "desc": "沪深300分析基准"},
+        {"table": "csi300_constituent_snapshot", "label": "沪深300成分", "model": "Csi300ConstituentSnapshot", "date_field": "as_of_date", "desc": "沪深300成分股快照"},
+    ],
+    "指数基金": [
+        {"table": "funds", "label": "基金", "model": "Fund", "pk": "code", "date_field": "updated_at", "desc": "基金/ETF 基础信息"},
+        {"table": "fund_index_map", "label": "基金→指数", "model": "FundIndexMap", "date_field": "as_of_date", "desc": "基金→指数追踪关系"},
+        {"table": "index_constituents", "label": "指数成分股", "model": "IndexConstituent", "date_field": "as_of_date", "desc": "指数成分股+权重"},
+        {"table": "index_constituent_snapshot", "label": "成分股快照", "model": "IndexConstituentSnapshot", "date_field": "as_of_date", "desc": "指数成分股快照"},
+    ],
+    "新闻研报": [
+        {"table": "global_flash_news", "label": "全球快讯", "model": "GlobalFlashNews", "date_field": "published_at", "desc": "东财7×24全球快讯"},
+        {"table": "stock_news", "label": "个股新闻", "model": "StockNews", "date_field": "published_at", "desc": "个股新闻"},
+        {"table": "announcements", "label": "公告", "model": "Announcement", "date_field": "publish_date", "desc": "巨潮公告"},
+        {"table": "research_reports", "label": "研报", "model": "ResearchReport", "date_field": "publish_date", "desc": "东财研报"},
+        {"table": "hot_stock_signals", "label": "强势股", "model": "HotStockSignal", "date_field": "signal_date", "desc": "同花顺强势股信号"},
+    ],
+    "分析师报告": [
+        {"table": "analyst_company_report", "label": "公司研究", "model": "AnalystCompanyReport", "date_field": "updated_at", "desc": "公司研究6段式报告"},
+        {"table": "analyst_industry_chain", "label": "产业链总结", "model": "AnalystIndustryChain", "date_field": "updated_at", "desc": "产业链总结报告"},
+        {"table": "analyst_industry_chain_company", "label": "产业链公司", "model": "AnalystIndustryChainCompany", "date_field": "updated_at", "desc": "产业链公司清单"},
+    ],
+    "基础配置": [
+        {"table": "trading_calendar", "label": "交易日历", "model": "TradingCalendar", "date_field": "date", "desc": "CN/HK/US/OF 交易日历"},
+        {"table": "api_code_map", "label": "API代码映射", "model": "ApiCodeMap", "date_field": "updated_at", "desc": "标准代码→各API调用代码"},
+    ],
+    "系统表": [
+        {"table": "access_attempts", "label": "登录失败", "model": "AccessAttempt", "pk": "ip", "date_field": "last_fail_at", "desc": "登录失败累计（系统）"},
+        {"table": "access_sessions", "label": "会话", "model": "AccessSession", "pk": "token", "date_field": "created_at", "desc": "会话token（系统）"},
     ],
 }
+
+
+def _find_model(table_name: str):
+    """根据表名查找模型类和配置（公共辅助函数）"""
+    import models
+    for category, tables in DATA_TABLES.items():
+        for t in tables:
+            if t["table"] == table_name:
+                model_cls = getattr(models, t["model"], None)
+                return model_cls, t, category
+    return None, None, None
 
 
 @app.get("/api/data-browser/tables")
@@ -1517,6 +1561,116 @@ def data_browser_options(db: Session = Depends(get_db)):
     }
 
 
+@app.get("/api/data-browser/overview")
+def data_browser_overview(db: Session = Depends(get_db)):
+    """所有表的数据完整性概览（34张表的行数/日期范围/填充率）"""
+    from sqlalchemy import func
+    from sqlalchemy.inspection import inspect as sa_inspect
+
+    result = []
+    for category, tables in DATA_TABLES.items():
+        for t in tables:
+            model_cls, _, _ = _find_model(t["table"])
+            if not model_cls:
+                continue
+            mapper = sa_inspect(model_cls)
+            columns = [c.key for c in mapper.column_attrs]
+
+            total = db.query(model_cls).count()
+            last_update = None
+            date_range = None
+
+            # 日期字段范围
+            date_field = t.get("date_field")
+            if date_field and date_field in columns:
+                col = getattr(model_cls, date_field)
+                last_update = db.query(func.max(col)).scalar()
+                dmin = db.query(func.min(col)).scalar()
+                if dmin or last_update:
+                    date_range = {
+                        "field": date_field,
+                        "min": str(dmin) if dmin else None,
+                        "max": str(last_update) if last_update else None,
+                    }
+
+            # 关键字段填充率（抽样前 8 个字段）
+            fill_rates = {}
+            for col_name in columns[:8]:
+                if col_name == date_field:
+                    continue
+                col = getattr(model_cls, col_name)
+                non_null = db.query(func.count(col)).filter(col.isnot(None)).scalar()
+                fill_rates[col_name] = round(non_null / total * 100, 1) if total > 0 else 0
+
+            result.append({
+                "table": t["table"],
+                "label": t["label"],
+                "category": category,
+                "desc": t.get("desc", ""),
+                "row_count": total,
+                "column_count": len(columns),
+                "date_range": date_range,
+                "last_update": str(last_update) if last_update else None,
+                "fill_rates": fill_rates,
+            })
+
+    # 汇总
+    total_tables = len(result)
+    non_empty = sum(1 for r in result if r["row_count"] > 0)
+    fill_vals = [sum(r["fill_rates"].values()) / len(r["fill_rates"]) for r in result if r["fill_rates"]]
+    avg_fill = sum(fill_vals) / total_tables if total_tables else 0
+
+    return {
+        "summary": {
+            "total_tables": total_tables,
+            "non_empty": non_empty,
+            "empty": total_tables - non_empty,
+            "avg_fill_rate": round(avg_fill, 1),
+        },
+        "tables": result,
+    }
+
+
+@app.get("/api/data-browser/schema")
+def data_browser_schema():
+    """所有表的完整结构信息（字段名/类型/可空/主键/默认值/唯一约束）"""
+    from sqlalchemy.inspection import inspect as sa_inspect
+
+    result = {}
+    for category, tables in DATA_TABLES.items():
+        for t in tables:
+            model_cls, _, _ = _find_model(t["table"])
+            if not model_cls:
+                continue
+            mapper = sa_inspect(model_cls)
+            fields = []
+            for c in mapper.columns:
+                fields.append({
+                    "name": c.key,
+                    "type": str(c.type),
+                    "nullable": c.nullable,
+                    "primary_key": c.primary_key,
+                    "default": str(c.default.arg) if c.default and c.default.arg else None,
+                    "autoincrement": bool(c.autoincrement),
+                })
+            # 唯一约束
+            uniques = []
+            for const in mapper.tables[0].constraints:
+                if hasattr(const, "columns") and const.columns:
+                    uniques.append({
+                        "name": const.name,
+                        "columns": [col.name for col in const.columns],
+                    })
+            result[t["table"]] = {
+                "label": t["label"],
+                "category": category,
+                "desc": t.get("desc", ""),
+                "fields": fields,
+                "uniques": uniques,
+            }
+    return result
+
+
 @app.get("/api/data-browser/{table_name}")
 def browse_table(
     table_name: str,
@@ -1525,29 +1679,11 @@ def browse_table(
     db: Session = Depends(get_db),
 ):
     """分页浏览指定数据表"""
-    import models
-    # 查找模型类
-    model_cls = None
-    for category, tables in DATA_TABLES.items():
-        for t in tables:
-            if t["table"] == table_name:
-                model_cls = getattr(models, t["model"], None)
-                break
-        if model_cls:
-            break
-
+    model_cls, t_cfg, _ = _find_model(table_name)
     if not model_cls:
         return {"error": f"Table {table_name} not found"}
 
-    # 找 pk 列
-    pk_col = None
-    for category, tables in DATA_TABLES.items():
-        for t in tables:
-            if t["table"] == table_name and "pk" in t:
-                pk_col = t["pk"]
-                break
-        if pk_col:
-            break
+    pk_col = t_cfg.get("pk") if t_cfg else None
 
     total = db.query(model_cls).count()
     rows = db.query(model_cls).offset((page - 1) * page_size).limit(page_size).all()
@@ -1578,6 +1714,52 @@ def browse_table(
         "page_size": page_size,
         "total_pages": (total + page_size - 1) // page_size,
     }
+
+
+@app.get("/api/data-browser/{table_name}/stats")
+def data_browser_table_stats(table_name: str, db: Session = Depends(get_db)):
+    """指定表的字段级统计（宽度）：非空率/唯一值/min/max/avg/示例值"""
+    from sqlalchemy import func, Integer, Float
+    from sqlalchemy.inspection import inspect as sa_inspect
+
+    model_cls, _, _ = _find_model(table_name)
+    if not model_cls:
+        return {"error": f"Table {table_name} not found"}
+
+    mapper = sa_inspect(model_cls)
+    total = db.query(model_cls).count()
+
+    fields = []
+    for c in mapper.columns:
+        col = getattr(model_cls, c.key)
+        non_null = db.query(func.count(col)).filter(col.isnot(None)).scalar() if total > 0 else 0
+        distinct = db.query(func.count(func.distinct(col))).scalar() if total > 0 else 0
+
+        stat = {
+            "name": c.key,
+            "type": str(c.type),
+            "nullable": c.nullable,
+            "primary_key": c.primary_key,
+            "default": str(c.default.arg) if c.default and c.default.arg else None,
+            "non_null_count": non_null,
+            "fill_rate": round(non_null / total * 100, 1) if total > 0 else 0,
+            "distinct_count": distinct,
+        }
+
+        # 数值字段：min/max/avg
+        if isinstance(c.type, (Integer, Float)) and not c.primary_key and total > 0:
+            stat["min"] = db.query(func.min(col)).scalar()
+            stat["max"] = db.query(func.max(col)).scalar()
+            avg_val = db.query(func.avg(col)).scalar()
+            stat["avg"] = round(avg_val, 2) if avg_val is not None else None
+
+        # 示例值（取第一条非空）
+        sample = db.query(col).filter(col.isnot(None)).first()
+        stat["sample"] = str(sample[0])[:100] if sample and sample[0] is not None else None
+
+        fields.append(stat)
+
+    return {"table": table_name, "total_rows": total, "fields": fields}
 
 
 # 编辑允许的列：表 → 允许编辑的列集合

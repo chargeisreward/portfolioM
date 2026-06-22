@@ -70,6 +70,11 @@ export const searchSecurities = (q) => api.get('/watchlist/search', { params: { 
 export const getDataBrowserOptions = () => api.get('/data-browser/options').then(r => r.data)
 export const updateTableRow = (table, pkCol, pkVal, body) => api.put(`/data-browser/${table}/${pkCol}/${pkVal}`, body).then(r => r.data)
 
+// 数据质量仪表盘
+export const getDataOverview = () => api.get('/data-browser/overview').then(r => r.data)
+export const getTableStats = (table) => api.get(`/data-browser/${table}/stats`).then(r => r.data)
+export const getDataSchema = () => api.get('/data-browser/schema').then(r => r.data)
+
 // Strategies (API 策略页面)
 export const getStrategies = () => api.get('/strategies').then(r => r.data)
 
@@ -78,7 +83,7 @@ export const getCalendarMonth = (market, year, month) => api.get('/calendar/mont
 export const getCalendarRange = (market, start, end) => api.get('/calendar', { params: { market, start, end } }).then(r => r.data)
 
 // API code map
-export const getCodeMaps = (api) => api.get('/code-map', { params: api ? { api } : {} }).then(r => r.data)
+export const getCodeMaps = (apiStrategy) => api.get('/code-map', { params: apiStrategy ? { api: apiStrategy } : {} }).then(r => r.data)
 
 // Trend
 export const getTrend = (days = 90, target = 'CNY') => api.get('/trend', { params: { days, target } }).then(r => r.data)

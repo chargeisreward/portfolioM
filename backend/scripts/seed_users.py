@@ -1,9 +1,7 @@
 """seed 测试用户：admin / advisor / user / user_b / user_c
 
-用户密码策略（2026-06-24 用户确认）：
-  - 用户2 + 管理员：admin / user_b → 234567
-  - 原用户 + 顾问：user / advisor → 123456（继承原密码）
-  - 新建用户3：user_c → 112233
+用户密码策略（2026-06-24 用户确认 — test purpose 统一）：
+  - 5 个用户密码全部 = 123456
 
 数据归属（2026-06-24 用户确认）：
   - admin 作为 user 视角无数据
@@ -37,12 +35,13 @@ def hash_pw(plain: str) -> str:
 #   user    → 普通用户，无持仓，可申请 advisor 为顾问
 #   user_b  → 普通用户2，无数据
 #   user_c  → 普通用户3，无数据
+# 密码（2026-06-24 用户确认 — test purpose 统一）：全部 = 123456
 SEEDS = [
-    (SEED_ADMIN_USERNAME, "234567",    False, True,  "系统管理员"),
+    (SEED_ADMIN_USERNAME, "123456",    False, True,  "系统管理员"),
     ("advisor",           "123456",    True,  False, "李顾问"),
     ("user",              "123456",    False, False, "王用户"),
-    ("user_b",            "234567",    False, False, "李女士"),
-    ("user_c",            "112233",    False, False, "赵客户"),
+    ("user_b",            "123456",    False, False, "李女士"),
+    ("user_c",            "123456",    False, False, "赵客户"),
 ]
 
 

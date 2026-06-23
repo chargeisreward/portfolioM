@@ -74,6 +74,10 @@ def init_db():
         ("csi300_constituent_snapshot", "se_l4", "VARCHAR(60)"),
         # Index constituent weight (added 2026-06 via pull_index_weights.py)
         ("index_constituent_snapshot", "weight", "FLOAT"),
+        # === Multi-user: user_id columns (auth-upgrade M1) ===
+        ("holdings", "user_id", "BIGINT NOT NULL DEFAULT 1"),
+        ("watchlist", "user_id", "BIGINT NOT NULL DEFAULT 1"),
+        ("access_sessions", "user_id", "BIGINT"),
     ]
     from sqlalchemy import inspect
     insp = inspect(engine)
@@ -89,3 +93,46 @@ def init_db():
                     conn.execute(text(f'ALTER TABLE {table} ADD COLUMN {col} {coltype}'))
                 except Exception:
                     pass
+
+        # === Watchlist PK 改复合 (user_id, code) ===
+        try:
+            pk_info = insp.get_pk_constraint("watchlist")
+            pk_cols = pk_info.get("constrained_columns", []) if pk_info else []
+            if pk_cols == ["code"]:
+                if "sqlite" in DATABASE_URL:
+                    # SQLite 不能 DROP/ADD PK — 重建表
+                    conn.execute(text("""
+                        CREATE TABLE watchlist_new (
+                            user_id BIGINT NOT NULL DEFAULT 1,
+                            code VARCHAR(20) NOT NULL,
+                            name VARCHAR(100),
+                            market VARCHAR(10),
+                            industry VARCHAR(50),
+                            weight FLOAT,
+                            added_at DATETIME,
+                            PRIMARY KEY (user_id, code)
+                        )
+                    """))
+                    conn.execute(text("""
+                        INSERT OR IGNORE INTO watchlist_new
+                            (user_id, code, name, market, industry, weight, added_at)
+                        SELECT user_id, code, name, market, industry, weight, added_at
+                        FROM watchlist
+                    """))
+                    conn.execute(text("DROP TABLE watchlist"))
+                    conn.execute(text("ALTER TABLE watchlist_new RENAME TO watchlist"))
+                else:
+                    # PG: 直接 DROP/ADD PK
+                    conn.execute(text("ALTER TABLE watchlist DROP CONSTRAINT IF EXISTS watchlist_pkey"))
+                    conn.execute(text("ALTER TABLE watchlist ADD PRIMARY KEY (user_id, code)"))
+        except Exception as e:
+            print(f"[init_db] watchlist PK migration: {e}")
+
+        # === 索引 ===
+        for ix_table, ix_col in [("holdings", "user_id"), ("watchlist", "user_id"),
+                                  ("access_sessions", "user_id")]:
+            try:
+                ix_name = f"ix_{ix_table}_{ix_col}"
+                conn.execute(text(f"CREATE INDEX IF NOT EXISTS {ix_name} ON {ix_table} ({ix_col})"))
+            except Exception:
+                pass

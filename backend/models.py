@@ -85,6 +85,7 @@ class Holding(Base):
     __tablename__ = "holdings"
 
     id = Column(Integer, primary_key=True, autoincrement=True)
+    user_id = Column(BigInteger, nullable=False, default=1, index=True)
     security_code = Column(String(20), nullable=False, index=True)
     security_name = Column(String(100))
     quantity = Column(Float, default=0.0)        # 持仓数量
@@ -133,6 +134,7 @@ class AccessSession(Base):
 
     token = Column(String(64), primary_key=True)
     ip = Column(String(64), nullable=True)
+    user_id = Column(BigInteger, nullable=True, index=True)
     created_at = Column(DateTime, default=datetime.utcnow)
     expires_at = Column(DateTime, nullable=False)
 
@@ -259,10 +261,11 @@ class Csi300Baseline(Base):
 
 
 class Watchlist(Base):
-    """用户关注清单（自选股）"""
+    """用户关注清单（自选股）— PK 改 (user_id, code)"""
     __tablename__ = "watchlist"
 
-    code = Column(String(20), primary_key=True)        # 证券代码（含后缀）
+    user_id = Column(BigInteger, primary_key=True, nullable=False, default=1)
+    code = Column(String(20), primary_key=True, nullable=False)        # 证券代码（含后缀）
     name = Column(String(100), nullable=True)          # 名称（首次添加时从行情拉取）
     market = Column(String(10), nullable=True)         # 美股/A股/港股
     industry = Column(String(50), nullable=True)       # 行业（首次添加时拉取）

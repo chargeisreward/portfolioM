@@ -117,6 +117,12 @@ export const getAuthMe = () => api.get('/auth/me').then(r => r.data)
 export const getUsers = () => api.get('/auth/users').then(r => r.data)
 export const logout = () => api.post('/auth/logout').then(r => r.data)
 
+// 关联管理
+export const listRelations = () => api.get('/auth/relations').then(r => r.data)
+export const createRelation = (body) => api.post('/auth/relations', body).then(r => r.data)
+export const confirmRelation = (id) => api.post(`/auth/relations/${id}/confirm`).then(r => r.data)
+export const cancelRelation = (id) => api.post(`/auth/relations/${id}/cancel`).then(r => r.data)
+
 // ============================================================================
 // Fund Penetration & Industry Aggregation (spec §4)
 // ============================================================================

@@ -10,6 +10,7 @@ import DataBrowser from './components/DataBrowser'
 import StrategiesPanel from './components/StrategiesPanel'
 import AuthGate from './components/AuthGate'
 import OpsPanel from './components/OpsPanel'
+import RelationPanel from './components/RelationPanel'
 import './App.css'
 
 // SVG path icons (no emoji — per UI UX Pro Max §4)
@@ -139,7 +140,7 @@ export default function App() {
       case 'analyst': return <AnalystPanel />
       case 'trading': return <TradingPanel />
       case 'watch': return <WatchPanel />
-      case 'relation': return <div style={{ padding: 40 }}>关联管理（M4 实现）</div>
+      case 'relation': return <RelationPanel currentUser={currentUser} />
       case 'data': return <DataBrowser />
       case 'ops': return <OpsPanel />
       case 'dataGap': return <div style={{ padding: 40 }}>数据补足（M5 实现）</div>

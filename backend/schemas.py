@@ -24,6 +24,7 @@ class HoldingSummary(BaseModel):
 
 
 class PenetrationRow(BaseModel):
+    model_config = {"from_attributes": True, "extra": "ignore"}
     stock_code: str
     stock_name: Optional[str] = None
     penetration_weight: float
@@ -35,8 +36,8 @@ class PenetrationRow(BaseModel):
     ttm_pe: Optional[float] = None
     forecast_pe_1y: Optional[float] = None
     forecast_pe_2y: Optional[float] = None
-    revenue_growth: Optional[float] = None
-    profit_growth: Optional[float] = None
+    revenue_growth: Optional[str] = None
+    profit_growth: Optional[str] = None
 
 
 class PenetrationSummary(BaseModel):

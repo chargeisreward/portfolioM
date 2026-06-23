@@ -45,10 +45,14 @@ def _resolve_snap_for_code(db: Session, code: str, as_of_date: _date, a_snap, h_
     return snap
 
 
-def _aggregate_holdings_by_fund(db: Session) -> dict[str, dict]:
-    """Sum quantities and amount_cny per fund_code (across all buy batches)."""
+def _aggregate_holdings_by_fund(db: Session, user_id: int | None = None) -> dict[str, dict]:
+    """Sum quantities and amount_cny per fund_code (across all buy batches).
+    user_id=None 处理全部 holdings（admin 维护场景）；常规调用应传 user_id（2026-06-24）。"""
     out: dict[str, dict] = {}
-    for h in db.query(Holding).all():
+    q = db.query(Holding)
+    if user_id is not None:
+        q = q.filter(Holding.user_id == user_id)
+    for h in q.all():
         code = h.security_code
         if code not in out:
             out[code] = {
@@ -96,7 +100,7 @@ def _load_fund_navs(db: Session, fund_codes: list[str]) -> dict[str, dict]:
     return out
 
 
-def list_drillable_indices(db: Session, as_of_date: _date) -> list[dict]:
+def list_drillable_indices(db: Session, as_of_date: _date, user_id: int | None = None) -> list[dict]:
     """One card per index using unit_nav for assets, cumnav for period change.
 
     算法:
@@ -112,12 +116,15 @@ def list_drillable_indices(db: Session, as_of_date: _date) -> list[dict]:
 
       deviation = (est_value - simulated_value) / simulated_value      # 跟踪误差
     """
-    holdings_agg = _aggregate_holdings_by_fund(db)
+    holdings_agg = _aggregate_holdings_by_fund(db, user_id=user_id)
 
-    a_snap = {a.stock_code.split(".")[0]: a for a in
-              db.query(AShareFinancialSnapshot).filter_by(as_of_date=as_of_date).all()}
-    h_snap = {h.stock_code.split(".")[0]: h for h in
-              db.query(HKShareFinancialSnapshot).filter_by(as_of_date=as_of_date).all()}
+    a_q = db.query(AShareFinancialSnapshot).filter(AShareFinancialSnapshot.as_of_date == as_of_date)
+    h_q = db.query(HKShareFinancialSnapshot).filter(HKShareFinancialSnapshot.as_of_date == as_of_date)
+    if user_id is not None:
+        a_q = a_q.filter(AShareFinancialSnapshot.user_id == user_id)
+        h_q = h_q.filter(HKShareFinancialSnapshot.user_id == user_id)
+    a_snap = {a.stock_code.split(".")[0]: a for a in a_q.all()}
+    h_snap = {h.stock_code.split(".")[0]: h for h in h_q.all()}
 
     candidate_funds = [fc for fc, info in holdings_agg.items() if info["quantity"] > 0]
     fund_navs = _load_fund_navs(db, candidate_funds)
@@ -299,10 +306,12 @@ def get_index_drill_detail(
     fund_navs: dict[str, dict] | None = None,
     a_snap: dict[str, AShareFinancialSnapshot] | None = None,
     h_snap: dict[str, HKShareFinancialSnapshot] | None = None,
+    user_id: int | None = None,
 ) -> dict:
     """Drill-down detail using precise formula per stock.
 
     支持传入预加载的 holdings_agg / fund_navs / snapshots，避免重复查库。
+    user_id 透传到内部 _aggregate_holdings_by_fund；外部传 holdings_agg 则用外部的（2026-06-24）。
     """
     idx_code = index_code.split(".")[0]
     fund_maps = db.query(FundIndexMap).filter(
@@ -314,7 +323,7 @@ def get_index_drill_detail(
     fund_codes = [f.fund_code for f in fund_maps]
 
     if holdings_agg is None:
-        holdings_agg = _aggregate_holdings_by_fund(db)
+        holdings_agg = _aggregate_holdings_by_fund(db, user_id=user_id)
     if fund_navs is None:
         fund_navs = _load_fund_navs(db, fund_codes)
     if a_snap is None:
@@ -409,10 +418,12 @@ def get_all_drilled_stocks(
     fund_navs: dict[str, dict] | None = None,
     a_snap: dict | None = None,
     h_snap: dict | None = None,
+    user_id: int | None = None,
 ) -> dict:
     """跨所有可下钻指数聚合成分股 (drill 算法 = 与 get_index_drill_detail 一致).
 
     支持传入预加载的 indices / holdings_agg / fund_navs / snapshots，避免重复查库。
+    user_id 透传到 list_drillable_indices（2026-06-24）。
 
     Returns: {
       "as_of_date": ...,
@@ -426,7 +437,7 @@ def get_all_drilled_stocks(
     est_market_value_cny 求和; 价格 / 估值指标取首个非空值.
     """
     if indices is None:
-        indices = list_drillable_indices(db, as_of_date)
+        indices = list_drillable_indices(db, as_of_date, user_id=user_id)
     if not indices:
         return {"as_of_date": as_of_date.isoformat(), "stocks": [], "count": 0}
 

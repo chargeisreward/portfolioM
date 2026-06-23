@@ -97,6 +97,29 @@ def _resolve_eff_from_request(request: Request, db: Session) -> tuple[User, int]
     return u, eff_uid
 
 
+def user_scope_query(query, model, request: Request, db: Session):
+    """给 query 加上 user_id == eff_uid 过滤。用于按 user 隔离的个人数据表。
+
+    用法:
+        rows = user_scope_query(
+            db.query(PenetrationResult), PenetrationResult, request, db
+        ).order_by(...).all()
+    """
+    _u, eff_uid = _resolve_eff_from_request(request, db)
+    return query.filter(model.user_id == eff_uid)
+
+
+def eff_user_dep(request: Request, db: Session = None):
+    """FastAPI dependency: 解析 effective user_id。
+
+    用法:
+        def endpoint(request: Request, eff_uid: int = Depends(eff_user_dep), db: Session = Depends(get_db)):
+            rows = db.query(Holding).filter(Holding.user_id == eff_uid).all()
+    """
+    _u, eff_uid = _resolve_eff_from_request(request, db)
+    return eff_uid
+
+
 def effective_user_dep(
     request: Request,
     user: User = None,  # 强制 require_user 先行

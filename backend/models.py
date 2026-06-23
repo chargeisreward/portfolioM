@@ -228,10 +228,11 @@ class StockInfoCache(Base):
 # ---------- 穿透结果 ----------
 
 class PenetrationResult(Base):
-    """底层股票穿透表"""
+    """底层股票穿透表（按 user 隔离的个人衍生数据 — 2026-06-24）"""
     __tablename__ = "penetration_results"
 
     id = Column(Integer, primary_key=True, autoincrement=True)
+    user_id = Column(Integer, nullable=False, index=True)  # 多用户隔离
     stock_code = Column(String(20), nullable=False, index=True)
     stock_name = Column(String(100))
     penetration_weight = Column(Float, default=0.0)    # 穿透后权重 %
@@ -390,6 +391,7 @@ class AShareFinancialSnapshot(Base):
     )
 
     id = Column(Integer, primary_key=True, autoincrement=True)
+    user_id = Column(Integer, nullable=False, index=True)  # 多用户隔离
     as_of_date = Column(Date, nullable=False, index=True)
     stock_code = Column(String(20), nullable=False, index=True)
     stock_name = Column(String(80))
@@ -436,6 +438,7 @@ class HKShareFinancialSnapshot(Base):
     )
 
     id = Column(Integer, primary_key=True, autoincrement=True)
+    user_id = Column(Integer, nullable=False, index=True)  # 多用户隔离
     as_of_date = Column(Date, nullable=False, index=True)
     stock_code = Column(String(20), nullable=False, index=True)
     stock_name = Column(String(80))
@@ -524,6 +527,7 @@ class FullHoldingSnapshot(Base):
     )
 
     id = Column(Integer, primary_key=True, autoincrement=True)
+    user_id = Column(Integer, nullable=False, index=True)  # 多用户隔离
     as_of_date = Column(Date, nullable=False, index=True)
     stock_code = Column(String(20), nullable=False, index=True)
     stock_name = Column(String(80))
@@ -589,6 +593,7 @@ class Csi300ConstituentSnapshot(Base):
     )
 
     id = Column(Integer, primary_key=True, autoincrement=True)
+    user_id = Column(Integer, nullable=False, index=True)  # 多用户隔离
     as_of_date = Column(Date, nullable=False, index=True)
     stock_code = Column(String(20), nullable=False, index=True)
     stock_name = Column(String(80))
@@ -624,10 +629,11 @@ class AggregationTimeseries(Base):
     """组合 / CSI300 估值指标日时序（点击展开趋势图）。"""
     __tablename__ = "aggregation_timeseries"
     __table_args__ = (
-        UniqueConstraint("calc_date", "scope", name="ux_aggts"),
+        UniqueConstraint("calc_date", "scope", "user_id", name="ux_aggts"),
     )
 
     id = Column(Integer, primary_key=True, autoincrement=True)
+    user_id = Column(Integer, nullable=False, index=True, default=2)  # 多用户隔离（2026-06-24）
     calc_date = Column(Date, nullable=False, index=True)
     business_date = Column(Date, nullable=False)          # 该 calc_date 使用的业务日期
     scope = Column(String(20))                            # portfolio | csi300

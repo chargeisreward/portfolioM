@@ -152,7 +152,8 @@ def _norm_bucket_key(k: str | None) -> str:
     return k
 
 
-def _bucket_portfolio(db: Session, as_of_date: _date, col: str, market: str = "A+H"):
+def _bucket_portfolio(db: Session, as_of_date: _date, col: str, market: str = "A+H",
+                      user_id: int | None = None):
     """Merge per-stock from FullHoldingSnapshot, then bucket by `col`.
 
     Excludes source_type IN ('undrilled_fund', 'cash') from metric rows —
@@ -183,6 +184,8 @@ def _bucket_portfolio(db: Session, as_of_date: _date, col: str, market: str = "A
         FullHoldingSnapshot.as_of_date == as_of_date,
         FullHoldingSnapshot.source_type.in_(METRIC_SOURCES),
     )
+    if user_id is not None:
+        q = q.filter(FullHoldingSnapshot.user_id == user_id)
     if market == "A":
         q = q.filter(
             (FullHoldingSnapshot.stock_code.like("%.SH")) |
@@ -343,12 +346,12 @@ def _bucket_csi300(db: Session, as_of_date: _date, col: str):
 # ---------- public ----------
 
 def aggregate_dimension(db: Session, as_of_date: _date, scope: str, dim: str,
-                        market: str = "A+H"):
+                        market: str = "A+H", user_id: int | None = None):
     if dim not in DIM_COL:
         raise ValueError(f"unknown dim: {dim}")
     col = DIM_COL[dim]
     if scope == "portfolio":
-        bucket, total = _bucket_portfolio(db, as_of_date, col, market=market)
+        bucket, total = _bucket_portfolio(db, as_of_date, col, market=market, user_id=user_id)
     elif scope == "csi300":
         bucket, total = _bucket_csi300(db, as_of_date, col)
     else:

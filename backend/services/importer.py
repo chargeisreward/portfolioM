@@ -188,11 +188,15 @@ def fetch_fund_nav_history(fund_code: str, days: int = 90) -> list[dict]:
     return _try("累计净值走势", "累计净值")
 
 
-def fill_prices(db: Session):
-    """Fetch latest prices for all holdings and calculate amount = quantity × price.
-    US stocks → Tencent API | Chinese funds → akshare NAV | ETFs → Tencent API"""
+def fill_prices(db: Session, user_id: int | None = None):
+    """Fetch latest prices for holdings and calculate amount = quantity × price.
+    US stocks → Tencent API | Chinese funds → akshare NAV | ETFs → Tencent API
+    多用户隔离：user_id=None 时处理全部；否则只处理该 user 的 holdings（2026-06-24）。"""
     from crawlers.price_data import fetch_tencent_quote
-    holdings = db.query(Holding).all()
+    q = db.query(Holding)
+    if user_id is not None:
+        q = q.filter(Holding.user_id == user_id)
+    holdings = q.all()
     updated = 0
 
     for h in holdings:

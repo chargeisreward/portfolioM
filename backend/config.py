@@ -80,3 +80,10 @@ DATA_DIR_INFO = DATA_DIR / "info_cache"
 DATA_DIR_PDF = DATA_DIR / "research_pdfs"
 DATA_DIR_INFO.mkdir(parents=True, exist_ok=True)
 DATA_DIR_PDF.mkdir(parents=True, exist_ok=True)
+
+# ============================================================================
+# 多用户/权限 (auth-upgrade)
+# ============================================================================
+BCRYPT_ROUNDS = int(os.environ.get("BCRYPT_ROUNDS", "10"))
+SEED_ADMIN_USERNAME = os.environ.get("SEED_ADMIN_USERNAME", "admin")
+SEED_ADMIN_PASSWORD = os.environ.get("SEED_ADMIN_PASSWORD", "admin123")

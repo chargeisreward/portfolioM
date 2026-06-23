@@ -1,6 +1,6 @@
 """SQLAlchemy ORM models for PortfolioM"""
 from datetime import date, datetime
-from sqlalchemy import Column, Integer, Float, String, Date, DateTime, Text, JSON, Boolean, UniqueConstraint
+from sqlalchemy import Column, Integer, Float, String, Date, DateTime, Text, JSON, Boolean, UniqueConstraint, BigInteger, ForeignKey
 from database import Base
 import enum
 
@@ -796,3 +796,70 @@ class AnalystIndustryChainCompany(Base):
     row_index = Column(Integer, nullable=True)
     parsed_at = Column(DateTime, default=datetime.utcnow)
     updated_at = Column(DateTime, default=datetime.utcnow, onupdate=datetime.utcnow)
+
+
+# ============================================================================
+# Multi-user / Permissions (auth-upgrade M1)
+# ============================================================================
+
+class User(Base):
+    __tablename__ = "users"
+    id = Column(BigInteger, primary_key=True, autoincrement=True)
+    username = Column(String(64), unique=True, nullable=False, index=True)
+    password_hash = Column(String(255), nullable=False)
+    display_name = Column(String(64), nullable=True)
+    is_advisor = Column(Boolean, nullable=False, default=False, index=True)
+    is_admin = Column(Boolean, nullable=False, default=False, index=True)
+    is_active = Column(Boolean, nullable=False, default=True)
+    created_at = Column(DateTime, default=datetime.utcnow)
+    last_login_at = Column(DateTime, nullable=True)
+    updated_at = Column(DateTime, default=datetime.utcnow, onupdate=datetime.utcnow)
+
+
+class UserRelation(Base):
+    __tablename__ = "user_relations"
+    id = Column(BigInteger, primary_key=True, autoincrement=True)
+    advisor_user_id = Column(BigInteger, ForeignKey("users.id"), nullable=False, index=True)
+    client_user_id = Column(BigInteger, ForeignKey("users.id"), nullable=False, index=True)
+    status = Column(String(16), nullable=False, default="PENDING")
+    initiator_user_id = Column(BigInteger, ForeignKey("users.id"), nullable=False)
+    created_at = Column(DateTime, default=datetime.utcnow)
+    updated_at = Column(DateTime, default=datetime.utcnow, onupdate=datetime.utcnow)
+    __table_args__ = (UniqueConstraint("advisor_user_id", "client_user_id", name="uq_relation"),)
+
+
+class IndexClassification(Base):
+    __tablename__ = "index_classification"
+    id = Column(BigInteger, primary_key=True, autoincrement=True)
+    index_code = Column(String(32), unique=True, nullable=False, index=True)
+    index_name = Column(String(128), nullable=True)
+    category = Column(String(64), nullable=True)
+    theme = Column(String(64), nullable=True)
+    benchmark_formula = Column(Text, nullable=True)
+    source = Column(String(32), nullable=True)
+    created_at = Column(DateTime, default=datetime.utcnow)
+    updated_at = Column(DateTime, default=datetime.utcnow, onupdate=datetime.utcnow)
+
+
+class DataGapReport(Base):
+    __tablename__ = "data_gap_report"
+    id = Column(BigInteger, primary_key=True, autoincrement=True)
+    user_id = Column(BigInteger, ForeignKey("users.id"), nullable=True, index=True)
+    gap_type = Column(String(32), nullable=False, index=True)
+    stock_code = Column(String(32), nullable=True, index=True)
+    index_code = Column(String(32), nullable=True, index=True)
+    as_of_date = Column(Date, nullable=True)
+    description = Column(Text, nullable=True)
+    status = Column(String(16), nullable=False, default="OPEN")
+    detected_at = Column(DateTime, default=datetime.utcnow, index=True)
+    resolved_at = Column(DateTime, nullable=True)
+
+
+class HoldingImportLog(Base):
+    __tablename__ = "holding_import_log"
+    id = Column(BigInteger, primary_key=True, autoincrement=True)
+    user_id = Column(BigInteger, ForeignKey("users.id"), nullable=False, index=True)
+    import_source = Column(String(16), nullable=False)
+    file_name = Column(String(255), nullable=True)
+    row_count = Column(Integer, nullable=False, default=0)
+    imported_at = Column(DateTime, default=datetime.utcnow, index=True)

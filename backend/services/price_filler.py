@@ -398,6 +398,8 @@ def fill_snapshot_gaps_smart(db: Session, days: int = 15,
                         results["gaps_filled"] += 1
                         results["api_breakdown"][api_name] = \
                             results["api_breakdown"].get(api_name, 0) + 1
+                    # 强制 flush 让后续 latest_pc 查询能看见新加的 PriceCache 行
+                    db.flush()
                     # batch commit 防止内存膨胀
                     if results["gaps_filled"] % batch_commit == 0:
                         db.commit()
@@ -408,8 +410,9 @@ def fill_snapshot_gaps_smart(db: Session, days: int = 15,
                 PriceCache.trade_date >= earliest,
             ).order_by(PriceCache.trade_date.desc()).first()
             if latest_pc and latest_pc.close_px:
-                _update_snapshot_current_price(db, code, latest_pc, compute_dynamic)
-                results["snapshots_updated"] += 1
+                updated = _update_snapshot_current_price(db, code, latest_pc, compute_dynamic)
+                if updated:
+                    results["snapshots_updated"] += 1
 
             if sleep_between:
                 _t.sleep(sleep_between)
@@ -422,15 +425,17 @@ def fill_snapshot_gaps_smart(db: Session, days: int = 15,
     return results
 
 
-def _update_snapshot_current_price(db: Session, code: str, latest_pc, compute_dynamic):
+def _update_snapshot_current_price(db: Session, code: str, latest_pc, compute_dynamic) -> bool:
     """把最新 PriceCache 行回写到 snapshot 表的 current_price / current_price_date。
     仅当 PriceCache.trade_date > snapshot.current_price_date 时更新 — 不覆盖更早的数据。
+
+    Returns True if an actual update happened, False otherwise.
     """
     for model in (AShareFinancialSnapshot, HKShareFinancialSnapshot):
         snap = db.query(model).filter(model.stock_code == code).first()
         if not snap:
             continue
-        # 不覆盖：仅当 PriceCache 日期更新
+        # 不覆盖：仅当 PriceCache 日期严格更晚
         if snap.current_price_date and latest_pc.trade_date <= snap.current_price_date:
             continue
         snap.current_price = latest_pc.close_px
@@ -449,4 +454,5 @@ def _update_snapshot_current_price(db: Session, code: str, latest_pc, compute_dy
             except Exception:
                 pass
         # 单只股票只更新一次（HK/A 不重复处理）
-        break
+        return True
+    return False

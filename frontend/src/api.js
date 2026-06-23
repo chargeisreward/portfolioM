@@ -105,7 +105,10 @@ export const getTrend = (days = 90, target = 'CNY') => api.get('/trend', { param
 
 // Auth
 export const getAuthStatus = () => api.get('/auth/status').then(r => r.data)
-export const login = (password) => api.post('/auth/login', { password }).then(r => r.data)
+export const login = (username, password) => api.post('/auth/login', { username, password }).then(r => r.data)
+// 兼容旧调用（仅密码 → 旧单密码模式）
+export const loginPasswordOnly = (password) => api.post('/auth/login', { password }).then(r => r.data)
+export const getAuthMe = () => api.get('/auth/me').then(r => r.data)
 export const logout = () => api.post('/auth/logout').then(r => r.data)
 
 // ============================================================================

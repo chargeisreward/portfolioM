@@ -2,7 +2,7 @@ import React, { useState, useEffect } from 'react'
 import * as api from '../api'
 
 /**
- * 访问密码门 — 全屏空白页 + 一个输入框
+ * 多用户登录门 — username + password (bcrypt)
  * 后端限流规则（同一 IP）：
  *   10 次错 → 禁 1h
  *   20 次错 → 禁 1d
@@ -10,6 +10,7 @@ import * as api from '../api'
  *   40 次错 → 禁 365d
  */
 export default function AuthGate({ onLoggedIn }) {
+  const [username, setUsername] = useState('')
   const [password, setPassword] = useState('')
   const [error, setError] = useState('')
   const [banned, setBanned] = useState(null)   // {until, remaining}
@@ -35,6 +36,10 @@ export default function AuthGate({ onLoggedIn }) {
   const submit = async (e) => {
     e?.preventDefault()
     if (banned || submitting) return
+    if (username.length < 3) {
+      setError('用户名至少 3 位')
+      return
+    }
     if (password.length < 6) {
       setError('密码至少 6 位')
       return
@@ -42,20 +47,20 @@ export default function AuthGate({ onLoggedIn }) {
     setSubmitting(true)
     setError('')
     try {
-      const res = await api.login(password)
+      const res = await api.login(username, password)
       if (res.status === 'ok' && res.token) {
-        onLoggedIn(res.token)
+        onLoggedIn(res.token, res.user)
       } else if (res.status === 'banned') {
         setBanned({ until: res.banned_until, remaining: res.remaining_seconds })
         setError(res.message || '已被封禁')
       } else {
-        setError(res.message || '密码错误')
+        setError(res.message || '登录失败')
         setAttempts(res.attempts_1y || 0)
       }
     } catch (e) {
       const status = e?.response?.status
       if (status === 401 || status === 403) {
-        setError('密码错误')
+        setError('用户名或密码错误')
       } else if (e?.response?.data?.detail?.includes('封禁')) {
         setError(e.response.data.detail)
       } else {
@@ -83,7 +88,7 @@ export default function AuthGate({ onLoggedIn }) {
         <h1 style={{
           fontSize: 20, fontWeight: 400, color: 'var(--text)', margin: '0 0 24px 0',
           letterSpacing: 0.5,
-        }}>访问需要密码</h1>
+        }}>登录</h1>
 
         {banned ? (
           <div style={{
@@ -99,13 +104,24 @@ export default function AuthGate({ onLoggedIn }) {
         ) : (
           <>
             <input
-              type="password"
+              type="text"
               className="ig"
               autoFocus
+              value={username}
+              onChange={e => { setUsername(e.target.value); setError('') }}
+              placeholder="用户名"
+              disabled={submitting}
+              autoComplete="username"
+              style={{ width: '100%', marginBottom: 12, fontSize: 14, padding: '10px 12px' }}
+            />
+            <input
+              type="password"
+              className="ig"
               value={password}
               onChange={e => { setPassword(e.target.value); setError('') }}
-              placeholder="6-12 位密码"
+              placeholder="6 位以上密码"
               disabled={submitting}
+              autoComplete="current-password"
               style={{ width: '100%', marginBottom: 12, fontSize: 14, padding: '10px 12px' }}
             />
             {error && (
@@ -122,11 +138,11 @@ export default function AuthGate({ onLoggedIn }) {
             )}
             <button
               type="submit"
-              disabled={submitting || !password}
+              disabled={submitting || !username || !password}
               className="btn-ghost"
               style={{ width: '100%', padding: '10px', fontSize: 13 }}
             >
-              {submitting ? '验证中…' : '进入'}
+              {submitting ? '验证中…' : '登录'}
             </button>
           </>
         )}
@@ -135,8 +151,8 @@ export default function AuthGate({ onLoggedIn }) {
           marginTop: 24, paddingTop: 16, borderTop: '1px solid var(--border)',
           fontSize: 10, color: 'var(--text-muted)', lineHeight: 1.6,
         }}>
-          <div>封禁规则：</div>
-          <div>10 次 → 1h · 20 次 → 1d · 30 次 → 30d · 40 次 → 365d</div>
+          <div>测试账户：</div>
+          <div>admin / admin123 · advisor_x / advisor123 · user_a / user123</div>
         </div>
       </form>
     </div>

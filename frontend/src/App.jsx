@@ -34,9 +34,13 @@ const TABS = [
 ]
 
 const TOKEN_KEY = 'portfoliom_session'
+const USER_KEY = 'portfoliom_session_user'
 
 export default function App() {
   const [sessionToken, setSessionToken] = useState(() => localStorage.getItem(TOKEN_KEY) || '')
+  const [currentUser, setCurrentUser] = useState(() => {
+    try { return JSON.parse(localStorage.getItem(USER_KEY) || 'null') } catch { return null }
+  })
   const [activeTab, setActiveTab] = useState('overview')
   const [loading, setLoading] = useState(false)
 
@@ -49,8 +53,23 @@ export default function App() {
     }
   }, [sessionToken])
 
-  const onLoggedIn = (token) => setSessionToken(token)
-  const onLogout = () => setSessionToken('')
+  // 持久化 currentUser
+  useEffect(() => {
+    if (currentUser) {
+      localStorage.setItem(USER_KEY, JSON.stringify(currentUser))
+    } else {
+      localStorage.removeItem(USER_KEY)
+    }
+  }, [currentUser])
+
+  const onLoggedIn = (token, user) => {
+    setSessionToken(token)
+    setCurrentUser(user)
+  }
+  const onLogout = () => {
+    setSessionToken('')
+    setCurrentUser(null)
+  }
 
   const refreshAll = useCallback(async () => {
     setLoading(true)
@@ -104,7 +123,11 @@ export default function App() {
           ))}
         </nav>
         <div className="sidebar-footer" style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center' }}>
-          <span className="version">v0.2.0</span>
+          <span className="version" style={{ fontSize: 10 }}>
+            {currentUser?.display_name || currentUser?.username || '未登录'}
+            {currentUser?.is_admin && <span style={{ marginLeft: 4, color: 'var(--accent)' }}>·管理员</span>}
+            {currentUser?.is_advisor && !currentUser?.is_admin && <span style={{ marginLeft: 4, color: 'var(--accent)' }}>·顾问</span>}
+          </span>
           <button onClick={onLogout} className="btn-ghost" style={{ padding: '2px 8px', fontSize: 10 }}>登出</button>
         </div>
       </aside>

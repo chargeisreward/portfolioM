@@ -1,4 +1,4 @@
-import React, { useState, useCallback, useEffect } from 'react'
+import React, { useState, useCallback, useEffect, useMemo } from 'react'
 import * as api from './api'
 import OverviewPanel from './components/OverviewPanel'
 import AnalysisPanel from './components/AnalysisPanel'
@@ -23,15 +23,25 @@ const ICONS = {
 }
 
 const TABS = [
-  { id: 'overview', label: '总览', icon: ICONS.overview },
-  { id: 'analysis', label: '分析', icon: ICONS.analysis },
-  { id: 'analyst',  label: '分析师', icon: ICONS.analyst },
-  { id: 'trading',  label: '交易', icon: ICONS.trading },
-  { id: 'watch',    label: '关注', icon: ICONS.watch },
-  { id: 'data',     label: '数据', icon: ICONS.data },
-  { id: 'strategies', label: 'API策略', icon: 'M13 10V3L4 14h7v7l9-11h-7z' },
-  { id: 'settings', label: '设置', icon: ICONS.settings },
+  { id: 'overview',  label: '总览',    icon: ICONS.overview, visibility: ['user','advisor','admin'] },
+  { id: 'analysis',  label: '分析',    icon: ICONS.analysis, visibility: ['user','advisor','admin'] },
+  { id: 'analyst',   label: '分析师',  icon: ICONS.analyst,  visibility: ['user','advisor','admin'] },
+  { id: 'trading',   label: '交易',    icon: ICONS.trading,  visibility: ['user'] },
+  { id: 'watch',     label: '关注',    icon: ICONS.watch,    visibility: ['user','advisor','admin'] },
+  { id: 'relation',  label: '关联',    icon: 'M17 20h5v-2a4 4 0 00-3-3.87M9 20H4v-2a3 3 0 015.36-1.87M15 7a3 3 0 11-6 0 3 3 0 016 0zm6 7a2 2 0 11-4 0 2 2 0 014 0z', visibility: ['user','advisor'] },
+  { id: 'data',      label: '数据',    icon: ICONS.data,     visibility: ['advisor','admin'] },
+  { id: 'ops',       label: '运维',    icon: 'M3 12l2-2 4 4 8-8', visibility: ['admin'] },
+  { id: 'dataGap',   label: '数据补足', icon: 'M12 9v2m0 4h.01M21 12a9 9 0 11-18 0 9 9 0 0118 0z', visibility: ['admin'] },
+  { id: 'strategies', label: 'API策略', icon: 'M13 10V3L4 14h7v7l9-11h-7z', visibility: ['admin'] },
+  { id: 'settings',  label: '设置',    icon: ICONS.settings, visibility: ['user','advisor','admin'] },
 ]
+
+function userRoleOf(u) {
+  if (!u) return 'user'
+  if (u.is_admin) return 'admin'
+  if (u.is_advisor) return 'advisor'
+  return 'user'
+}
 
 const TOKEN_KEY = 'portfoliom_session'
 const USER_KEY = 'portfoliom_session_user'
@@ -41,8 +51,42 @@ export default function App() {
   const [currentUser, setCurrentUser] = useState(() => {
     try { return JSON.parse(localStorage.getItem(USER_KEY) || 'null') } catch { return null }
   })
+  const [viewAsUser, setViewAsUser] = useState(null)
+  const [allUsers, setAllUsers] = useState([])
   const [activeTab, setActiveTab] = useState('overview')
   const [loading, setLoading] = useState(false)
+
+  // 角色 + 菜单过滤
+  const userRole = userRoleOf(currentUser)
+  const visibleTabs = useMemo(
+    () => TABS.filter(t => t.visibility.includes(userRole)),
+    [userRole]
+  )
+
+  // 加载可切换用户列表（advisor/admin）
+  useEffect(() => {
+    if (currentUser?.is_advisor || currentUser?.is_admin) {
+      api.getUsers().then(r => setAllUsers(r.users || [])).catch(() => setAllUsers([]))
+    } else {
+      setAllUsers([])
+    }
+  }, [currentUser])
+
+  // 当 viewAs = 自己时清空
+  useEffect(() => {
+    if (viewAsUser && viewAsUser.id === currentUser?.id) {
+      setViewAsUser(null)
+    }
+  }, [viewAsUser, currentUser])
+
+  // 持久化 viewAs 到 localStorage
+  useEffect(() => {
+    if (viewAsUser) {
+      localStorage.setItem('portfoliom_view_as', String(viewAsUser.id))
+    } else {
+      localStorage.removeItem('portfoliom_view_as')
+    }
+  }, [viewAsUser])
 
   // token 注入 axios
   useEffect(() => {
@@ -94,7 +138,10 @@ export default function App() {
       case 'analyst': return <AnalystPanel />
       case 'trading': return <TradingPanel />
       case 'watch': return <WatchPanel />
+      case 'relation': return <div style={{ padding: 40 }}>关联管理（M4 实现）</div>
       case 'data': return <DataBrowser />
+      case 'ops': return <div style={{ padding: 40 }}>运维面板（M3.5 实现）</div>
+      case 'dataGap': return <div style={{ padding: 40 }}>数据补足（M5 实现）</div>
       case 'strategies': return <StrategiesPanel />
       case 'settings': return <SettingsPanel />
       default: return null
@@ -109,7 +156,7 @@ export default function App() {
           <span className="brand-text">PortfolioM</span>
         </div>
         <nav className="sidebar-nav">
-          {TABS.map(tab => (
+          {visibleTabs.map(tab => (
             <button key={tab.id}
               className={`nav-item ${activeTab === tab.id ? 'active' : ''}`}
               onClick={() => setActiveTab(tab.id)}>
@@ -122,23 +169,61 @@ export default function App() {
             </button>
           ))}
         </nav>
-        <div className="sidebar-footer" style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center' }}>
-          <span className="version" style={{ fontSize: 10 }}>
-            {currentUser?.display_name || currentUser?.username || '未登录'}
-            {currentUser?.is_admin && <span style={{ marginLeft: 4, color: 'var(--accent)' }}>·管理员</span>}
-            {currentUser?.is_advisor && !currentUser?.is_admin && <span style={{ marginLeft: 4, color: 'var(--accent)' }}>·顾问</span>}
-          </span>
-          <button onClick={onLogout} className="btn-ghost" style={{ padding: '2px 8px', fontSize: 10 }}>登出</button>
+        <div className="sidebar-footer" style={{ display: 'flex', flexDirection: 'column', gap: 6 }}>
+          <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center' }}>
+            <span className="version" style={{ fontSize: 10 }}>
+              {currentUser?.display_name || currentUser?.username || '未登录'}
+              {currentUser?.is_admin && <span style={{ marginLeft: 4, color: 'var(--accent)' }}>·管理员</span>}
+              {currentUser?.is_advisor && !currentUser?.is_admin && <span style={{ marginLeft: 4, color: 'var(--accent)' }}>·顾问</span>}
+            </span>
+            <button onClick={onLogout} className="btn-ghost" style={{ padding: '2px 8px', fontSize: 10 }}>登出</button>
+          </div>
+          {(currentUser?.is_advisor || currentUser?.is_admin) && allUsers.length > 1 && (
+            <select
+              value={viewAsUser?.id || ''}
+              onChange={e => {
+                const id = e.target.value ? Number(e.target.value) : null
+                setViewAsUser(id ? allUsers.find(u => u.id === id) : null)
+              }}
+              style={{ padding: '2px 4px', fontSize: 10, width: '100%' }}
+              title="切换查看其他用户视图"
+            >
+              <option value="">查看自己</option>
+              {allUsers.filter(u => u.id !== currentUser.id).map(u => (
+                <option key={u.id} value={u.id}>
+                  {u.display_name || u.username}
+                  {u.is_admin ? ' [管]' : u.is_advisor ? ' [顾]' : ''}
+                </option>
+              ))}
+            </select>
+          )}
         </div>
       </aside>
 
       <main className="main-area">
         <header className="topbar">
-          <h2 className="page-title">{TABS.find(t => t.id === activeTab)?.label}</h2>
+          <h2 className="page-title">{visibleTabs.find(t => t.id === activeTab)?.label}</h2>
           <button className="btn-ghost" onClick={refreshAll} disabled={loading}>
             {loading ? '⟳ 加载中' : '⟳ 刷新'}
           </button>
         </header>
+        {viewAsUser && (
+          <div style={{
+            padding: '8px 16px', background: 'var(--accent-soft, #e0e7ff)',
+            borderBottom: '1px solid var(--border)', display: 'flex',
+            justifyContent: 'space-between', alignItems: 'center', fontSize: 12,
+          }}>
+            <span>
+              👀 正在查看 <strong>{viewAsUser.display_name || viewAsUser.username}</strong> 的视图
+              <span style={{ marginLeft: 8, color: 'var(--text-muted)', fontSize: 10 }}>
+                (只读模式 — 写入仍只对 {currentUser?.display_name || currentUser?.username} 生效)
+              </span>
+            </span>
+            <button onClick={() => setViewAsUser(null)} className="btn-ghost" style={{ fontSize: 10, padding: '2px 8px' }}>
+              切回自己
+            </button>
+          </div>
+        )}
         <div className="page-container">
           {renderPage()}
         </div>

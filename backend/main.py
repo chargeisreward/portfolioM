@@ -332,6 +332,15 @@ def auth_me(request: Request, db: Session = Depends(get_db)):
     return {"user": _user_public(u)}
 
 
+@app.get("/api/auth/users")
+def list_users(request: Request, db: Session = Depends(get_db),
+               user: User = Depends(require_advisor)):
+    """返回所有 active 用户（advisor/admin 用 — 用于 view_as 下拉）"""
+    from models import User as U
+    users = db.query(U).filter(U.is_active == True).order_by(U.id).all()
+    return {"users": [_user_public(u) for u in users]}
+
+
 # 给所有受保护端点加依赖
 def _apply_auth_to_routes():
     """遍历 app 路由，给非 auth 端点加 require_auth 依赖"""

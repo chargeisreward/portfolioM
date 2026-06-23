@@ -15,6 +15,11 @@ api.interceptors.request.use((config) => {
   if (token) {
     config.headers['x-session-token'] = token
   }
+  // 注入 view_as（多用户视图代理）
+  const viewAsId = localStorage.getItem('portfoliom_view_as')
+  if (viewAsId) {
+    config.params = { ...(config.params || {}), view_as: viewAsId }
+  }
   return config
 })
 
@@ -109,6 +114,7 @@ export const login = (username, password) => api.post('/auth/login', { username,
 // 兼容旧调用（仅密码 → 旧单密码模式）
 export const loginPasswordOnly = (password) => api.post('/auth/login', { password }).then(r => r.data)
 export const getAuthMe = () => api.get('/auth/me').then(r => r.data)
+export const getUsers = () => api.get('/auth/users').then(r => r.data)
 export const logout = () => api.post('/auth/logout').then(r => r.data)
 
 // ============================================================================

@@ -9,6 +9,7 @@ import SettingsPanel from './components/SettingsPanel'
 import DataBrowser from './components/DataBrowser'
 import StrategiesPanel from './components/StrategiesPanel'
 import AuthGate from './components/AuthGate'
+import OpsPanel from './components/OpsPanel'
 import './App.css'
 
 // SVG path icons (no emoji — per UI UX Pro Max §4)
@@ -140,7 +141,7 @@ export default function App() {
       case 'watch': return <WatchPanel />
       case 'relation': return <div style={{ padding: 40 }}>关联管理（M4 实现）</div>
       case 'data': return <DataBrowser />
-      case 'ops': return <div style={{ padding: 40 }}>运维面板（M3.5 实现）</div>
+      case 'ops': return <OpsPanel />
       case 'dataGap': return <div style={{ padding: 40 }}>数据补足（M5 实现）</div>
       case 'strategies': return <StrategiesPanel />
       case 'settings': return <SettingsPanel />

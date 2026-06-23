@@ -686,7 +686,7 @@ def start_scheduler():
 
     # 任务9：数据补足检测（每日 6:50 — 早于 7:00 财务任务）
     scheduler.add_job(
-        _wrap_job("detect_data_gaps", job_detect_data_gaps),
+        job_detect_data_gaps,
         "cron",
         hour=6,
         minute=50,

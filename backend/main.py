@@ -341,6 +341,147 @@ def list_users(request: Request, db: Session = Depends(get_db),
     return {"users": [_user_public(u) for u in users]}
 
 
+# ==================== 顾问-客户关联 ====================
+
+class RelationCreateIn(BaseModel):
+    advisor_username: str | None = None
+    client_username: str | None = None
+
+
+def _relation_to_dict(rel, current_user_id: int, other_username: str, other_display_name: str | None) -> dict:
+    """序列化为 API 响应。other_user 字段总是非当前用户那一方。"""
+    is_as_advisor = (rel.advisor_user_id == current_user_id)
+    other_user_id = rel.client_user_id if is_as_advisor else rel.advisor_user_id
+    return {
+        "id": rel.id,
+        "advisor_user_id": rel.advisor_user_id,
+        "client_user_id": rel.client_user_id,
+        "other_user_id": other_user_id,
+        "other_username": other_username,
+        "other_display_name": other_display_name,
+        "status": rel.status,
+        "initiator_user_id": rel.initiator_user_id,
+        "created_at": rel.created_at.isoformat() if rel.created_at else None,
+    }
+
+
+@app.get("/api/auth/relations")
+def list_relations(request: Request, db: Session = Depends(get_db),
+                   user: User = Depends(require_user)):
+    """返回当前 user 的所有关联（作为顾问 + 作为客户）"""
+    from models import UserRelation, User as U
+    # 作为顾问（advisor_user_id = me）
+    as_adv = db.query(UserRelation, U).join(
+        U, U.id == UserRelation.client_user_id
+    ).filter(UserRelation.advisor_user_id == user.id).all()
+    # 作为客户（client_user_id = me）
+    as_cli = db.query(UserRelation, U).join(
+        U, U.id == UserRelation.advisor_user_id
+    ).filter(UserRelation.client_user_id == user.id).all()
+
+    out = {"as_advisor": [], "as_client": []}
+    for rel, other in as_adv:
+        out["as_advisor"].append(
+            _relation_to_dict(rel, user.id, other.username, other.display_name)
+        )
+    for rel, other in as_cli:
+        out["as_client"].append(
+            _relation_to_dict(rel, user.id, other.username, other.display_name)
+        )
+    return out
+
+
+@app.post("/api/auth/relations")
+def create_relation(body: RelationCreateIn, request: Request, db: Session = Depends(get_db),
+                    user: User = Depends(require_user)):
+    """发起关联 — 双向预占（PENDING），需对方 confirm → ACTIVE。
+
+    - 用户发起：body.advisor_username = "顾问用户名"
+    - 顾问/管理员发起：body.client_username = "客户用户名"
+    """
+    from models import UserRelation, User as U
+    if body.advisor_username:
+        advisor = db.query(U).filter(
+            U.username == body.advisor_username, U.is_advisor == True, U.is_active == True
+        ).first()
+        if not advisor:
+            raise HTTPException(404, "顾问不存在")
+        advisor_id, client_id = advisor.id, user.id
+    elif body.client_username:
+        client = db.query(U).filter(
+            U.username == body.client_username, U.is_active == True
+        ).first()
+        if not client:
+            raise HTTPException(404, "用户不存在")
+        advisor_id, client_id = user.id, client.id
+        if not (user.is_advisor or user.is_admin):
+            raise HTTPException(403, "只有顾问或管理员能邀请客户")
+    else:
+        raise HTTPException(400, "请提供 advisor_username 或 client_username")
+
+    if advisor_id == client_id:
+        raise HTTPException(400, "不能与自己建立关联")
+
+    existing = db.query(UserRelation).filter(
+        UserRelation.advisor_user_id == advisor_id,
+        UserRelation.client_user_id == client_id,
+    ).first()
+    if existing and existing.status in ("PENDING", "ACTIVE"):
+        return {"status": "exists", "relation_id": existing.id, "current_status": existing.status}
+    if existing and existing.status == "CANCELLED":
+        # 重置
+        existing.status = "PENDING"
+        existing.initiator_user_id = user.id
+        existing.updated_at = datetime.utcnow()
+        db.commit()
+        return {"status": "recreated", "relation_id": existing.id}
+
+    rel = UserRelation(
+        advisor_user_id=advisor_id, client_user_id=client_id,
+        status="PENDING", initiator_user_id=user.id,
+    )
+    db.add(rel); db.commit(); db.refresh(rel)
+    return {"status": "created", "relation_id": rel.id}
+
+
+@app.post("/api/auth/relations/{rel_id}/confirm")
+def confirm_relation(rel_id: int, request: Request, db: Session = Depends(get_db),
+                     user: User = Depends(require_user)):
+    """对方确认 → ACTIVE"""
+    from models import UserRelation
+    rel = db.query(UserRelation).filter(UserRelation.id == rel_id).first()
+    if not rel:
+        raise HTTPException(404, "关联不存在")
+    if user.id not in (rel.advisor_user_id, rel.client_user_id):
+        raise HTTPException(403, "无权操作")
+    if rel.initiator_user_id == user.id:
+        raise HTTPException(400, "不能确认自己发起的关联")
+    if rel.status == "ACTIVE":
+        return {"status": "already_active"}
+    if rel.status == "CANCELLED":
+        raise HTTPException(400, "已取消的关联无法确认")
+    rel.status = "ACTIVE"
+    rel.updated_at = datetime.utcnow()
+    db.commit()
+    return {"status": "active"}
+
+
+@app.post("/api/auth/relations/{rel_id}/cancel")
+def cancel_relation(rel_id: int, request: Request, db: Session = Depends(get_db),
+                    user: User = Depends(require_user)):
+    """任一方取消 → CANCELLED"""
+    from models import UserRelation
+    rel = db.query(UserRelation).filter(UserRelation.id == rel_id).first()
+    if not rel:
+        raise HTTPException(404, "关联不存在")
+    if user.id not in (rel.advisor_user_id, rel.client_user_id) and not user.is_admin:
+        raise HTTPException(403, "无权操作")
+    rel.status = "CANCELLED"
+    rel.updated_at = datetime.utcnow()
+    db.commit()
+    return {"status": "cancelled"}
+
+
 # 给所有受保护端点加依赖
 def _apply_auth_to_routes():
     """遍历 app 路由，给非 auth 端点加 require_auth 依赖"""

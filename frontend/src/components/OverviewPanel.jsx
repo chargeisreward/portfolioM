@@ -45,7 +45,7 @@ export default function OverviewPanel() {
   const [type2Filter, setType2Filter] = useState('all')
   const [kpi, setKpi] = useState(null)        // spec §4.8: real KPI from /api/penetration/kpi
   const [bizDate, setBizDate] = useState(null) // for KPI fetch param
-  const [expandedKpi, setExpandedKpi] = useState(null)  // 'pe' | 'high_growth' | 'midstream' | null
+  const [expandedKpi, setExpandedKpi] = useState(null)  // 'pe' | 'daily_change' | 'tech_weight' | null
   const [kpiWindow, setKpiWindow] = useState(90)
 
   useEffect(() => {
@@ -232,6 +232,16 @@ export default function OverviewPanel() {
 
   const topHoldings = penTable.slice(0, 10)
 
+  // 前 10 大底层持仓（穿透 + 未穿透，仅股票，按前收盘口径）—— 覆盖默认 penTable.slice(0,10)
+  // 数据源：/api/penetration/top10-holdings，与 OverviewPanel chip 区口径一致
+  const [top10Api, setTop10Api] = useState(null)  // { items: [...], prev_close_date, candidates_total }
+  useEffect(() => {
+    if (!bizDate) return
+    api.getTop10Holdings(bizDate, 10)
+      .then(d => setTop10Api(d || null))
+      .catch(() => setTop10Api(null))
+  }, [bizDate])
+
   // 类型1：按显示短标签去重（同名 label 合并，如 A股基 = a_share_equity ∪ a_share_etf）
   const type1Labels = [...new Set(displayHoldings.map(h => CAT_SHORT[h.asset_type] || h.asset_type).filter(Boolean))]
 
@@ -283,18 +293,35 @@ export default function OverviewPanel() {
         <div className="kpi-card" style={{ cursor: 'pointer' }} onClick={() => setExpandedKpi(prev => prev === 'pe' ? null : 'pe')}>
           <div className="kpi-label">组合PE {expandedKpi === 'pe' ? '▼' : '▸'}</div>
           <div className="kpi-value">{(kpi?.portfolio_pe_weighted ?? pe.portfolio_weighted_pe)?.toFixed(1)||'—'}</div>
-          <div className="kpi-sub">300: {pe.csi300_pe?.toFixed(1)||'—'}</div>
+          <div className="kpi-sub">300: {(kpi?.csi300_pe ?? pe.csi300_pe)?.toFixed(1) || '—'}</div>
         </div>
-        <div className="kpi-card" style={{ cursor: 'pointer' }} onClick={() => setExpandedKpi(prev => prev === 'high_growth' ? null : 'high_growth')}>
-          <div className="kpi-label">高增长% {expandedKpi === 'high_growth' ? '▼' : '▸'}</div>
-          <div className="kpi-value kpi-up">{(kpi?.high_growth_weight_pct ?? growth.portfolio?.high)?.toFixed(1)||'—'}%</div>
-          <div className="kpi-sub">300: {growth.csi300?.high?.toFixed(1)||'—'}%</div>
+        <div className="kpi-card" style={{ cursor: 'pointer' }} onClick={() => setExpandedKpi(prev => prev === 'daily_change' ? null : 'daily_change')}>
+          <div className="kpi-label">当日涨幅 {expandedKpi === 'daily_change' ? '▼' : '▸'}</div>
+          <div className="kpi-value" style={{
+            color: kpi?.daily_change_pct == null ? undefined
+                   : (kpi.daily_change_pct > 0 ? 'var(--up)'
+                   : kpi.daily_change_pct < 0 ? 'var(--down)' : undefined),
+            fontWeight: 600,
+          }}>
+            {kpi?.daily_change_pct != null
+              ? (kpi.daily_change_pct > 0 ? '+' : '') + kpi.daily_change_pct.toFixed(2) + '%'
+              : '—'}
+          </div>
+          <div className="kpi-sub" style={{ fontSize: 10 }}>
+            {kpi?.daily_change_breakdown?.prev_trade_date
+              ? `vs ${kpi.daily_change_breakdown.prev_trade_date} 收盘`
+              : '未加载'}
+          </div>
         </div>
         <div className="kpi-card"><div className="kpi-label">Forecast PE</div><div className="kpi-value">{pe.portfolio_forecast_pe_1y?.toFixed(1)||'—'}</div><div className="kpi-sub">1年后预期</div></div>
-        <div className="kpi-card" style={{ cursor: 'pointer' }} onClick={() => setExpandedKpi(prev => prev === 'midstream' ? null : 'midstream')}>
-          <div className="kpi-label">中游占比 {expandedKpi === 'midstream' ? '▼' : '▸'}</div>
-          <div className="kpi-value">{kpi?.midstream_weight_pct != null ? kpi.midstream_weight_pct.toFixed(1) + '%' : '—'}</div>
-          <div className="kpi-sub">{kpi ? '来自聚合表' : '未加载'}</div>
+        <div className="kpi-card" style={{ cursor: 'pointer' }} onClick={() => setExpandedKpi(prev => prev === 'tech_weight' ? null : 'tech_weight')}>
+          <div className="kpi-label">科技占比 {expandedKpi === 'tech_weight' ? '▼' : '▸'}</div>
+          <div className="kpi-value">{kpi?.tech_weight_pct != null ? kpi.tech_weight_pct.toFixed(1) + '%' : '—'}</div>
+          <div className="kpi-sub" style={{ fontSize: 10 }}>
+            {kpi?.tech_weight_breakdown
+              ? `新兴 ${(kpi.tech_weight_breakdown.emerging_cny/10000).toFixed(0)}w + 美科 ${(kpi.tech_weight_breakdown.us_tech_cny/10000).toFixed(0)}w`
+              : '未加载'}
+          </div>
         </div>
       </div>
 
@@ -303,8 +330,8 @@ export default function OverviewPanel() {
           <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', marginBottom: 8 }}>
             <span className="section-title">
               {expandedKpi === 'pe' ? '组合PE 序时' :
-               expandedKpi === 'high_growth' ? '高增长占比 序时' :
-               expandedKpi === 'midstream' ? '中游占比 序时' : ''}
+               expandedKpi === 'daily_change' ? '当日涨幅 序时' :
+               expandedKpi === 'tech_weight' ? '科技占比 序时' : ''}
             </span>
             <div style={{ display: 'flex', gap: 6, alignItems: 'center' }}>
               <select value={kpiWindow} onChange={e => setKpiWindow(Number(e.target.value))}>
@@ -317,7 +344,7 @@ export default function OverviewPanel() {
           </div>
           <MetricTimeseriesChart metric="pe_weighted" window={kpiWindow} scope="both" />
           <div style={{ fontSize: 11, color: 'var(--text-muted)', marginTop: 4 }}>
-            高增长/中游占比的序时口径暂统一展示 PE 序时（其他维度需 future 计算）
+            当日涨幅/科技占比的序时口径暂统一展示 PE 序时（其他维度需 future 计算）
           </div>
         </div>
       )}
@@ -406,15 +433,34 @@ export default function OverviewPanel() {
 
       {/* Top Holdings Chips */}
       <div className="raised">
-        <div className="section-title">前10大底层持仓</div>
+        <div style={{display:'flex',justifyContent:'space-between',alignItems:'baseline',marginBottom:6}}>
+          <div className="section-title" style={{marginBottom:0}}>前10大底层持仓</div>
+          <span style={{fontSize:10,color:'var(--text-muted)',fontFamily:'"GeistMono",monospace'}}>
+            {top10Api?.prev_close_date
+              ? `按 ${top10Api.prev_close_date} 前收 · ${top10Api.candidates_total} 候选`
+              : '加载中…'}
+          </span>
+        </div>
         <div style={{display:'flex',flexWrap:'wrap',gap:6}}>
-          {topHoldings.filter(r => r.stock_name && !r.stock_code.includes('.OF')).map(r => (
-            <div key={r.stock_code} className="chip">
-              <span>{r.stock_name}</span>
-              <span className="pct">{r.penetration_weight.toFixed(1)}%</span>
-              <span className="pe">PE {r.ttm_pe?.toFixed(1)||'-'}</span>
-            </div>
-          ))}
+          {(() => {
+            // 优先用 top10Api（穿透 + 未穿透，股票，前收口径）；
+            // 加载失败 / 业务日期未就绪时回退到旧 penTable.slice(0,10)。
+            const rows = top10Api?.items?.length
+              ? top10Api.items.map(r => ({
+                  stock_code: r.stock_code,
+                  stock_name: r.stock_name,
+                  penetration_weight: r.weight_pct,   // 字段名沿用 chip UI 兼容
+                  ttm_pe: r.pe_ttm,
+                }))
+              : topHoldings.filter(r => r.stock_name && !r.stock_code.includes('.OF'));
+            return rows.map(r => (
+              <div key={r.stock_code} className="chip">
+                <span>{r.stock_name}</span>
+                <span className="pct">{r.penetration_weight.toFixed(1)}%</span>
+                <span className="pe">PE {r.ttm_pe?.toFixed(1)||'-'}</span>
+              </div>
+            ));
+          })()}
         </div>
       </div>
 

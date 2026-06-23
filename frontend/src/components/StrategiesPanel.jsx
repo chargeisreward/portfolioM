@@ -26,6 +26,10 @@ export default function StrategiesPanel() {
   const [previewLimit, setPreviewLimit] = useState(20)
   const [preview, setPreview] = useState({ table: '', rows: [], total_rows: 0 })
   const [previewErr, setPreviewErr] = useState(null)
+  // ---- 代码映射覆盖率（pre-flight）----
+  const [coverage, setCoverage] = useState(null)
+  const [coveragePool, setCoveragePool] = useState('all')
+  const [coverageErr, setCoverageErr] = useState(null)
 
   useEffect(() => {
     api.getStrategies()
@@ -69,6 +73,15 @@ export default function StrategiesPanel() {
       .catch(e => { if (mounted) setPreviewErr('预览加载失败：' + (e?.message || e)) })
     return () => { mounted = false }
   }, [previewTable, previewStock, previewLimit])
+
+  // 代码映射覆盖率：手动 / 池变化时拉取（不轮询 — 大查询）
+  const loadCoverage = (pool) => {
+    setCoverageErr(null)
+    api.getCodeMapCoverage(pool || 'all')
+      .then(d => setCoverage(d))
+      .catch(e => setCoverageErr('覆盖率加载失败：' + (e?.message || e)))
+  }
+  useEffect(() => { loadCoverage(coveragePool) }, [coveragePool])
 
   const triggerJob = (jobId) => {
     setTriggerMsg(`已排队 ${jobId}，请稍候 5-10s 后刷新查看 last_run_at`)
@@ -114,7 +127,7 @@ export default function StrategiesPanel() {
             <tr>
               <th>ID</th>
               <th>名称</th>
-              <th>类型</th>
+              <th style={{ minWidth: 96 }}>类型</th>
               <th>数据</th>
               <th>覆盖</th>
               <th>限流</th>
@@ -130,7 +143,7 @@ export default function StrategiesPanel() {
                     {fileFunc(s)}
                   </div>
                 </td>
-                <td><span className="cur-btn on" style={{ fontSize: 10 }}>{s.type}</span></td>
+                <td style={{ minWidth: 96 }}><span className="cur-btn on" style={{ fontSize: 10 }}>{s.type}</span></td>
                 <td style={{ fontSize: 11, color: 'var(--text-secondary)' }}>{s.data_type}</td>
                 <td style={{ fontSize: 11 }}>
                   {s.covers?.map(c => (
@@ -238,6 +251,90 @@ export default function StrategiesPanel() {
             )}
           </tbody>
         </table>
+      </div>
+
+      {/* ========== 代码映射覆盖率（定时拉取前预检） ========== */}
+      <div className="raised">
+        <div className="section-title">
+          代码映射覆盖率 ·
+          {coverage ? (
+            coverage.health === 'ok'
+              ? <span style={{ color: 'var(--up)' }}> ✓ 全部映射完成</span>
+              : <span style={{ color: 'var(--down)' }}> ⚠ {coverage.total_missing} 个未映射</span>
+          ) : ' 加载中…'}
+        </div>
+        <div style={{ fontSize: 10, color: 'var(--text-muted)', marginBottom: 8 }}>
+          三个证券池（持仓 / 关注 / 已下钻）× 五个候选 API 策略的代码映射完整性检查。
+          定时拉取任务（realtime_prices / fill_snapshot_gaps_smart / backfill_gaps）开始前会先跑这个检查，发现缺失记录到 _JOB_LAST_RUN.last_result。
+          数据源：<code style={{ fontFamily: '"GeistMono", monospace' }}>GET /api/code-map/coverage</code>
+        </div>
+        <div style={{ display: 'flex', gap: 4, flexWrap: 'wrap', marginBottom: 8, alignItems: 'center' }}>
+          <span style={{ fontSize: 11, color: 'var(--text-muted)', marginRight: 4 }}>池</span>
+          {['all', 'holdings', 'watchlist', 'drilled'].map(p => (
+            <button key={p} onClick={() => setCoveragePool(p)}
+              className={coveragePool === p ? 'cur-btn on' : 'cur-btn'} style={{ fontSize: 10 }}>{p}</button>
+          ))}
+          <button onClick={() => loadCoverage(coveragePool)}
+            className="cur-btn" style={{ fontSize: 10, marginLeft: 8 }}>↻ 重新检查</button>
+          <span style={{ fontSize: 10, color: 'var(--text-muted)', marginLeft: 8 }}>
+            上次检查：{coverage ? (coverage.checked_at || '—') : '—'}
+          </span>
+        </div>
+        {coverageErr && (
+          <div style={{ fontSize: 11, color: 'var(--down)', marginBottom: 8 }}>{coverageErr}</div>
+        )}
+        <table className="data-table">
+          <thead>
+            <tr>
+              <th>池</th>
+              <th style={{ textAlign: 'right' }}>证券数</th>
+              <th style={{ textAlign: 'right' }}>映射条目</th>
+              <th style={{ textAlign: 'right' }}>已映射</th>
+              <th style={{ textAlign: 'right' }}>未映射</th>
+              <th>未映射示例</th>
+            </tr>
+          </thead>
+          <tbody>
+            {(coverage?.pools || []).map(p => (
+              <tr key={p.name} style={p.missing > 0 ? { borderLeft: '2px solid var(--down)' } : { borderLeft: '2px solid var(--up)' }}>
+                <td style={{ fontSize: 11, fontWeight: 600 }}>{p.name}</td>
+                <td style={{ fontFamily: '"GeistMono", monospace', fontSize: 11, textAlign: 'right' }}>{p.total_codes}</td>
+                <td style={{ fontFamily: '"GeistMono", monospace', fontSize: 11, textAlign: 'right', color: 'var(--text-muted)' }}>{p.rows_count}</td>
+                <td style={{ fontFamily: '"GeistMono", monospace', fontSize: 11, textAlign: 'right', color: 'var(--up)' }}>{p.mapped}</td>
+                <td style={{
+                  fontFamily: '"GeistMono", monospace', fontSize: 11, textAlign: 'right',
+                  color: p.missing > 0 ? 'var(--down)' : 'var(--text-muted)',
+                  fontWeight: p.missing > 0 ? 600 : 400,
+                }}>{p.missing}</td>
+                <td style={{ fontFamily: '"GeistMono", monospace', fontSize: 10, color: 'var(--text-secondary)' }}>
+                  {p.missing_examples.length === 0
+                    ? <span style={{ color: 'var(--text-muted)' }}>—</span>
+                    : p.missing_examples.map((ex, i) => (
+                        <span key={i} style={{
+                          display: 'inline-block', padding: '1px 5px', margin: '0 3px 2px 0',
+                          border: '1px solid var(--down)', color: 'var(--down)',
+                          borderRadius: 3,
+                        }}>
+                          {ex.code} → {ex.api}
+                        </span>
+                      ))}
+                  {p.rows_truncated && (
+                    <span style={{ marginLeft: 6, color: 'var(--text-muted)' }}>(rows 截断显示前 500 行)</span>
+                  )}
+                </td>
+              </tr>
+            ))}
+            {!coverage && (
+              <tr><td colSpan={6} style={{ textAlign: 'center', color: 'var(--text-muted)', fontSize: 11, padding: 12 }}>加载中…</td></tr>
+            )}
+          </tbody>
+        </table>
+        {coverage && coverage.total_missing > 0 && (
+          <div style={{ fontSize: 10, color: 'var(--down)', marginTop: 8, fontFamily: '"GeistMono", monospace' }}>
+            ⚠ 修复方法：在 <code>backend/services/code_map.py</code> 的 _default_transform 加规则，或调用
+            <code style={{ marginLeft: 4 }}>POST /api/code-map</code> 手动补映射。
+          </div>
+        )}
       </div>
 
       {/* ========== 调度任务实时状态 ========== */}

@@ -104,10 +104,13 @@ def job_fetch_realtime_prices(force: bool = False):
         from services.importer import _fetch_fund_nav
         from services.trading_calendar import is_any_market_open_today
 
+        # Pre-flight：持仓代码映射覆盖率（不阻塞，记录到 last_result）
+        preflight = _run_code_map_preflight(db, pools=("holdings",))
+
         holdings = db.query(Holding).all()
         if not holdings:
             logger.info("无持仓记录，跳过行情抓取")
-            return
+            return {"skipped": "no_holdings", "preflight": preflight}
 
         today = date.today()
         # 日历门控：今日无任何市场开市（CN/HK/US）→ 跳过（force 强制仍跑）
@@ -115,7 +118,7 @@ def job_fetch_realtime_prices(force: bool = False):
             try:
                 if not is_any_market_open_today(db):
                     logger.info("今日全市场休市（日历），跳过实时拉取")
-                    return
+                    return {"skipped": "all_markets_closed", "preflight": preflight}
             except Exception as e:
                 logger.warning("日历门控失败，继续执行: %s", e)
 
@@ -172,10 +175,16 @@ def job_fetch_realtime_prices(force: bool = False):
 
         db.commit()
         logger.info("行情抓取完成，更新 %d/%d 只持仓", updated, len(holdings))
+        return {
+            "holdings_total": len(holdings),
+            "updated": updated,
+            "preflight": preflight,
+        }
 
     except Exception as e:
         logger.error("行情抓取任务异常: %s", e, exc_info=True)
         db.rollback()
+        raise
     finally:
         db.close()
 
@@ -453,6 +462,33 @@ def job_backfill_gaps(days: int = 90):
 
 # ---------- 调度器启停 ----------
 
+def _run_code_map_preflight(db: Session, pools: tuple[str, ...] = ("holdings", "drilled")) -> dict:
+    """代码映射覆盖率 pre-flight（在 fetch 任务前调用，记录缺失而非阻塞）。
+
+    返回 summary dict — caller 负责写入 _JOB_LAST_RUN 字段供前端展示。
+    即使有 missing 也不抛异常：避免一条规则缺失导致整批抓取停摆。
+    """
+    try:
+        from scripts.check_code_map_coverage import run as coverage_run
+        reports, summary = coverage_run(list(pools))
+        total_missing = summary.get("total_missing", 0)
+        if total_missing > 0:
+            examples = []
+            for p in summary.get("pools", []):
+                for ex in p.get("missing_examples", [])[:3]:
+                    examples.append(f"{p['name']}/{ex['code']}/{ex['api']}")
+            logger.warning(
+                "pre-flight 代码映射缺失 %d 条（%s）— 拉取时这些 code 可能失败，请补 _default_transform",
+                total_missing, ", ".join(examples[:6]),
+            )
+        else:
+            logger.info("pre-flight 代码映射覆盖率 OK（%d 池全部 mapped）", len(pools))
+        return summary
+    except Exception as e:
+        logger.warning("pre-flight 覆盖率检查失败（非阻塞）: %s", e)
+        return {"error": str(e)[:300], "preflight_skipped": True}
+
+
 @track_run("fill_snapshot_gaps_smart")
 def job_fill_snapshot_gaps_smart(days: int = 15, force: bool = False):
     """Smart Gap-Fill：扫描 snapshot 表所有股票过去 N 个交易日的 PriceCache 缺口，
@@ -466,11 +502,16 @@ def job_fill_snapshot_gaps_smart(days: int = 15, force: bool = False):
       - force=True 跳过 is_any_market_open_today 门控
 
     时机：每日 06:00 + 20:00（cron），覆盖美股昨日收盘 + A/H 股当日收盘。
+
+    入口先跑代码映射 pre-flight：记录 missing 到 last_result，不阻塞执行。
     """
     from services.price_filler import fill_snapshot_gaps_smart
 
     db = SessionLocal()
     try:
+        # Pre-flight：检查持仓 + 下钻池的代码映射完整性
+        preflight = _run_code_map_preflight(db, pools=("holdings", "drilled"))
+
         if not force:
             try:
                 from services.trading_calendar import is_any_market_open_today
@@ -479,7 +520,7 @@ def job_fill_snapshot_gaps_smart(days: int = 15, force: bool = False):
                         "全市场休市（昨天是周末/节假日），跳过 snapshot 补缺；"
                         "force=True 可绕过"
                     )
-                    return {"skipped": "all_markets_closed"}
+                    return {"skipped": "all_markets_closed", "preflight": preflight}
             except Exception as e:
                 logger.warning("日历门控失败，继续执行: %s", e)
 
@@ -494,6 +535,7 @@ def job_fill_snapshot_gaps_smart(days: int = 15, force: bool = False):
             result["api_breakdown"],
             result["elapsed_seconds"],
         )
+        result["preflight"] = preflight
         return result
     except Exception as e:
         logger.error("snapshot gap-fill 异常: %s", e, exc_info=True)

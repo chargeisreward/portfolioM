@@ -95,6 +95,10 @@ export const getCalendarRange = (market, start, end) => api.get('/calendar', { p
 
 // API code map
 export const getCodeMaps = (apiStrategy) => api.get('/code-map', { params: apiStrategy ? { api: apiStrategy } : {} }).then(r => r.data)
+export const getCodeMapCoverage = (pool = 'all', apiStrategy = null) =>
+  api.get('/code-map/coverage', {
+    params: { pool, ...(apiStrategy ? { api: apiStrategy } : {}) },
+  }).then(r => r.data)
 
 // Trend
 export const getTrend = (days = 90, target = 'CNY') => api.get('/trend', { params: { days, target } }).then(r => r.data)
@@ -129,5 +133,6 @@ export const getDrillableIndices = (asOfDate) => api.get('/penetration/drillable
 export const getIndexDrill = (indexCode, asOfDate) => api.get('/penetration/index-drill', { params: { index_code: indexCode, as_of_date: asOfDate } }).then(r => r.data)
 export const getAllDrilledStocks = (asOfDate) => api.get('/penetration/all-drilled-stocks', { params: { as_of_date: asOfDate } }).then(r => r.data)
 export const getFullHoldingTable = (asOfDate) => api.get('/penetration/full-holding-table', { params: { as_of_date: asOfDate } }).then(r => r.data)
+export const getTop10Holdings = (asOfDate, limit = 10) => api.get('/penetration/top10-holdings', { params: { as_of_date: asOfDate, limit } }).then(r => r.data)
 export const getDimensionDrilled = (dim, asOfDate, market = 'A+H') => api.get('/penetration/dimension-drilled', { params: { dim, as_of_date: asOfDate, market } }).then(r => r.data)
 export const getLatestExchangeRates = () => api.get('/exchange-rates/latest').then(r => r.data)

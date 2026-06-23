@@ -341,6 +341,93 @@ def list_users(request: Request, db: Session = Depends(get_db),
     return {"users": [_user_public(u) for u in users]}
 
 
+# ==================== 数据补足（admin） ====================
+
+@app.get("/api/data-gap/report")
+def data_gap_report(
+    gap_type: str | None = None,
+    status: str = "OPEN",
+    user: User = Depends(require_admin),
+    db: Session = Depends(get_db),
+):
+    """列出数据缺口（按 gap_type / status 过滤）"""
+    from models import DataGapReport
+    q = db.query(DataGapReport)
+    if gap_type:
+        q = q.filter(DataGapReport.gap_type == gap_type)
+    if status:
+        q = q.filter(DataGapReport.status == status)
+    items = q.order_by(DataGapReport.detected_at.desc()).limit(500).all()
+    return {
+        "items": [{
+            "id": g.id,
+            "user_id": g.user_id,
+            "gap_type": g.gap_type,
+            "stock_code": g.stock_code,
+            "index_code": g.index_code,
+            "as_of_date": g.as_of_date.isoformat() if g.as_of_date else None,
+            "description": g.description,
+            "status": g.status,
+            "detected_at": g.detected_at.isoformat() if g.detected_at else None,
+        } for g in items],
+        "counts": {
+            "OPEN": db.query(DataGapReport).filter(DataGapReport.status == "OPEN").count(),
+            "FIXED": db.query(DataGapReport).filter(DataGapReport.status == "FIXED").count(),
+        }
+    }
+
+
+@app.post("/api/data-gap/fix/{gap_id}")
+def fix_data_gap(
+    gap_id: int,
+    user: User = Depends(require_admin),
+    db: Session = Depends(get_db),
+):
+    """标记某个缺口为 FIXED。index_constituent 类型尝试触发抓取。"""
+    from models import DataGapReport
+    g = db.query(DataGapReport).filter(DataGapReport.id == gap_id).first()
+    if not g:
+        raise HTTPException(404, "缺口记录不存在")
+    if g.gap_type == "index_constituent" and g.index_code and g.as_of_date:
+        try:
+            from crawlers.index_constituents import crawl_constituents
+            crawl_constituents(g.index_code, db, as_of_date=g.as_of_date)
+        except Exception as e:
+            import logging
+            logging.getLogger(__name__).warning("crawl_constituents failed for %s: %s", g.index_code, e)
+    g.status = "FIXED"
+    g.resolved_at = datetime.utcnow()
+    db.commit()
+    return {"status": "fixed", "id": g.id}
+
+
+@app.post("/api/data-gap/index-classification")
+def set_index_classification(
+    body: dict,
+    user: User = Depends(require_admin),
+    db: Session = Depends(get_db),
+):
+    """设置指数分类。body: {index_code, index_name?, category, theme?, benchmark_formula?}"""
+    from models import IndexClassification
+    code = body.get("index_code")
+    if not code:
+        raise HTTPException(400, "index_code 必填")
+    cls = db.query(IndexClassification).filter(IndexClassification.index_code == code).first()
+    if not cls:
+        cls = IndexClassification(index_code=code)
+        db.add(cls)
+    if body.get("index_name"):
+        cls.index_name = body["index_name"]
+    if body.get("category"):
+        cls.category = body["category"]
+    if body.get("theme"):
+        cls.theme = body["theme"]
+    if body.get("benchmark_formula"):
+        cls.benchmark_formula = body["benchmark_formula"]
+    db.commit()
+    return {"status": "ok"}
+
+
 # ==================== 顾问-客户关联 ====================
 
 class RelationCreateIn(BaseModel):

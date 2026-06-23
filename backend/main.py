@@ -20,6 +20,7 @@ from schemas import (
     SecurityTypeConfigOut, SecurityTypeConfigUpsert,
 )
 from services.importer import import_excel, get_holdings_summary
+from middleware.auth import require_user, require_advisor, require_admin
 from services.penetration import PenetrationEngine
 from services.growth_bucketer import GrowthBucketer, IndustryChainAnalyzer
 from services.csi300 import Csi300Analyzer
@@ -532,14 +533,28 @@ def shutdown():
 # ==================== 持仓 ====================
 
 @app.get("/api/holdings", response_model=list[HoldingOut])
-def list_holdings(db: Session = Depends(get_db)):
+def list_holdings(
+    request: Request,
+    view_as: int | None = None,
+    user: User = Depends(require_user),
+    db: Session = Depends(get_db),
+):
     from models import Holding as HoldingModel
-    return db.query(HoldingModel).all()
+    from middleware.auth import _resolve_eff_from_request
+    _u, eff_uid = _resolve_eff_from_request(request, db)
+    return db.query(HoldingModel).filter(HoldingModel.user_id == eff_uid).all()
 
 
 @app.get("/api/holdings/summary", response_model=HoldingSummary)
-def holdings_summary(db: Session = Depends(get_db)):
-    return get_holdings_summary(db)
+def holdings_summary(
+    request: Request,
+    view_as: int | None = None,
+    user: User = Depends(require_user),
+    db: Session = Depends(get_db),
+):
+    from middleware.auth import _resolve_eff_from_request
+    _u, eff_uid = _resolve_eff_from_request(request, db)
+    return get_holdings_summary(db, user_id=eff_uid)
 
 
 # ==================== 证券基础表 ====================
@@ -1309,14 +1324,18 @@ def admin_backfill_prices(days: int = 90, db: Session = Depends(get_db)):
 
 
 @app.post("/api/holdings/import", response_model=CrawlResponse)
-def import_holdings(req: ImportRequest, db: Session = Depends(get_db)):
-    """从Excel导入持仓"""
+def import_holdings(
+    req: ImportRequest,
+    user: User = Depends(require_user),
+    db: Session = Depends(get_db),
+):
+    """从Excel导入持仓（按 user 隔离；只删/只写自己 user 的）"""
     xlsx_files = list(DATA_DIR.glob("*.xlsx")) + list(DATA_DIR.glob("*.xls"))
     if not xlsx_files:
         return CrawlResponse(status="error", message="No Excel files found in project root")
 
     filepath = str(xlsx_files[0])
-    count = import_excel(filepath, db)
+    count = import_excel(filepath, db, user_id=user.id)
     return CrawlResponse(status="ok", message=f"Imported {count} holdings", count=count)
 
 
@@ -2220,25 +2239,47 @@ def _enrich_watch_row(w, db) -> dict:
 
 
 @app.get("/api/watchlist")
-def list_watchlist(db: Session = Depends(get_db)):
-    """获取关注清单（带实时行情补全）"""
+def list_watchlist(
+    request: Request,
+    view_as: int | None = None,
+    user: User = Depends(require_user),
+    db: Session = Depends(get_db),
+):
+    """获取关注清单（带实时行情补全）— 按 user 隔离"""
     from models import Watchlist
-    rows = db.query(Watchlist).order_by(Watchlist.added_at.desc()).all()
+    from middleware.auth import _resolve_eff_from_request
+    _u, eff_uid = _resolve_eff_from_request(request, db)
+    rows = db.query(Watchlist).filter(
+        Watchlist.user_id == eff_uid
+    ).order_by(Watchlist.added_at.desc()).all()
     return [_enrich_watch_row(r, db) for r in rows]
 
 
 @app.post("/api/watchlist")
-def add_watchlist(req: WatchAddRequest, db: Session = Depends(get_db)):
-    """添加关注。code 任意合法证券代码；后端拉一次行情回填 name/market/industry"""
+def add_watchlist(
+    req: WatchAddRequest,
+    request: Request,
+    user: User = Depends(require_user),
+    db: Session = Depends(get_db),
+):
+    """添加关注。code 任意合法证券代码；后端拉一次行情回填 name/market/industry。
+    写入当前 user（不写入 view_as 目标 — 视图代理只读不写）。
+    """
     from models import Watchlist
     from crawlers.price_data import fetch_tencent_quote
+    from middleware.auth import _resolve_eff_from_request
+    _u, eff_uid = _resolve_eff_from_request(request, db)
+    # 写入始终对自己（user.id），不是 view_as
+    write_uid = user.id
 
     code = req.code.strip().upper()
     if not code:
         return {"status": "error", "message": "code 不能为空"}
 
-    # 查重
-    if db.query(Watchlist).filter(Watchlist.code == code).first():
+    # 查重（按 user_id 隔离）
+    if db.query(Watchlist).filter(
+        Watchlist.user_id == write_uid, Watchlist.code == code
+    ).first():
         return {"status": "error", "message": f"{code} 已在关注清单"}
 
     # 拉行情回填 name/industry
@@ -2253,6 +2294,7 @@ def add_watchlist(req: WatchAddRequest, db: Session = Depends(get_db)):
         market = "A股"
 
     w = Watchlist(
+        user_id=write_uid,
         code=code,
         name=name,
         market=market,
@@ -2266,10 +2308,17 @@ def add_watchlist(req: WatchAddRequest, db: Session = Depends(get_db)):
 
 
 @app.delete("/api/watchlist/{code}")
-def remove_watchlist(code: str, db: Session = Depends(get_db)):
-    """移除关注"""
+def remove_watchlist(
+    code: str,
+    request: Request,
+    user: User = Depends(require_user),
+    db: Session = Depends(get_db),
+):
+    """移除关注（仅删自己 user 的）"""
     from models import Watchlist
-    w = db.query(Watchlist).filter(Watchlist.code == code).first()
+    w = db.query(Watchlist).filter(
+        Watchlist.user_id == user.id, Watchlist.code == code
+    ).first()
     if not w:
         return {"status": "error", "message": f"{code} 不在关注清单"}
     db.delete(w)

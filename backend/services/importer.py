@@ -32,17 +32,19 @@ def guess_asset_type(code: str) -> str:
     return AssetType.CASH.value
 
 
-def import_excel(filepath: str, db: Session, batch: str | None = None) -> int:
+def import_excel(filepath: str, db: Session, batch: str | None = None, user_id: int = 1) -> int:
     """
     Import holdings from Excel, deduplicating same code+quantity rows.
     Fund 'amount' is stored as quantity (份额).
     Adds price and calculates amount = quantity × price.
+
+    user_id: 隔离持仓（多用户升级）。只删该 user 的旧持仓。
     """
     if batch is None:
         batch = datetime.utcnow().strftime("%Y%m%d%H%M%S")
 
-    # Delete old holdings for this import
-    db.query(Holding).delete()
+    # Delete old holdings for this user（仅删自己的，不影响其他 user）
+    db.query(Holding).filter(Holding.user_id == user_id).delete()
 
     wb = load_workbook(filepath, data_only=True)
     ws = wb[wb.sheetnames[0]]
@@ -76,6 +78,7 @@ def import_excel(filepath: str, db: Session, batch: str | None = None) -> int:
             continue  # skip duplicate
 
         dedup[key] = {
+            "user_id": user_id,
             "security_code": code,
             "security_name": name,
             "quantity": quantity,
@@ -239,10 +242,16 @@ def fill_prices(db: Session):
     return updated
 
 
-def get_holdings_summary(db: Session) -> dict:
-    """Get portfolio summary by asset category"""
+def get_holdings_summary(db: Session, user_id: int | None = None) -> dict:
+    """Get portfolio summary by asset category.
+
+    user_id 隔离：传 None 时返回所有（兼容旧调用；不建议用于受保护端点）。
+    """
     from sqlalchemy import func
-    rows = db.query(
+    q = db.query(Holding)
+    if user_id is not None:
+        q = q.filter(Holding.user_id == user_id)
+    rows = q.with_entities(
         Holding.asset_type,
         func.sum(Holding.amount).label("total")
     ).group_by(Holding.asset_type).all()
@@ -254,7 +263,7 @@ def get_holdings_summary(db: Session) -> dict:
         categories[r.asset_type] = v
         total += v
 
-    fund_count = db.query(Holding).filter(
+    fund_count = q.filter(
         Holding.asset_type.in_([
             AssetType.A_SHARE_EQUITY.value, AssetType.A_SHARE_ETF.value,
             AssetType.HK_EQUITY.value, AssetType.QDII_EQUITY.value,
@@ -262,7 +271,7 @@ def get_holdings_summary(db: Session) -> dict:
         ])
     ).count()
 
-    stock_count = db.query(Holding).filter(
+    stock_count = q.filter(
         Holding.asset_type == AssetType.US_STOCK.value
     ).count()
 

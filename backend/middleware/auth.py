@@ -79,3 +79,37 @@ def get_effective_user_id(
     if not target:
         raise HTTPException(404, "目标用户不存在")
     return target.id
+
+
+def _resolve_eff_from_request(request: Request, db: Session) -> tuple[User, int]:
+    """从 request.state.user + view_as query 解析 (user, effective_user_id)。
+    假设 middleware 已注入 user；不抛 401（应已被 require_user 校验）。
+    """
+    u = getattr(request.state, "user", None)
+    view_as_raw = request.query_params.get("view_as")
+    view_as_id: Optional[int] = None
+    if view_as_raw:
+        try:
+            view_as_id = int(view_as_raw)
+        except (TypeError, ValueError):
+            view_as_id = None
+    eff_uid = get_effective_user_id(request, view_as_id, u, db) if u else None
+    return u, eff_uid
+
+
+def effective_user_dep(
+    request: Request,
+    user: User = None,  # 强制 require_user 先行
+    db: Session = None,
+):
+    """FastAPI dependency 包装器: 调用时同时 require_user + get_db。
+
+    用法:
+        def my_endpoint(
+            eff = Depends(effective_user_dep),
+        ):
+            u, eff_uid = eff
+    """
+    # FastAPI 会先把 user 和 db 注入 — 但作为顶层 dep，user/db 是 Depends 参数
+    # 此处 user/db 实际由 require_user + get_db 注入；调用方应显式依赖
+    return _resolve_eff_from_request(request, db)

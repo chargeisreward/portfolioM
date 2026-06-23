@@ -1,8 +1,12 @@
 """SQLAlchemy ORM models for PortfolioM"""
 from datetime import date, datetime
 from sqlalchemy import Column, Integer, Float, String, Date, DateTime, Text, JSON, Boolean, UniqueConstraint, BigInteger, ForeignKey
+from sqlalchemy.dialects.sqlite import INTEGER as SQLITE_INTEGER
 from database import Base
 import enum
+
+# BigInteger 在 SQLite 上需降级为 INTEGER 才能触发 autoincrement
+BigIntPK = BigInteger().with_variant(SQLITE_INTEGER, "sqlite")
 
 
 class AssetType(str, enum.Enum):
@@ -807,7 +811,7 @@ class AnalystIndustryChainCompany(Base):
 
 class User(Base):
     __tablename__ = "users"
-    id = Column(BigInteger, primary_key=True, autoincrement=True)
+    id = Column(BigIntPK, primary_key=True, autoincrement=True)
     username = Column(String(64), unique=True, nullable=False, index=True)
     password_hash = Column(String(255), nullable=False)
     display_name = Column(String(64), nullable=True)
@@ -821,7 +825,7 @@ class User(Base):
 
 class UserRelation(Base):
     __tablename__ = "user_relations"
-    id = Column(BigInteger, primary_key=True, autoincrement=True)
+    id = Column(BigIntPK, primary_key=True, autoincrement=True)
     advisor_user_id = Column(BigInteger, ForeignKey("users.id"), nullable=False, index=True)
     client_user_id = Column(BigInteger, ForeignKey("users.id"), nullable=False, index=True)
     status = Column(String(16), nullable=False, default="PENDING")
@@ -833,7 +837,7 @@ class UserRelation(Base):
 
 class IndexClassification(Base):
     __tablename__ = "index_classification"
-    id = Column(BigInteger, primary_key=True, autoincrement=True)
+    id = Column(BigIntPK, primary_key=True, autoincrement=True)
     index_code = Column(String(32), unique=True, nullable=False, index=True)
     index_name = Column(String(128), nullable=True)
     category = Column(String(64), nullable=True)
@@ -846,7 +850,7 @@ class IndexClassification(Base):
 
 class DataGapReport(Base):
     __tablename__ = "data_gap_report"
-    id = Column(BigInteger, primary_key=True, autoincrement=True)
+    id = Column(BigIntPK, primary_key=True, autoincrement=True)
     user_id = Column(BigInteger, ForeignKey("users.id"), nullable=True, index=True)
     gap_type = Column(String(32), nullable=False, index=True)
     stock_code = Column(String(32), nullable=True, index=True)
@@ -860,7 +864,7 @@ class DataGapReport(Base):
 
 class HoldingImportLog(Base):
     __tablename__ = "holding_import_log"
-    id = Column(BigInteger, primary_key=True, autoincrement=True)
+    id = Column(BigIntPK, primary_key=True, autoincrement=True)
     user_id = Column(BigInteger, ForeignKey("users.id"), nullable=False, index=True)
     import_source = Column(String(16), nullable=False)
     file_name = Column(String(255), nullable=True)

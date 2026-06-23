@@ -42,6 +42,8 @@ def init_db():
     """Create all tables + lightweight column migrations for SQLite"""
     import models  # noqa: F401 — ensure models are registered
     Base.metadata.create_all(bind=engine)
+    # === 启动时自动 seed admin (若无 users) ===
+    _ensure_seed_admin()
 
     # Lightweight ALTER for new columns on existing tables
     _MIGRATIONS = [
@@ -136,3 +138,29 @@ def init_db():
                 conn.execute(text(f"CREATE INDEX IF NOT EXISTS {ix_name} ON {ix_table} ({ix_col})"))
             except Exception:
                 pass
+
+
+def _ensure_seed_admin():
+    """启动时若无 users 表行，自动 seed 一个 admin 账户。"""
+    try:
+        import bcrypt
+        from sqlalchemy.orm import Session
+        from sqlalchemy import text
+        from config import SEED_ADMIN_USERNAME, SEED_ADMIN_PASSWORD
+        from models import User
+        # 用 globals()['engine'] 而非模块顶部 import-time 的 engine（支持测试 monkeypatch）
+        eng = globals()["engine"]
+        with Session(eng) as db:
+            if db.query(User).count() > 0:
+                return
+            pw_hash = bcrypt.hashpw(SEED_ADMIN_PASSWORD.encode(),
+                                    bcrypt.gensalt(rounds=10)).decode()
+            admin = User(
+                username=SEED_ADMIN_USERNAME, password_hash=pw_hash,
+                is_admin=True, is_advisor=False,
+                display_name="系统管理员", is_active=True
+            )
+            db.add(admin); db.commit()
+            print(f"[SEED] 已创建 admin 用户 (id={admin.id}): {SEED_ADMIN_USERNAME}")
+    except Exception as e:
+        print(f"[SEED] 自动 seed admin 失败（不影响启动）: {e}")

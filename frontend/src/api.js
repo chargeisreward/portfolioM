@@ -123,6 +123,11 @@ export const createRelation = (body) => api.post('/auth/relations', body).then(r
 export const confirmRelation = (id) => api.post(`/auth/relations/${id}/confirm`).then(r => r.data)
 export const cancelRelation = (id) => api.post(`/auth/relations/${id}/cancel`).then(r => r.data)
 
+// 数据补足（admin）
+export const getGapReport = (params = {}) => api.get('/data-gap/report', { params }).then(r => r.data)
+export const fixGap = (id) => api.post(`/data-gap/fix/${id}`).then(r => r.data)
+export const setIndexClassification = (body) => api.post('/data-gap/index-classification', body).then(r => r.data)
+
 // ============================================================================
 // Fund Penetration & Industry Aggregation (spec §4)
 // ============================================================================

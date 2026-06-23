@@ -143,7 +143,7 @@ export default function App() {
       case 'relation': return <RelationPanel currentUser={currentUser} />
       case 'data': return <DataBrowser />
       case 'ops': return <OpsPanel />
-      case 'dataGap': return <div style={{ padding: 40 }}>数据补足（M5 实现）</div>
+      case 'dataGap': return <DataGapPanel />
       case 'strategies': return <StrategiesPanel />
       case 'settings': return <SettingsPanel />
       default: return null

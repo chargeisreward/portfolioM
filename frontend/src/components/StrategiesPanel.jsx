@@ -2,8 +2,11 @@ import React, { useEffect, useState } from 'react'
 import * as api from '../api'
 
 /**
- * API 策略页面：列出所有数据源 + 限制 + 覆盖范围 + 代码映射表。
- * 数据源：api_strategies.json (manifest) + 实时扫描 backend 代码 (live hook) + api_code_map 表
+ * API 策略页面：列出所有数据源 + 限制 + 覆盖范围 + 代码映射表 +
+ * 调度任务实时状态 + 数据新鲜度 + 数据预览。
+ *
+ * 数据源：api_strategies.json (manifest) + 实时扫描 backend 代码 (live hook) +
+ *        /api/scheduler/status + /api/data-freshness + /api/data-preview
  */
 export default function StrategiesPanel() {
   const [manifest, setManifest] = useState({ strategies: [] })
@@ -11,6 +14,18 @@ export default function StrategiesPanel() {
   const [codeMaps, setCodeMaps] = useState([])
   const [filterApi, setFilterApi] = useState('')
   const [error, setError] = useState(null)
+
+  // ---- 调度任务实时状态 ----
+  const [sched, setSched] = useState({ running: false, jobs: [] })
+  const [triggerMsg, setTriggerMsg] = useState(null)
+  // ---- 数据新鲜度 ----
+  const [freshness, setFreshness] = useState({ as_of: '', tables: [] })
+  // ---- 数据预览 ----
+  const [previewTable, setPreviewTable] = useState('price_cache')
+  const [previewStock, setPreviewStock] = useState('')
+  const [previewLimit, setPreviewLimit] = useState(20)
+  const [preview, setPreview] = useState({ table: '', rows: [], total_rows: 0 })
+  const [previewErr, setPreviewErr] = useState(null)
 
   useEffect(() => {
     api.getStrategies()
@@ -26,6 +41,54 @@ export default function StrategiesPanel() {
       .then(d => setCodeMaps(d.items || []))
       .catch(() => setCodeMaps([]))
   }, [filterApi])
+
+  // 调度状态 10s 轮询
+  useEffect(() => {
+    let mounted = true
+    const tick = () => api.getSchedulerStatus().then(d => { if (mounted) setSched(d) }).catch(() => {})
+    tick()
+    const t = setInterval(tick, 10000)
+    return () => { mounted = false; clearInterval(t) }
+  }, [])
+
+  // 数据新鲜度 60s 轮询
+  useEffect(() => {
+    let mounted = true
+    const tick = () => api.getDataFreshness().then(d => { if (mounted) setFreshness(d) }).catch(() => {})
+    tick()
+    const t = setInterval(tick, 60000)
+    return () => { mounted = false; clearInterval(t) }
+  }, [])
+
+  // 数据预览：表 / 过滤条件变化时拉取
+  useEffect(() => {
+    let mounted = true
+    setPreviewErr(null)
+    api.getDataPreview(previewTable, { limit: previewLimit, stock_code: previewStock || undefined })
+      .then(d => { if (mounted) setPreview(d) })
+      .catch(e => { if (mounted) setPreviewErr('预览加载失败：' + (e?.message || e)) })
+    return () => { mounted = false }
+  }, [previewTable, previewStock, previewLimit])
+
+  const triggerJob = (jobId) => {
+    setTriggerMsg(`已排队 ${jobId}，请稍候 5-10s 后刷新查看 last_run_at`)
+    api.triggerSchedulerJob(jobId, false, true)
+      .then(d => setTriggerMsg(`✓ ${jobId} ${d.mode || 'ok'}`))
+      .catch(e => setTriggerMsg(`✗ ${jobId}: ${e?.message || e}`))
+    setTimeout(() => setTriggerMsg(null), 8000)
+  }
+
+  // 健康度判断（绿/黄/红/灰）
+  const health = (t) => {
+    if (!t.max_date) return { label: '无数据', color: 'var(--text-muted)', dot: '⚫' }
+    if (t.max_date < freshness.as_of) return { label: '过期', color: 'var(--down)', dot: '🔴' }
+    if (t.max_created_at) {
+      const ageMin = (Date.now() - new Date(t.max_created_at).getTime()) / 60000
+      if (ageMin <= 30) return { label: '健康', color: 'var(--up)', dot: '🟢' }
+      return { label: `滞后 ${Math.round(ageMin)}min`, color: '#f59e0b', dot: '🟡' }
+    }
+    return { label: '待写入', color: 'var(--text-muted)', dot: '⚫' }
+  }
 
   const fileFunc = (s) => `${s.module.split('/').pop()} :: ${s.function}`
 
@@ -175,6 +238,177 @@ export default function StrategiesPanel() {
             )}
           </tbody>
         </table>
+      </div>
+
+      {/* ========== 调度任务实时状态 ========== */}
+      <div className="raised">
+        <div className="section-title">
+          调度任务实时状态 · {sched.running ? `${sched.jobs.length} jobs running` : '⚠ scheduler not running'}
+        </div>
+        <div style={{ fontSize: 10, color: 'var(--text-muted)', marginBottom: 8 }}>
+          数据源：<code style={{ fontFamily: '"GeistMono", monospace' }}>GET /api/scheduler/status</code> ·
+          轮询间隔 10s ·
+          如果 next_run 为空或 last_run_at 为空 → 调度器可能未运行或该 job 已停。
+          「立即触发」按钮调用 <code style={{ fontFamily: '"GeistMono", monospace' }}>POST /api/scheduler/trigger/&lt;job_id&gt;</code>。
+        </div>
+        {triggerMsg && (
+          <div style={{ fontSize: 11, color: 'var(--text-secondary)', marginBottom: 8, fontFamily: '"GeistMono", monospace' }}>
+            {triggerMsg}
+          </div>
+        )}
+        <table className="data-table">
+          <thead>
+            <tr>
+              <th>Job ID</th>
+              <th>名称</th>
+              <th>下次执行</th>
+              <th>最近执行</th>
+              <th>状态</th>
+              <th>耗时</th>
+              <th>错误 / 结果</th>
+              <th>操作</th>
+            </tr>
+          </thead>
+          <tbody>
+            {sched.jobs.map(j => (
+              <tr key={j.id} style={j.last_status === 'error' ? { borderLeft: '2px solid var(--down)' } : null}>
+                <td style={{ fontFamily: '"GeistMono", monospace', fontSize: 11 }}>{j.id}</td>
+                <td style={{ fontSize: 11 }}>{j.name}</td>
+                <td style={{ fontFamily: '"GeistMono", monospace', fontSize: 10, color: 'var(--text-muted)' }}>{j.next_run || '—'}</td>
+                <td style={{ fontFamily: '"GeistMono", monospace', fontSize: 10, color: 'var(--text-muted)' }}>{j.last_run_at || '—'}</td>
+                <td>
+                  {j.last_status === 'ok' && <span style={{ color: 'var(--up)', fontSize: 11 }}>✓ ok</span>}
+                  {j.last_status === 'error' && <span style={{ color: 'var(--down)', fontSize: 11 }}>✗ error</span>}
+                  {!j.last_status && <span style={{ color: 'var(--text-muted)', fontSize: 11 }}>—</span>}
+                </td>
+                <td style={{ fontFamily: '"GeistMono", monospace', fontSize: 10, color: 'var(--text-muted)' }}>
+                  {j.last_duration_ms != null ? `${j.last_duration_ms}ms` : '—'}
+                </td>
+                <td style={{ fontSize: 10, color: 'var(--text-muted)', fontFamily: '"GeistMono", monospace', maxWidth: 280, overflow: 'hidden', textOverflow: 'ellipsis' }}>
+                  {j.last_error ? <span style={{ color: 'var(--down)' }}>{j.last_error}</span> :
+                   j.last_result ? <span style={{ color: 'var(--text-secondary)' }}>{JSON.stringify(j.last_result).slice(0, 80)}</span> :
+                   '—'}
+                </td>
+                <td>
+                  <button onClick={() => triggerJob(j.id)} className="cur-btn" style={{ fontSize: 10 }}>立即触发</button>
+                </td>
+              </tr>
+            ))}
+            {!sched.running && (
+              <tr><td colSpan={8} style={{ textAlign: 'center', color: 'var(--down)', fontSize: 11, padding: 12 }}>
+                调度器未运行。检查 backend startup() 是否被调用 / 容器是否在重启中。
+              </td></tr>
+            )}
+          </tbody>
+        </table>
+      </div>
+
+      {/* ========== 数据新鲜度 ========== */}
+      <div className="raised">
+        <div className="section-title">
+          数据新鲜度 · as_of {freshness.as_of || '(加载中)'}
+        </div>
+        <div style={{ fontSize: 10, color: 'var(--text-muted)', marginBottom: 8 }}>
+          数据源：<code style={{ fontFamily: '"GeistMono", monospace' }}>GET /api/data-freshness</code> ·
+          轮询间隔 60s ·
+          健康度 = (max_date == 今天 && 最近落库 &lt; 30min) → 🟢 健康；max_date 过期 → 🔴 过期
+        </div>
+        <table className="data-table">
+          <thead>
+            <tr>
+              <th>表</th>
+              <th>最新业务日期</th>
+              <th>最后落库时间</th>
+              <th>今日写入</th>
+              <th>健康度</th>
+            </tr>
+          </thead>
+          <tbody>
+            {freshness.tables.map(t => {
+              const h = health(t)
+              return (
+                <tr key={t.table}>
+                  <td style={{ fontFamily: '"GeistMono", monospace', fontSize: 11 }}>{t.table}</td>
+                  <td style={{ fontFamily: '"GeistMono", monospace', fontSize: 11 }}>{t.max_date || '—'}</td>
+                  <td style={{ fontFamily: '"GeistMono", monospace', fontSize: 10, color: 'var(--text-muted)' }}>
+                    {t.max_created_at ? t.max_created_at.replace('T', ' ').slice(0, 19) : '—'}
+                  </td>
+                  <td style={{ fontFamily: '"GeistMono", monospace', fontSize: 11, textAlign: 'right' }}>{t.rows_today ?? '—'}</td>
+                  <td><span style={{ color: h.color, fontSize: 11 }}>{h.dot} {h.label}</span></td>
+                </tr>
+              )
+            })}
+            {freshness.tables.length === 0 && (
+              <tr><td colSpan={5} style={{ textAlign: 'center', color: 'var(--text-muted)', fontSize: 11, padding: 12 }}>
+                加载中…
+              </td></tr>
+            )}
+          </tbody>
+        </table>
+      </div>
+
+      {/* ========== 数据预览 ========== */}
+      <div className="raised">
+        <div className="section-title">数据预览 · 最近 {previewLimit} 行</div>
+        <div style={{ fontSize: 10, color: 'var(--text-muted)', marginBottom: 8 }}>
+          数据源：<code style={{ fontFamily: '"GeistMono", monospace' }}>GET /api/data-preview?table=...</code> ·
+          用于直观检查数据是否落库 — 看最新一行 trade_date / current_price_date 是否为今天
+        </div>
+        <div style={{ display: 'flex', gap: 8, marginBottom: 8, flexWrap: 'wrap', alignItems: 'center' }}>
+          <label style={{ fontSize: 11, color: 'var(--text-muted)' }}>表：</label>
+          <select value={previewTable} onChange={e => setPreviewTable(e.target.value)}
+            style={{ fontSize: 11, padding: '2px 6px', background: 'var(--bg)', color: 'var(--text)', border: '1px solid var(--border)' }}>
+            <option value="price_cache">price_cache</option>
+            <option value="a_share_snapshot">a_share_snapshot</option>
+            <option value="hk_share_snapshot">hk_share_snapshot</option>
+            <option value="holding">holding</option>
+          </select>
+          <label style={{ fontSize: 11, color: 'var(--text-muted)' }}>股票代码：</label>
+          <input value={previewStock} onChange={e => setPreviewStock(e.target.value)}
+            placeholder="(空=全部)"
+            style={{ fontSize: 11, padding: '2px 6px', background: 'var(--bg)', color: 'var(--text)', border: '1px solid var(--border)', fontFamily: '"GeistMono", monospace', width: 140 }} />
+          <label style={{ fontSize: 11, color: 'var(--text-muted)' }}>行数：</label>
+          <select value={previewLimit} onChange={e => setPreviewLimit(Number(e.target.value))}
+            style={{ fontSize: 11, padding: '2px 6px', background: 'var(--bg)', color: 'var(--text)', border: '1px solid var(--border)' }}>
+            <option value={10}>10</option>
+            <option value={20}>20</option>
+            <option value={50}>50</option>
+            <option value={100}>100</option>
+          </select>
+          <span style={{ fontSize: 10, color: 'var(--text-muted)', marginLeft: 'auto' }}>
+            表总行数：{preview.total_rows.toLocaleString()}
+          </span>
+        </div>
+        {previewErr && (
+          <div style={{ fontSize: 11, color: 'var(--down)', marginBottom: 8 }}>{previewErr}</div>
+        )}
+        <div style={{ overflowX: 'auto' }}>
+          <table className="data-table">
+            <thead>
+              <tr>
+                {preview.rows[0] ? Object.keys(preview.rows[0]).map(k => <th key={k}>{k}</th>) : <th>—</th>}
+              </tr>
+            </thead>
+            <tbody>
+              {preview.rows.map((r, i) => (
+                <tr key={i}>
+                  {Object.entries(r).map(([k, v]) => (
+                    <td key={k} style={{
+                      fontFamily: '"GeistMono", monospace', fontSize: 10,
+                      color: ['current_price', 'close_px', 'price'].includes(k) ? 'var(--chart-up)' : 'var(--text-secondary)',
+                      whiteSpace: 'nowrap',
+                    }}>{v ?? '—'}</td>
+                  ))}
+                </tr>
+              ))}
+              {preview.rows.length === 0 && (
+                <tr><td style={{ textAlign: 'center', color: 'var(--text-muted)', fontSize: 11, padding: 12 }}>
+                  无数据
+                </td></tr>
+              )}
+            </tbody>
+          </table>
+        </div>
       </div>
     </div>
   )

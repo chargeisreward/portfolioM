@@ -5,7 +5,9 @@
 2. 财务基本面数据更新（每日7:00/19:00）
 3. 行业/爬虫数据更新（每日6:00/20:00）
 """
+import functools
 import logging
+import time as _time_mod
 from datetime import datetime, date, time
 
 from apscheduler.schedulers.background import BackgroundScheduler
@@ -17,6 +19,46 @@ from models import Holding, PriceCache, StockInfoCache, AssetType
 logger = logging.getLogger(__name__)
 
 scheduler: BackgroundScheduler | None = None
+
+# ---------- 运行状态跟踪 ----------
+# 给前端 /api/scheduler/status 使用：每个 job_id 最近一次执行的元数据。
+# 通过 track_run() 装饰器写入；手动触发也会记录（trigger_job 调用 _JOB_DISPATCH 中的 wrapper）。
+_JOB_LAST_RUN: dict[str, dict] = {}
+
+
+def track_run(job_id: str):
+    """装饰器：把函数的执行结果 / 异常 / 耗时写入 _JOB_LAST_RUN[job_id]。
+
+    APScheduler 调用与 /api/scheduler/trigger 手动调用都走包装后的函数，
+    因此 last_run_at 是「真实最近一次执行」而非「最近一次 cron 触发」。
+    """
+    def deco(fn):
+        @functools.wraps(fn)
+        def wrapper(*args, **kwargs):
+            t0 = _time_mod.time()
+            run_at = datetime.now().isoformat(timespec="seconds")
+            try:
+                result = fn(*args, **kwargs)
+            except Exception as e:
+                _JOB_LAST_RUN[job_id] = {
+                    "run_at": run_at,
+                    "status": "error",
+                    "error": f"{type(e).__name__}: {e}"[:300],
+                    "result": None,
+                    "duration_ms": int((_time_mod.time() - t0) * 1000),
+                }
+                raise
+            _JOB_LAST_RUN[job_id] = {
+                "run_at": run_at,
+                "status": "ok",
+                "error": None,
+                "result": result if isinstance(result, dict)
+                           else {"value": str(result)[:200] if result is not None else None},
+                "duration_ms": int((_time_mod.time() - t0) * 1000),
+            }
+            return result
+        return wrapper
+    return deco
 
 
 # ---------- 工具函数 ----------
@@ -46,6 +88,7 @@ def _is_trading_hours(now: datetime) -> bool:
 
 # ---------- 任务1：实时行情抓取 ----------
 
+@track_run("realtime_prices")
 def job_fetch_realtime_prices(force: bool = False):
     """每15分钟执行：抓取所有持仓的最新价格并更新缓存。
     交易时段（A股+美股）每15分钟；非交易时段只拉最近1天价。
@@ -163,6 +206,7 @@ def _save_price_cache(
 
 # ---------- 任务2：财务基本面数据更新 ----------
 
+@track_run("financial_fundamentals")
 def job_update_financial_fundamentals():
     """每日7:00/19:00执行：增量抓取财务基本面数据并运行穿透计算"""
     db: Session = SessionLocal()
@@ -255,6 +299,7 @@ def job_update_financial_fundamentals():
 
 # ---------- 任务3：行业/爬虫数据更新 ----------
 
+@track_run("industry_crawler_data")
 def job_update_industry_crawler_data():
     """每日6:00/20:00执行：更新ETF映射、指数成分股、沪深300基准、汇率"""
     db: Session = SessionLocal()
@@ -314,6 +359,7 @@ def _expected_trading_dates_legacy(days: int) -> list:
     return out
 
 
+@track_run("backfill_gaps")
 def job_backfill_gaps(days: int = 90):
     """检查所有 holding 过去 N 天的 price_cache 完整性，缺哪补哪。
     使用交易日历（按 holding 所属市场）判断应补哪些日期。"""
@@ -407,6 +453,55 @@ def job_backfill_gaps(days: int = 90):
 
 # ---------- 调度器启停 ----------
 
+@track_run("fill_snapshot_gaps_smart")
+def job_fill_snapshot_gaps_smart(days: int = 15, force: bool = False):
+    """Smart Gap-Fill：扫描 snapshot 表所有股票过去 N 个交易日的 PriceCache 缺口，
+    用腾讯 K 线 / yfinance 多 API 兜底补全，**不覆盖**已有数据。
+    最后回写 snapshot.current_price（仅更新到更新日期）。
+
+    设计原则：
+      - 不动 current_price 已存在的快照（除非 PriceCache 有更晚的日期）
+      - 每个 gap 只查一次（PriceCache UNIQUE 约束保证幂等）
+      - 跳过 .BJ（北交所，Tencent 不支持）
+      - force=True 跳过 is_any_market_open_today 门控
+
+    时机：每日 06:00 + 20:00（cron），覆盖美股昨日收盘 + A/H 股当日收盘。
+    """
+    from services.price_filler import fill_snapshot_gaps_smart
+
+    db = SessionLocal()
+    try:
+        if not force:
+            try:
+                from services.trading_calendar import is_any_market_open_today
+                if not is_any_market_open_today(db):
+                    logger.info(
+                        "全市场休市（昨天是周末/节假日），跳过 snapshot 补缺；"
+                        "force=True 可绕过"
+                    )
+                    return {"skipped": "all_markets_closed"}
+            except Exception as e:
+                logger.warning("日历门控失败，继续执行: %s", e)
+
+        result = fill_snapshot_gaps_smart(db, days=days, max_codes=10000, sleep_between=0.0)
+        logger.info(
+            "snapshot gap-fill 完成: checked=%d gaps_found=%d filled=%d "
+            "snapshots_updated=%d api=%s elapsed=%ss",
+            result["stocks_checked"],
+            result["gaps_found"],
+            result["gaps_filled"],
+            result["snapshots_updated"],
+            result["api_breakdown"],
+            result["elapsed_seconds"],
+        )
+        return result
+    except Exception as e:
+        logger.error("snapshot gap-fill 异常: %s", e, exc_info=True)
+        raise
+    finally:
+        db.close()
+
+
 def start_scheduler():
     """启动后台定时任务调度器"""
     global scheduler
@@ -426,6 +521,20 @@ def start_scheduler():
         name="实时行情抓取",
         max_instances=1,
         misfire_grace_time=60,
+    )
+
+    # 任务1b：snapshot 智能补缺 — 每日 06:00 + 20:00
+    # 覆盖美股昨日收盘 + A/H 股当日收盘；2 次/天避免限流
+    scheduler.add_job(
+        job_fill_snapshot_gaps_smart,
+        "cron",
+        hour="6,20",
+        minute=0,
+        id="fill_snapshot_gaps_smart",
+        name="snapshot 智能补缺（15 天窗口）",
+        max_instances=1,
+        misfire_grace_time=600,
+        kwargs={"days": 15},
     )
 
     # 任务2：财务基本面更新 — 每日 6:15 / 20:15（紧跟主批次 5min 后）
@@ -452,7 +561,8 @@ def start_scheduler():
         misfire_grace_time=300,
     )
 
-    # 任务4：90 天历史价完整性检查 — 每日 6:05 / 20:05（跟着主批次做完整性检查）
+    # 任务4：360 天历史价完整性检查 — 每日 6:05 / 20:05（跟着主批次做完整性检查）
+    # Holding 是动态的（不只是固定 44 只），用 360 天窗口覆盖完整年度
     scheduler.add_job(
         job_backfill_gaps,
         "cron",
@@ -462,7 +572,7 @@ def start_scheduler():
         name="历史价补缺",
         max_instances=1,
         misfire_grace_time=600,
-        kwargs={"days": 90},
+        kwargs={"days": 360},
     )
 
     # 任务5：全球快讯 — 每日 6:20 / 20:20 (a-stock-data skill §5.3)
@@ -560,6 +670,7 @@ def _info_target_codes(db) -> list[str]:
     return sorted(codes)
 
 
+@track_run("info_global_news")
 def job_crawl_global_news():
     """每日 07:30 / 19:30: 拉全球快讯 (skill §5.3)."""
     db: Session = SessionLocal()
@@ -575,6 +686,7 @@ def job_crawl_global_news():
         db.close()
 
 
+@track_run("info_stock_news")
 def job_crawl_stock_news():
     """每日 18:00: 拉穿透成分股的个股新闻 (skill §5.1)."""
     db: Session = SessionLocal()
@@ -598,6 +710,7 @@ def job_crawl_stock_news():
         db.close()
 
 
+@track_run("info_announcements_research")
 def job_crawl_announcements_and_research():
     """每 3 日 21:00: 拉穿透成分股的公告 + 研报."""
     db: Session = SessionLocal()
@@ -626,6 +739,7 @@ def job_crawl_announcements_and_research():
         db.close()
 
 
+@track_run("info_hot_stocks")
 def job_crawl_hot_stocks():
     """交易日 15:35: 拉同花顺当日热点 + 题材归因 (skill §3.1)."""
     from datetime import date as _date

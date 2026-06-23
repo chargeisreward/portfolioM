@@ -78,6 +78,17 @@ export const getDataSchema = () => api.get('/data-browser/schema').then(r => r.d
 // Strategies (API 策略页面)
 export const getStrategies = () => api.get('/strategies').then(r => r.data)
 
+// Scheduler 实时状态 + 数据新鲜度 + 数据预览
+export const getSchedulerStatus = () => api.get('/scheduler/status').then(r => r.data)
+export const triggerSchedulerJob = (jobId, force = false, background = true) =>
+  api.post(`/scheduler/trigger/${jobId}`, null, { params: { force, background } }).then(r => r.data)
+export const getDataFreshness = () => api.get('/data-freshness').then(r => r.data)
+export const getDataPreview = (table, opts = {}) => {
+  const params = { table, limit: opts.limit ?? 20 }
+  if (opts.stock_code) params.stock_code = opts.stock_code
+  return api.get('/data-preview', { params }).then(r => r.data)
+}
+
 // Trading calendar
 export const getCalendarMonth = (market, year, month) => api.get('/calendar/month', { params: { market, year, month } }).then(r => r.data)
 export const getCalendarRange = (market, start, end) => api.get('/calendar', { params: { market, start, end } }).then(r => r.data)

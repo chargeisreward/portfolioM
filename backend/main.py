@@ -1395,12 +1395,13 @@ _JOB_DISPATCH: dict = {}  # 延迟到 register_job_handlers() 填充（启动时
 
 
 def register_job_handlers() -> None:
-    """把 8 个 job_* 函数注册到 _JOB_DISPATCH。FastAPI 启动时调用一次。"""
+    """把 9 个 job_* 函数注册到 _JOB_DISPATCH。FastAPI 启动时调用一次。"""
     global _JOB_DISPATCH
     if _JOB_DISPATCH:
         return  # 幂等
     from services.scheduler import (
         job_fetch_realtime_prices,
+        job_fill_snapshot_gaps_smart,
         job_update_financial_fundamentals,
         job_update_industry_crawler_data,
         job_backfill_gaps,
@@ -1411,6 +1412,7 @@ def register_job_handlers() -> None:
     )
     _JOB_DISPATCH = {
         "realtime_prices": job_fetch_realtime_prices,
+        "fill_snapshot_gaps_smart": job_fill_snapshot_gaps_smart,
         "industry_crawler_data": job_update_industry_crawler_data,
         "financial_fundamentals": job_update_financial_fundamentals,
         "backfill_gaps": job_backfill_gaps,
@@ -1423,16 +1425,23 @@ def register_job_handlers() -> None:
 
 @app.get("/api/scheduler/status")
 def scheduler_status():
-    """获取定时任务调度器状态"""
-    from services.scheduler import scheduler
+    """获取定时任务调度器状态 + 每个 job 最近一次执行的元数据"""
+    from services.scheduler import scheduler, _JOB_LAST_RUN
     if not scheduler or not scheduler.running:
         return {"running": False, "jobs": []}
     jobs = []
     for job in scheduler.get_jobs():
+        jid = job.id
+        last = _JOB_LAST_RUN.get(jid, {})
         jobs.append({
-            "id": job.id,
+            "id": jid,
             "name": job.name,
             "next_run": str(job.next_run_time) if job.next_run_time else None,
+            "last_run_at": last.get("run_at"),
+            "last_status": last.get("status"),       # "ok" / "error" / None
+            "last_error": last.get("error"),
+            "last_result": last.get("result"),
+            "last_duration_ms": last.get("duration_ms"),
         })
     return {"running": True, "jobs": jobs}
 
@@ -3584,6 +3593,124 @@ def admin_fill_prices_tencent(
     """通过腾讯 API 拉取 current_price，填充 price_cache + 重算 dynamic PE/PB/PS。"""
     from services.price_filler import fill_prices_for_as_of
     return fill_prices_for_as_of(db, as_of_date, max_codes=max_codes)
+
+
+# ==================== 数据新鲜度 + 数据预览 ====================
+
+@app.get("/api/data-freshness")
+def data_freshness(db: Session = Depends(get_db)):
+    """各表最新落库时间 + 今日写入条数。
+
+    用于 API 策略页面「数据新鲜度」面板，让用户一眼看出哪张表已经落后。
+    Holding 没有 trade_date / as_of_date，回退到 created_at。
+    """
+    from models import (
+        Holding, PriceCache,
+        AShareFinancialSnapshot, HKShareFinancialSnapshot,
+        PenetrationSnapshot, FullHoldingSnapshot,
+    )
+
+    today = date.today()
+
+    def _stat(model, date_col: str, label: str):
+        max_date_val = None
+        max_created = None
+        rows_today = None
+        try:
+            if date_col:
+                max_date_val = db.query(func.max(getattr(model, date_col))).scalar()
+        except Exception:
+            max_date_val = None
+        try:
+            if hasattr(model, "created_at"):
+                max_created = db.query(func.max(model.created_at)).scalar()
+        except Exception:
+            max_created = None
+        try:
+            if date_col:
+                rows_today = db.query(func.count()).select_from(model).filter(
+                    getattr(model, date_col) == today
+                ).scalar()
+        except Exception:
+            rows_today = None
+        return {
+            "table": label,
+            "max_date": str(max_date_val) if max_date_val else None,
+            "max_created_at": str(max_created) if max_created else None,
+            "rows_today": int(rows_today or 0) if rows_today is not None else None,
+        }
+
+    tables = [
+        _stat(PriceCache, "trade_date", "price_cache"),
+        _stat(AShareFinancialSnapshot, "as_of_date", "a_share_snapshot"),
+        _stat(HKShareFinancialSnapshot, "as_of_date", "hk_share_snapshot"),
+        _stat(PenetrationSnapshot, "as_of_date", "penetration_snapshot"),
+        _stat(FullHoldingSnapshot, "as_of_date", "full_holding_snapshot"),
+        # Holding 无 trade_date/as_of_date → 用 created_at 作为最后更新时间代理
+        _stat(Holding, "created_at", "holding"),
+    ]
+
+    return {"as_of": today.isoformat(), "tables": tables}
+
+
+# Pydantic v1 用 regex=，v2 用 pattern=。本项目 main.py 顶部用 FastAPI 0.x，
+# 兼容到 v2 也都能识别；这里保留 regex 作为 v1 fallback。
+@app.get("/api/data-preview")
+def data_preview(
+    table: str = Query(..., regex="^(price_cache|a_share_snapshot|hk_share_snapshot|holding)$"),
+    limit: int = Query(20, ge=1, le=200),
+    stock_code: str | None = Query(None),
+    db: Session = Depends(get_db),
+):
+    """最近 N 行预览（按 created_at desc）。
+
+    用于 API 策略页面「数据预览」面板，让用户直观看到落库数据。
+    """
+    from models import (
+        Holding, PriceCache,
+        AShareFinancialSnapshot, HKShareFinancialSnapshot,
+    )
+
+    model_map = {
+        "price_cache": PriceCache,
+        "a_share_snapshot": AShareFinancialSnapshot,
+        "hk_share_snapshot": HKShareFinancialSnapshot,
+        "holding": Holding,
+    }
+    model = model_map[table]
+
+    q = db.query(model)
+    if stock_code:
+        if hasattr(model, "stock_code"):
+            q = q.filter(model.stock_code == stock_code)
+        elif hasattr(model, "security_code"):
+            q = q.filter(model.security_code == stock_code)
+
+    if hasattr(model, "created_at"):
+        rows = q.order_by(model.created_at.desc()).limit(limit).all()
+    else:
+        rows = q.order_by(model.id.desc()).limit(limit).all()
+
+    # 只取预设的安全字段列，避免暴露密码 / token 等敏感字段
+    safe_cols = {
+        "id", "stock_code", "security_code", "trade_date", "as_of_date",
+        "close_px", "current_price", "current_price_date",
+        "open_px", "high_px", "low_px", "volume",
+        "price", "amount", "amount_cny",
+        "source", "created_at", "fetched_at",
+    }
+    cols = [c.name for c in model.__table__.columns if c.name in safe_cols]
+
+    total_rows = db.query(func.count()).select_from(model).scalar()
+
+    return {
+        "table": table,
+        "rows": [
+            {c: (str(getattr(r, c)) if getattr(r, c) is not None else None) for c in cols}
+            for r in rows
+        ],
+        "total_rows": int(total_rows or 0),
+    }
 
 
 

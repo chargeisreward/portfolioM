@@ -684,11 +684,37 @@ def start_scheduler():
         misfire_grace_time=600,
     )
 
+    # 任务9：数据补足检测（每日 6:50 — 早于 7:00 财务任务）
+    scheduler.add_job(
+        _wrap_job("detect_data_gaps", job_detect_data_gaps),
+        "cron",
+        hour=6,
+        minute=50,
+        id="detect_data_gaps",
+        name="数据补足检测",
+        max_instances=1,
+        misfire_grace_time=300,
+    )
+
     scheduler.start()
     logger.info(
         "调度器已启动，注册 %d 个定时任务",
         len(scheduler.get_jobs()),
     )
+
+
+@track_run("detect_data_gaps")
+def job_detect_data_gaps():
+    """每日 6:50 — 扫描 3 类数据缺口写入 data_gap_report"""
+    from services.data_gap_detector import detect_all_gaps
+    db = SessionLocal()
+    try:
+        return detect_all_gaps(db)
+    except Exception as e:
+        logger.error("detect_data_gaps failed: %s", e, exc_info=True)
+        raise
+    finally:
+        db.close()
 
 
 def stop_scheduler():

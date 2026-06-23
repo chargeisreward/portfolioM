@@ -89,10 +89,12 @@ def _is_trading_hours(now: datetime) -> bool:
 # ---------- 任务1：实时行情抓取 ----------
 
 @track_run("realtime_prices")
-def job_fetch_realtime_prices(force: bool = False):
-    """每15分钟执行：抓取所有持仓的最新价格并更新缓存。
+def job_fetch_realtime_prices(force: bool = False, user_id: int | None = None):
+    """每15分钟执行：抓取所有（或指定 user 的）持仓最新价格并更新缓存。
     交易时段（A股+美股）每15分钟；非交易时段只拉最近1天价。
     force=True 时强制全量拉（手动触发用）
+
+    多用户升级：user_id=None 遍历所有 user 的持仓（保持原行为 — 价格共享）。
     """
     now = datetime.now()
     in_session = _is_trading_hours(now)
@@ -103,14 +105,18 @@ def job_fetch_realtime_prices(force: bool = False):
         from crawlers.exchange_rates import get_rate
         from services.importer import _fetch_fund_nav
         from services.trading_calendar import is_any_market_open_today
+        from models import User
 
         # Pre-flight：持仓代码映射覆盖率（不阻塞，记录到 last_result）
         preflight = _run_code_map_preflight(db, pools=("holdings",))
 
-        holdings = db.query(Holding).all()
+        holdings_q = db.query(Holding)
+        if user_id is not None:
+            holdings_q = holdings_q.filter(Holding.user_id == user_id)
+        holdings = holdings_q.all()
         if not holdings:
-            logger.info("无持仓记录，跳过行情抓取")
-            return {"skipped": "no_holdings", "preflight": preflight}
+            logger.info("无持仓记录 (user_id=%s)，跳过行情抓取", user_id)
+            return {"skipped": "no_holdings", "preflight": preflight, "user_id": user_id}
 
         today = date.today()
         # 日历门控：今日无任何市场开市（CN/HK/US）→ 跳过（force 强制仍跑）
@@ -174,11 +180,12 @@ def job_fetch_realtime_prices(force: bool = False):
                 continue
 
         db.commit()
-        logger.info("行情抓取完成，更新 %d/%d 只持仓", updated, len(holdings))
+        logger.info("行情抓取完成 (user_id=%s)，更新 %d/%d 只持仓", user_id, updated, len(holdings))
         return {
             "holdings_total": len(holdings),
             "updated": updated,
             "preflight": preflight,
+            "user_id": user_id,
         }
 
     except Exception as e:

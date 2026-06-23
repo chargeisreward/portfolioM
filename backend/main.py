@@ -159,13 +159,14 @@ def _record_success(db: Session, ip: str):
         db.commit()
 
 
-def _create_session(db: Session, ip: str) -> str:
-    """创建新 session，返回 token。默认 24h 过期"""
+def _create_session(db: Session, ip: str, user_id: int | None = None) -> str:
+    """创建新 session，返回 token。默认 24h 过期。user_id 可选（多用户场景）"""
     from models import AccessSession
     token = secrets.token_hex(32)
     sess = AccessSession(
         token=token,
         ip=ip,
+        user_id=user_id,
         created_at=datetime.utcnow(),
         expires_at=datetime.utcnow() + timedelta(days=1),
     )
@@ -174,19 +175,19 @@ def _create_session(db: Session, ip: str) -> str:
     return token
 
 
-def _verify_token(db: Session, token: str) -> bool:
-    """验证 session token 是否有效"""
+def _verify_token(db: Session, token: str):
+    """验证 session token 是否有效。返回 AccessSession 或 None。"""
     from models import AccessSession
     if not token:
-        return False
+        return None
     sess = db.query(AccessSession).filter(AccessSession.token == token).first()
     if not sess:
-        return False
+        return None
     if sess.expires_at < datetime.utcnow():
         db.delete(sess)
         db.commit()
-        return False
-    return True
+        return None
+    return sess
 
 
 def require_auth(request: Request, db: Session = Depends(get_db)):
@@ -206,6 +207,18 @@ def require_auth(request: Request, db: Session = Depends(get_db)):
 
 class LoginRequest(BaseModel):
     password: str
+    username: str | None = None  # 多用户登录；缺省走单密码兼容模式
+
+
+def _user_public(u) -> dict:
+    """统一序列化 user 字段到 API 响应"""
+    return {
+        "id": u.id,
+        "username": u.username,
+        "display_name": u.display_name,
+        "is_advisor": bool(u.is_advisor),
+        "is_admin": bool(u.is_admin),
+    }
 
 
 @app.get("/api/auth/status")
@@ -225,7 +238,9 @@ def auth_status(request: Request, db: Session = Depends(get_db)):
 
 @app.post("/api/auth/login")
 def auth_login(req: LoginRequest, request: Request, db: Session = Depends(get_db)):
-    """提交密码。正确→发 token；错→按 IP 限流规则封禁"""
+    """多用户登录：username + password (bcrypt)。
+    兼容：username 缺省 + 走单密码模式 (APP_PASSWORD) → 找任意 admin 用户。
+    """
     ip = _client_ip(request)
     # 先检查是否被锁
     banned_until, remaining = _check_ban(db, ip)
@@ -235,15 +250,45 @@ def auth_login(req: LoginRequest, request: Request, db: Session = Depends(get_db
             "banned_until": banned_until.isoformat(),
             "remaining_seconds": remaining,
         }
-    # 密码长度校验
-    if not (6 <= len(req.password) <= 12):
-        return {"status": "error", "message": "密码长度需 6-12 位"}
-    # 校验密码
-    if _hash_pw(req.password) != APP_PASSWORD_HASH:
+    # 长度校验（兼容旧 6-12）
+    if not (6 <= len(req.password) <= 128):
+        return {"status": "error", "message": "密码长度需 6-128 位"}
+
+    user = None
+    if req.username:
+        # === 多用户模式：按 username 查表 + bcrypt 校验 ===
+        from models import User
+        import bcrypt as _bcrypt
+        try:
+            u = db.query(User).filter(
+                User.username == req.username, User.is_active == True
+            ).first()
+        except Exception:
+            u = None
+        if u:
+            try:
+                if _bcrypt.checkpw(req.password.encode("utf-8"), u.password_hash.encode("utf-8")):
+                    user = u
+            except Exception:
+                user = None
+    else:
+        # === 兼容：旧单密码模式 → APP_PASSWORD 走 SHA-256 旧 hash ===
+        if _hash_pw(req.password) == APP_PASSWORD_HASH:
+            from models import User
+            user = db.query(User).filter(User.is_admin == True, User.is_active == True).first()
+        if user is None and APP_PASSWORD and req.password == APP_PASSWORD:
+            # 旧库可能没 admin 用户（理论上 _ensure_seed_admin 已建）— 找不到就失败
+            from models import User
+            user = db.query(User).filter(User.is_admin == True, User.is_active == True).first()
+            if not user:
+                _record_fail(db, ip)
+                raise HTTPException(status_code=401, detail="单密码登录要求至少存在 admin 用户")
+
+    if user is None:
         rec, ban_for = _record_fail(db, ip)
         result = {
             "status": "error",
-            "message": "密码错误",
+            "message": "用户名或密码错误",
             "attempts_1y": rec.fails_1y,
         }
         if ban_for:
@@ -252,13 +297,17 @@ def auth_login(req: LoginRequest, request: Request, db: Session = Depends(get_db
             result["remaining_seconds"] = int(ban_for.total_seconds())
             result["message"] = f"输错 {rec.fails_1y} 次，已封禁 {int(ban_for.total_seconds()//3600)} 小时"
         return result
+
     # 成功
     _record_success(db, ip)
-    token = _create_session(db, ip)
+    token = _create_session(db, ip, user_id=user.id)
+    user.last_login_at = datetime.utcnow()
+    db.commit()
     return {
         "status": "ok",
         "token": token,
         "expires_in": 86400,
+        "user": _user_public(user),
     }
 
 
@@ -271,6 +320,15 @@ def auth_logout(request: Request, db: Session = Depends(get_db)):
         db.query(AccessSession).filter(AccessSession.token == token).delete()
         db.commit()
     return {"status": "ok"}
+
+
+@app.get("/api/auth/me")
+def auth_me(request: Request, db: Session = Depends(get_db)):
+    """返回当前登录用户信息（middleware 已注入 request.state.user）"""
+    u = getattr(request.state, "user", None)
+    if not u:
+        raise HTTPException(status_code=401, detail="未登录")
+    return {"user": _user_public(u)}
 
 
 # 给所有受保护端点加依赖
@@ -310,18 +368,43 @@ async def auth_middleware(request: Request, call_next):
         "/api/auth/", "/api/strategies",
         "/openapi.json", "/docs", "/docs/oauth2-redirect", "/redoc", "/favicon.ico",
     )
-    if any(path.startswith(p) for p in PUBLIC_PATHS):
-        return await call_next(request)
-    if not path.startswith("/api/"):
-        return await call_next(request)
-    # 检查 session
+    is_public = any(path.startswith(p) for p in PUBLIC_PATHS)
+    # 始终尝试注入 user（即使公开路径，也要让 /me、/auth/users 等能用 request.state.user）
     token = request.headers.get("x-session-token") or request.query_params.get("session")
     db = next(get_db())
     try:
-        if not _verify_token(db, token):
-            return _json_error(401, "需要登录", request)
+        sess = _verify_token(db, token) if token else None
+        if sess:
+            try:
+                from models import User
+                if sess.user_id:
+                    u = db.query(User).filter(User.id == sess.user_id, User.is_active == True).first()
+                    if u:
+                        request.state.user = u
+                        request.state.user_id = u.id
+                        request.state.is_advisor = bool(u.is_advisor)
+                        request.state.is_admin = bool(u.is_admin)
+            except Exception as _e:
+                import logging
+                logging.getLogger(__name__).warning("user inject failed: %s", _e)
+            # view_as 解析（来自 query / header）
+            view_as = (
+                request.query_params.get("view_as")
+                or request.headers.get("x-view-as")
+            )
+            if view_as:
+                try:
+                    request.state.view_as_user_id = int(view_as)
+                except (TypeError, ValueError):
+                    pass
     finally:
         db.close()
+    if is_public:
+        return await call_next(request)
+    if not path.startswith("/api/"):
+        return await call_next(request)
+    if not sess:
+        return _json_error(401, "需要登录", request)
     return await call_next(request)
 
 

@@ -1,0 +1,112 @@
+"""海外市场财务数据 service — yfinance 获取 + upsert。"""
+from __future__ import annotations
+
+import logging
+import time
+from datetime import date
+
+from sqlalchemy.orm import Session
+
+from crawlers.price_data import fetch_yfinance_info, _infer_market_from_ticker
+from models import OverseasShareFinancialSnapshot
+
+logger = logging.getLogger(__name__)
+
+
+def upsert_overseas_financial(db: Session, data: dict) -> dict:
+    """单条写入海外财务数据（upsert）。
+
+    Args:
+        db: 数据库会话
+        data: {stock_code, stock_name, market, pe_ttm, pb_mrq, ps_ttm,
+               dividend_yield, market_cap, eps_fy1, sector, industry, as_of_date}
+
+    Returns: {status, market}
+    """
+    stock_code = data.get("stock_code", "")
+    if not stock_code:
+        raise ValueError("stock_code 不能为空")
+
+    market = data.get("market")
+    if not market:
+        market = _infer_market_from_ticker(stock_code)
+    as_of = data.get("as_of_date")
+    if isinstance(as_of, str):
+        as_of = date.fromisoformat(as_of)
+
+    existing = db.query(OverseasShareFinancialSnapshot).filter(
+        OverseasShareFinancialSnapshot.stock_code == stock_code,
+        OverseasShareFinancialSnapshot.as_of_date == as_of,
+    ).first()
+
+    fields = (
+        "stock_name", "market", "pe_ttm", "pb_mrq", "ps_ttm",
+        "dividend_yield", "market_cap", "eps_fy1",
+        "sector", "industry",
+    )
+
+    if existing:
+        for f in fields:
+            if f in data:
+                setattr(existing, f, data[f])
+    else:
+        kwargs = {"stock_code": stock_code, "as_of_date": as_of, "user_id": 1, "market": market}
+        for f in fields:
+            if f in data:
+                kwargs[f] = data[f]
+        snap = OverseasShareFinancialSnapshot(**kwargs)
+        db.add(snap)
+
+    db.commit()
+    return {"status": "ok", "market": market}
+
+
+def fetch_and_store_overseas_financials(db: Session, stock_codes: list[str], as_of_date: date) -> dict:
+    """批量从 yfinance 获取海外财务数据并存储。
+
+    Args:
+        db: 数据库会话
+        stock_codes: yfinance ticker 列表
+        as_of_date: 截止日期
+
+    Returns: {status, fetched, stored, errors}
+    """
+    fetched = 0
+    stored = 0
+    errors = []
+
+    for code in stock_codes:
+        try:
+            yf_info = fetch_yfinance_info(code)
+            if not yf_info:
+                errors.append(f"{code}: yfinance 返回空")
+                continue
+
+            fetched += 1
+
+            data = {
+                "stock_code": code,
+                "stock_name": yf_info.get("name", ""),
+                "market": yf_info.get("market", "US"),
+                "pe_ttm": yf_info.get("pe_ttm"),
+                "pb_mrq": yf_info.get("pb_mrq"),
+                "ps_ttm": yf_info.get("ps_ttm"),
+                "dividend_yield": yf_info.get("dividend_yield"),
+                "market_cap": yf_info.get("market_cap_b"),
+                "eps_fy1": yf_info.get("eps_fy1"),
+                "sector": yf_info.get("sector"),
+                "industry": yf_info.get("industry"),
+                "as_of_date": as_of_date,
+            }
+
+            upsert_overseas_financial(db, data)
+            stored += 1
+
+            time.sleep(3)
+
+        except Exception as e:
+            errors.append(f"{code}: {str(e)}")
+            logger.warning("获取海外财务数据失败 [%s]: %s", code, e)
+            continue
+
+    return {"status": "ok", "fetched": fetched, "stored": stored, "errors": errors}

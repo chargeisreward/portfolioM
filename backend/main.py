@@ -15,7 +15,7 @@ from sqlalchemy import func
 from sqlalchemy.orm import Session
 
 from database import get_db, init_db
-from models import FundIndexMap
+from models import FundIndexMap, Holding, AssetType, OverseasShareFinancialSnapshot
 from schemas import (
     HoldingOut, HoldingSummary, PenetrationRow, PenetrationSummary,
     IndustryChainAnalysis, GrowthAnalysis, ValuationMetrics,
@@ -5445,4 +5445,54 @@ async def admin_upload_financials_excel(
 
     # 导入
     result = import_excel_batch(db, full_path, market, as_of)
+    return result
+
+
+@app.get("/api/admin/overseas-financials")
+def admin_list_overseas_financials(
+    market: str = Query(None),
+    page: int = Query(1, ge=1),
+    page_size: int = Query(50, ge=1, le=200),
+    db: Session = Depends(get_db),
+):
+    """查看海外财务数据快照。"""
+    query = db.query(OverseasShareFinancialSnapshot)
+    if market:
+        query = query.filter(OverseasShareFinancialSnapshot.market == market)
+    total = query.count()
+    items = query.order_by(OverseasShareFinancialSnapshot.as_of_date.desc()) \
+        .offset((page - 1) * page_size).limit(page_size).all()
+    return {
+        "items": [{
+            "stock_code": s.stock_code,
+            "stock_name": s.stock_name,
+            "market": s.market,
+            "as_of_date": str(s.as_of_date),
+            "pe_ttm": s.pe_ttm,
+            "pb_mrq": s.pb_mrq,
+            "ps_ttm": s.ps_ttm,
+            "dividend_yield": s.dividend_yield,
+            "market_cap": s.market_cap,
+            "sector": s.sector,
+            "industry": s.industry,
+            "source": s.source,
+        } for s in items],
+        "total": total,
+    }
+
+
+@app.post("/api/admin/overseas-financials/refresh")
+def admin_refresh_overseas_financials(db: Session = Depends(get_db)):
+    """手动触发海外财务数据更新。"""
+    from services.overseas_financial_service import fetch_and_store_overseas_financials
+    overseas_holdings = db.query(Holding).filter(
+        Holding.asset_type.in_([
+            AssetType.US_STOCK.value,
+            AssetType.US_ETF.value,
+        ])
+    ).all()
+    overseas_codes = list(set(h.security_code for h in overseas_holdings))
+    if not overseas_codes:
+        return {"status": "ok", "fetched": 0, "stored": 0, "errors": ["无海外持仓"]}
+    result = fetch_and_store_overseas_financials(db, overseas_codes, date.today())
     return result

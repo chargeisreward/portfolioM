@@ -2,11 +2,7 @@
 不知道 user_id，不读 Holding 表。可独立复用。
 
 数据来源：scheduler 每日生成的 fund_drill_snapshot 预计算表。
-
-注意：FundDrillSnapshot 模型本身不含 index_code / index_name 列，
-指数关系通过 FundIndexMap（fund_code → index_code）获取。
-本 service 在查询时用 getattr 安全读取 index_code/index_name，
-兼容 mock 测试与未来可能扩展的模型字段。
+index_code/index_name 通过 FundIndexMap join 获取（FundDrillSnapshot 无此字段）。
 """
 from __future__ import annotations
 
@@ -19,6 +15,12 @@ from sqlalchemy.orm import Session
 from models import FundDrillSnapshot, FundIndexMap
 
 logger = logging.getLogger(__name__)
+
+
+def _load_fund_index_map(db: Session) -> dict[str, tuple[str, str]]:
+    """加载 fund_code → (index_code, index_name) 映射。"""
+    rows = db.query(FundIndexMap).all()
+    return {r.fund_code: (r.index_code.split(".")[0], r.index_name or "") for r in rows}
 
 
 def get_public_cards(db: Session, as_of: _date) -> list[dict]:
@@ -45,22 +47,27 @@ def get_public_cards(db: Session, as_of: _date) -> list[dict]:
     if not rows:
         return []
 
+    # 加载 fund_code → (index_code, index_name) 映射
+    fund_map = _load_fund_index_map(db)
+
     by_index: dict[str, dict] = {}
     for r in rows:
-        idx_code = (getattr(r, "index_code", "") or "").split(".")[0]
-        if not idx_code:
+        fund_code = r.fund_code
+        if fund_code not in fund_map:
             continue
+        idx_code, idx_name = fund_map[fund_code]
+
         if idx_code not in by_index:
             by_index[idx_code] = {
                 "index_code": idx_code,
-                "index_name": getattr(r, "index_name", None) or idx_code,
+                "index_name": idx_name or idx_code,
                 "as_of": as_of.isoformat(),
                 "fund_codes": set(),
                 "stock_set": set(),
                 "total_weight": 0.0,
             }
         bucket = by_index[idx_code]
-        bucket["fund_codes"].add(r.fund_code)
+        bucket["fund_codes"].add(fund_code)
         bucket["stock_set"].add(r.stock_code)
         bucket["total_weight"] += (r.weight_pct or 0.0) / 100.0
 
@@ -100,38 +107,31 @@ def get_public_detail(db: Session, as_of: _date, index_code: str) -> dict | None
     }
     """
     idx_code = index_code.split(".")[0]
-    # FundDrillSnapshot 无 index_code 列，先按 as_of_date 过滤，
-    # 再用 fund_code.isnot(None) 作为占位第二过滤（匹配 mock 链），
-    # 最终在 Python 侧按 index_code 筛选。
+
+    # 通过 FundIndexMap 找到跟踪该 index 的 fund_codes
+    fund_maps = db.query(FundIndexMap).filter(
+        FundIndexMap.index_code.startswith(idx_code)
+    ).all()
+    if not fund_maps:
+        return None
+
+    fund_codes = [fm.fund_code for fm in fund_maps]
+    fund_name_map = {fm.fund_code: fm.index_name or "" for fm in fund_maps}
+    index_name = fund_maps[0].index_name or idx_code
+
+    # 查这些 fund 的 drill snapshot
     rows = db.query(FundDrillSnapshot).filter(
-        FundDrillSnapshot.as_of_date == as_of
-    ).filter(
-        FundDrillSnapshot.fund_code.isnot(None)
+        FundDrillSnapshot.as_of_date == as_of,
+        FundDrillSnapshot.fund_code.in_(fund_codes),
     ).all()
 
     if not rows:
         return None
 
-    # Python 侧按 index_code 过滤（FundDrillSnapshot 无 index_code 列）
-    filtered = [
-        r for r in rows
-        if (getattr(r, "index_code", "") or "").split(".")[0] == idx_code
-    ]
-    if not filtered:
-        return None
-
-    # 获取基金名称
-    fund_codes = list(set(r.fund_code for r in filtered))
-    fund_maps = db.query(FundIndexMap).filter(
-        FundIndexMap.fund_code.in_(fund_codes)
-    ).all()
-    fund_name_map = {fm.fund_code: getattr(fm, "fund_name", None) or "" for fm in fund_maps}
-    index_name = getattr(filtered[0], "index_name", None) or idx_code
-
     constituents_by_code: dict[str, dict] = {}
     funds_by_code: dict[str, dict] = {}
 
-    for r in filtered:
+    for r in rows:
         # 成分股
         if r.stock_code not in constituents_by_code:
             constituents_by_code[r.stock_code] = {

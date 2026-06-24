@@ -310,3 +310,28 @@ RUNNING → SKIPPED  (跳过执行)
 - drill_orchestration_service.py — join 层
 - drillable_funds.py — 已标记 deprecated
 - 24 个测试全部通过
+
+### 2026-06-25 下钻 E2E HTTP 测试 + FundIndexMap 回退修复
+
+**影响范围**：中（发现并修复生产数据场景 bug）
+
+**问题**：E2E HTTP 测试发现 advisor（44 行持仓）的下钻卡片返回空。根因：`SecurityMaster` 表有 32 行数据但 `is_drillable` 全部为 `False`（admin 从未设置），`get_user_fund_codes` 在 `SecurityMaster` 有数据时只依赖 `is_drillable` 标志，不检查 `FundIndexMap`，导致返回空集合。
+
+**修复**：`drill_user_service.get_user_fund_codes` 增加 FundIndexMap 回退逻辑 — 当 `SecurityMaster` 有数据但 `is_drillable=True` 的查询结果为空时，回退到 `Holding JOIN FundIndexMap` 查找可下钻基金。
+
+**TDD 流程**：
+1. 写失败测试 `test_get_user_fund_codes_falls_back_to_fund_index_map`
+2. 修改 `get_user_fund_codes` 添加回退逻辑
+3. 26 个测试全部通过（25 原有 + 1 新增）
+
+**E2E HTTP 测试结果**（admin/advisor/user 账号，密码 123456）：
+
+| 测试 | 预期 | 实际 | 状态 |
+|------|------|------|------|
+| admin → drillable-indices | 0 卡片（无持仓） | 0 卡片 | ✅ |
+| advisor → drillable-indices | 有卡片 | 12 卡片 | ✅ |
+| advisor → index-drill | 有明细 | 50 成分股 + 1 基金 | ✅ |
+| user → drillable-indices | 0 卡片（无持仓） | 0 卡片 | ✅ |
+| admin view_as=advisor | advisor 的卡片 | 12 卡片 | ✅ |
+
+**Commit**：`e5add81`

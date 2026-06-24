@@ -24,6 +24,7 @@ from datetime import date, timedelta
 from sqlalchemy.orm import Session
 
 from models import (
+    ExchangeRate,
     FundDrillSnapshot,
     FundIndexMap,
     Holding,
@@ -40,10 +41,25 @@ STOCK_RATIO = 1 - CASH_RATIO         # 95% 成分股
 
 
 def _latest_index_constituents(db: Session, idx_code: str, on_or_before: date) -> list[IndexConstituentSnapshot]:
-    """取 idx_code 在 on_or_before 或之前的最近一份成分股快照。
+    """取 idx_code 在 on_or_before 或之前的最近一份「带权重的」成分股快照。
 
-    取最新 as_of_date 那一组（用子查询确定 max_date），避免不同月份同只股票去重失败。
+    优先取权重和 > 0 的 as_of_date（用户 2026-06-24 补丁）：
+      - 如果 5/29 有 weight（非空），就用 5/29（指数公司真实权重）
+      - 如果 5/29 weight 全空（如 399673 PG 旧数据），才用最近的 6/15 兜底
     """
+    # 步骤 1: 找到 5/29 是否有 weight
+    may29 = (
+        db.query(IndexConstituentSnapshot)
+        .filter(
+            IndexConstituentSnapshot.index_code == idx_code,
+            IndexConstituentSnapshot.as_of_date == date(2026, 5, 29),
+        )
+        .all()
+    )
+    if may29 and any((r.weight or 0) > 0 for r in may29):
+        return may29  # 优先用 5/29 真实权重
+
+    # 步骤 2: 回退到 on_or_before 之前的最新一份
     max_date_sub = (
         db.query(IndexConstituentSnapshot.as_of_date)
         .filter(
@@ -88,6 +104,31 @@ def _get_stock_price(db: Session, stock_code: str, as_of_date: date) -> tuple[fl
             if row and row.close_px:
                 return float(row.close_px), (i > 0)
     return None, False
+
+
+def _guess_currency(stock_code: str) -> str:
+    """根据股票代码推原币。"""
+    code = (stock_code or "").upper().strip()
+    if code.endswith(".HK"):
+        return "HKD"
+    if code.endswith(".US"):
+        return "USD"
+    return "CNY"
+
+
+def _get_fx_rate(db: Session, from_ccy: str, to_ccy: str, as_of_date: date) -> float | None:
+    """取 T 日汇率 (from→to)；若 T 日缺失，向前回退 7 天。"""
+    if from_ccy == to_ccy:
+        return 1.0
+    for d in [as_of_date - timedelta(days=i) for i in range(7)]:
+        row = db.query(ExchangeRate).filter(
+            ExchangeRate.rate_date == d,
+            ExchangeRate.from_currency == from_ccy,
+            ExchangeRate.to_currency == to_ccy,
+        ).first()
+        if row and row.rate:
+            return float(row.rate)
+    return None
 
 
 def _get_fund_price(db: Session, fund_code: str) -> float | None:
@@ -164,11 +205,28 @@ def generate_drill_snapshot_for_date(db: Session, as_of_date: date) -> dict:
             details.append({"fund": fund_code, "skip": "no_fund_price", "index": idx_code})
             continue
 
+        # === 2026-06-24 补丁 ===
+        # 5/29 权重和 < 100% 时，差额 × 95% 划入下钻-现金
+        # priced 是 list[(IndexConstituentSnapshot, price, stale)]
+        weight_sum = sum((s.weight or 0) for s, _, _ in priced)
+        weight_deficit = max(0.0, 100.0 - weight_sum)  # 0 if weight_sum >= 100
+        weight_deficit_cash = weight_deficit * STOCK_RATIO  # *0.95
+        # 也保留 fallback: 个别成分股 weight=NULL 时, 用 100/N 等权
+        default_w = 100.0 / len(constituents) if constituents else 0.0
+
         # 生成 shares_equivalent
         fund_rows = []
         for s, price, stale in priced:
-            weight_pct = s.weight if (s.weight and s.weight > 0) else (100.0 / len(constituents))
-            shares_eq = fund_price * STOCK_RATIO * (weight_pct / 100.0) / price
+            # 个别 weight NULL 用 fallback 等权
+            weight_pct = s.weight if (s.weight and s.weight > 0) else default_w
+            currency = _guess_currency(s.stock_code)
+            # 汇率折算 (2026-06-24 补丁): 港股/美股用 CNY 价算 shares_eq
+            fx_rate = _get_fx_rate(db, currency, "CNY", as_of_date)
+            fx_date = as_of_date if fx_rate else None
+            price_cny = float(price) * fx_rate if fx_rate else float(price)
+            # shares_eq 用 CNY 价算: shares = (fund_price_CNY × 0.95 × weight) / price_CNY
+            # 这样: shares_eq × current_price_cny = fund_price × 0.95 × weight / 100
+            shares_eq = fund_price * STOCK_RATIO * (weight_pct / 100.0) / price_cny
             fund_rows.append(FundDrillSnapshot(
                 fund_code=fund_code,
                 as_of_date=as_of_date,
@@ -179,7 +237,16 @@ def generate_drill_snapshot_for_date(db: Session, as_of_date: date) -> dict:
                 current_price=float(price),
                 shares_equivalent=float(shares_eq),
                 is_stale_price=bool(stale),
+                currency=currency,
+                current_price_cny=price_cny,
+                cny_currency="CNY" if price_cny is not None else None,
+                fx_rate=fx_rate,
+                fx_date=fx_date,
+                weight_deficit_cash=0.0,  # 仅在首行写入
             ))
+        # 把 weight_deficit_cash 标在第一行 (代表「该 fund 整批」)
+        if fund_rows:
+            fund_rows[0].weight_deficit_cash = weight_deficit_cash
 
         # 用 INSERT ... ON CONFLICT DO NOTHING 幂等写入
         from sqlalchemy.dialects.postgresql import insert as pg_insert
@@ -195,6 +262,12 @@ def generate_drill_snapshot_for_date(db: Session, as_of_date: date) -> dict:
                 "current_price": r.current_price,
                 "shares_equivalent": r.shares_equivalent,
                 "is_stale_price": r.is_stale_price,
+                "currency": r.currency,
+                "current_price_cny": r.current_price_cny,
+                "cny_currency": r.cny_currency,
+                "fx_rate": r.fx_rate,
+                "fx_date": r.fx_date,
+                "weight_deficit_cash": r.weight_deficit_cash,
                 "updated_at": _dt.utcnow(),
             }
             for r in fund_rows
@@ -210,6 +283,8 @@ def generate_drill_snapshot_for_date(db: Session, as_of_date: date) -> dict:
             "priced": len(priced),
             "stale_count": sum(1 for _, _, st in priced if st),
             "rows": len(fund_rows),
+            "weight_sum": round(weight_sum, 4),
+            "weight_deficit_cash": round(weight_deficit_cash, 4),
         })
         logger.info(
             "drill snapshot %s %s: %d/%d priced, %d rows",

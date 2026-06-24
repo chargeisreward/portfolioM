@@ -359,14 +359,18 @@ class IndexConstituentSnapshot(Base):
 class FundDrillSnapshot(Base):
     """公共下钻截面快照（按 fund × as_of_date 批量生成 — 2026-06-24 引入）。
 
-    算法（参考 spec §3.2 weight-invariant + 用户确认 95/5 拆分）：
+    算法（spec §3.2 weight-invariant + 用户 2026-06-24 补丁）：
       1. 读取 index_constituents[最近月份] 的成分股 + 权重 weight + baseline_price
       2. 取每只成分股 T 日 current_price；缺失用 T-1 价（视为停牌）
       3. 校验：当日获得收盘价的成分股占比 >= 95% 才生成
-      4. shares_equivalent = fund_price × 0.95 × (weight/100) / current_price
+      4. 权重和 = Σ(weight)，若 < 100%，差额 × 95% 加入「下钻-现金」(weight_deficit_cash 列)
+      5. shares_equivalent = fund_price × 0.95 × (weight/100) / current_price
          其中 fund_price = Holding.price（fund 当日基金价格）
          5% 现金部分：cash_per_unit = fund_price × 0.05（不需要存股票级记录）
-      5. user 层：user_drill[s] = Holding.quantity × shares_equivalent[s]
+      6. QDII 港股：current_price 是原币（HKD），shares_eq 用原币价算
+         current_price_cny = current_price × fx_rate（5% 现金也用 CNY）
+      7. user 层：user_drill[s] = Holding.quantity × shares_equivalent[s]
+         user_cash = Holding.quantity × fund_price × 0.05
 
     公共数据，不带 user_id。
     """
@@ -382,11 +386,19 @@ class FundDrillSnapshot(Base):
     stock_code = Column(String(20), nullable=False, index=True)
     stock_name = Column(String(80))
     weight_pct = Column(Float, nullable=False)            # 指数权重 %（来自 index_constituents）
-    baseline_price = Column(Float)                          # 成分股基准日收盘价
-    current_price = Column(Float, nullable=False)           # 成分股当日收盘价（缺失时用 T-1）
-    shares_equivalent = Column(Float, nullable=False)       # 1 份基金对应股数
+    baseline_price = Column(Float)                          # 成分股基准日收盘价（原币）
+    current_price = Column(Float, nullable=False)           # 成分股当日收盘价（原币，缺失时用 T-1）
+    shares_equivalent = Column(Float, nullable=False)       # 1 份基金对应股数（基于原币价）
     is_stale_price = Column(Boolean, default=False)          # True=current_price 是 T-1 替补
     updated_at = Column(DateTime, default=datetime.utcnow, onupdate=datetime.utcnow)
+
+    # === 2026-06-24 双币种补丁 ===
+    currency = Column(String(8))                             # 原币 (HKD / CNY / USD)
+    current_price_cny = Column(Float)                        # 本币 (CNY) 收盘价
+    cny_currency = Column(String(8), default='CNY')           # 本币币种
+    fx_rate = Column(Float)                                  # 当日汇率 (to_cny)
+    fx_date = Column(Date)                                   # 汇率日期
+    weight_deficit_cash = Column(Float, default=0)            # 权重和 < 100% 时的差额×95% 划入下钻-现金
 
 
 class FundDailyNav(Base):

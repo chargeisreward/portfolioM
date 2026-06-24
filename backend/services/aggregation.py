@@ -22,6 +22,7 @@ from models import (
     Csi300ConstituentSnapshot,
     FullHoldingSnapshot,
     HKShareFinancialSnapshot,
+    OverseasShareFinancialSnapshot,
 )
 
 logger = logging.getLogger(__name__)
@@ -94,6 +95,12 @@ def resolve_dynamic_metrics_for_stock(db: Session, stock_code: str):
         snap = db.query(AShareFinancialSnapshot).filter_by(stock_code=candidate).first()
         if snap:
             return snap.pe_ttm_dynamic, snap.pb_mrq_dynamic, snap.ps_ttm_dynamic
+    # 3. 查海外市场
+    o_snap = db.query(OverseasShareFinancialSnapshot).filter(
+        OverseasShareFinancialSnapshot.stock_code == stock_code,
+    ).order_by(OverseasShareFinancialSnapshot.as_of_date.desc()).first()
+    if o_snap:
+        return o_snap.pe_ttm_dynamic, o_snap.pb_mrq_dynamic, o_snap.ps_ttm_dynamic
     return None, None, None
 
 

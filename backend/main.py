@@ -5,13 +5,14 @@ import re as _re
 import secrets
 from datetime import date, datetime, timedelta
 from pathlib import Path
-from fastapi import FastAPI, Depends, Query, Request, HTTPException
+from fastapi import FastAPI, Depends, Query, Request, HTTPException, Body
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 from sqlalchemy import func
 from sqlalchemy.orm import Session
 
 from database import get_db, init_db
+from models import FundIndexMap
 from schemas import (
     HoldingOut, HoldingSummary, PenetrationRow, PenetrationSummary,
     IndustryChainAnalysis, GrowthAnalysis, ValuationMetrics,
@@ -4976,3 +4977,164 @@ def analyst_industry_chains(
     from middleware.auth import _resolve_eff_from_request
     _u, eff_uid = _resolve_eff_from_request(request, db)
     return get_industry_chains(db, as_of_date, user_id=eff_uid)
+
+
+# ========== Admin: 证券主数据 ==========
+
+@app.get("/api/admin/security-master")
+def admin_list_securities(
+    type: str | None = None,
+    market: str | None = None,
+    drillable: bool | None = None,
+    search: str | None = None,
+    page: int = 1,
+    page_size: int = 50,
+    db: Session = Depends(get_db),
+):
+    """列出证券主数据（分页+筛选）。"""
+    from services.security_master_service import list_securities
+    return list_securities(db, sec_type=type, market=market, drillable=drillable, search=search, page=page, page_size=page_size)
+
+
+@app.post("/api/admin/security-master")
+def admin_create_security(body: dict = Body(...), db: Session = Depends(get_db)):
+    """新增证券主数据。"""
+    from services.security_master_service import create_security
+    return create_security(db, body)
+
+
+@app.put("/api/admin/security-master/{code}")
+def admin_update_security(code: str, body: dict = Body(...), db: Session = Depends(get_db)):
+    """更新证券主数据。"""
+    from services.security_master_service import update_security
+    result = update_security(db, code, body)
+    if not result:
+        raise HTTPException(404, "证券不存在")
+    return result
+
+
+@app.delete("/api/admin/security-master/{code}")
+def admin_delete_security(code: str, db: Session = Depends(get_db)):
+    """删除证券主数据（有持仓时禁止）。"""
+    from services.security_master_service import delete_security
+    try:
+        ok = delete_security(db, code)
+        if not ok:
+            raise HTTPException(404, "证券不存在")
+        return {"status": "ok"}
+    except ValueError as e:
+        raise HTTPException(400, str(e))
+
+
+@app.post("/api/admin/security-master/sync-from-holdings")
+def admin_sync_from_holdings(db: Session = Depends(get_db)):
+    """从持仓同步证券主数据。"""
+    from services.security_master_service import sync_from_holdings
+    count = sync_from_holdings(db)
+    return {"status": "ok", "synced": count}
+
+
+@app.post("/api/admin/security-master/sync-from-drill")
+def admin_sync_from_drill(db: Session = Depends(get_db)):
+    """从下钻 snapshot 同步证券主数据。"""
+    from services.security_master_service import sync_from_drill
+    count = sync_from_drill(db)
+    return {"status": "ok", "synced": count}
+
+
+@app.post("/api/admin/security-master/init")
+def admin_init_security_master(db: Session = Depends(get_db)):
+    """初始化证券主数据（从现有数据批量导入）。"""
+    from services.security_master_service import init_from_existing
+    count = init_from_existing(db)
+    return {"status": "ok", "initialized": count}
+
+
+# ========== Admin: 基金-指数映射 ==========
+
+@app.get("/api/admin/fund-index-map")
+def admin_list_fund_index_map(
+    search: str | None = None,
+    page: int = 1,
+    page_size: int = 50,
+    db: Session = Depends(get_db),
+):
+    """列出基金-指数映射。"""
+    q = db.query(FundIndexMap)
+    if search:
+        like = f"%{search}%"
+        q = q.filter(FundIndexMap.fund_code.like(like) | FundIndexMap.fund_name.like(like) | FundIndexMap.index_code.like(like))
+    total = q.count()
+    rows = q.order_by(FundIndexMap.fund_code).offset((page - 1) * page_size).limit(page_size).all()
+    return {"items": [{"fund_code": r.fund_code, "fund_name": r.fund_name, "index_code": r.index_code, "index_name": r.index_name, "benchmark_formula": r.benchmark_formula, "as_of_date": r.as_of_date.isoformat(), "source": r.source} for r in rows], "total": total, "page": page, "page_size": page_size}
+
+
+@app.post("/api/admin/fund-index-map")
+def admin_create_fund_index_map(body: dict = Body(...), db: Session = Depends(get_db)):
+    """新增基金-指数映射。"""
+    fm = FundIndexMap(
+        fund_code=body["fund_code"], fund_name=body.get("fund_name"),
+        index_code=body["index_code"], index_name=body.get("index_name"),
+        benchmark_formula=body.get("benchmark_formula"),
+        as_of_date=body.get("as_of_date", date.today()),
+        source=body.get("source", "manual"),
+    )
+    db.add(fm)
+    db.commit()
+    return {"status": "ok", "fund_code": fm.fund_code}
+
+
+@app.put("/api/admin/fund-index-map/{fund_code}/{as_of_date}")
+def admin_update_fund_index_map(fund_code: str, as_of_date: date, body: dict = Body(...), db: Session = Depends(get_db)):
+    """更新基金-指数映射。"""
+    fm = db.query(FundIndexMap).filter(FundIndexMap.fund_code == fund_code, FundIndexMap.as_of_date == as_of_date).first()
+    if not fm:
+        raise HTTPException(404, "映射不存在")
+    for key in ("fund_name", "index_code", "index_name", "benchmark_formula", "source"):
+        if key in body:
+            setattr(fm, key, body[key])
+    db.commit()
+    return {"status": "ok"}
+
+
+@app.delete("/api/admin/fund-index-map/{fund_code}/{as_of_date}")
+def admin_delete_fund_index_map(fund_code: str, as_of_date: date, db: Session = Depends(get_db)):
+    """删除基金-指数映射。"""
+    fm = db.query(FundIndexMap).filter(FundIndexMap.fund_code == fund_code, FundIndexMap.as_of_date == as_of_date).first()
+    if not fm:
+        raise HTTPException(404, "映射不存在")
+    db.delete(fm)
+    db.commit()
+    return {"status": "ok"}
+
+
+# ========== Admin: 数据就绪 + 任务历史 ==========
+
+@app.get("/api/admin/data-readiness")
+def admin_data_readiness(as_of_date: date = Query(...), db: Session = Depends(get_db)):
+    """查询数据就绪状态。"""
+    from services.data_readiness_service import get_data_readiness
+    return {"as_of_date": as_of_date.isoformat(), "items": get_data_readiness(db, as_of_date)}
+
+
+@app.get("/api/admin/data-pull-tasks")
+def admin_list_data_pull_tasks(
+    status: str | None = None,
+    date_from: datetime | None = None,
+    date_to: datetime | None = None,
+    page: int = 1,
+    page_size: int = 50,
+    db: Session = Depends(get_db),
+):
+    """查询数据拉取任务历史。"""
+    from services.data_pull_task_service import list_tasks
+    return list_tasks(db, status=status, date_from=date_from, date_to=date_to, page=page, page_size=page_size)
+
+
+@app.post("/api/admin/data-pull-tasks/trigger/{job_id}")
+def admin_trigger_data_pull_task(job_id: str, request: Request):
+    """手动触发数据拉取任务。"""
+    # 简单实现：返回 job_id，实际触发逻辑在 Task 7 集成 scheduler
+    user_id = getattr(request.state, 'user_id', None) or getattr(request.state, 'user', None)
+    triggered_by = f"manual:{user_id}" if user_id else "manual"
+    return {"status": "ok", "job_id": job_id, "triggered_by": triggered_by, "message": "触发请求已记录，Task 7 将集成 scheduler"}

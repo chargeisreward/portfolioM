@@ -1,4 +1,17 @@
-"""Drillable-INDICES service — 2026-06-24 重构（公共下钻层 fund_drill_snapshot）
+"""[DEPRECATED 2026-06-24] 此模块已被三层 service 替代：
+  - drill_public_service.py（公共层：只读 fund_drill_snapshot + fund_index_map）
+  - drill_user_service.py（用户层：只读 Holding）
+  - drill_orchestration_service.py（join 层：调 public + user，返回完整结果）
+
+迁移状态：
+  - 已迁移：/api/penetration/drillable-indices、/api/penetration/index-drill
+  - 未迁移（仍用本模块）：full-holding-table、drill-dimension-aggregate、
+    industry-breakdown、csi300-pe、all-drilled-stocks 等端点
+  新代码请勿 import 本模块，应直接使用 drill_orchestration_service。
+
+---
+
+Drillable-INDICES service — 2026-06-24 重构（公共下钻层 fund_drill_snapshot）
 
 新算法（按用户确认）：
   公共层（scheduler 批量生成 fund_drill_snapshot）：

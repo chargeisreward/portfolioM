@@ -2576,12 +2576,20 @@ def remove_watchlist(
 
 
 @app.put("/api/watchlist/{code}/weight")
-def set_watchlist_weight(code: str, req: WatchWeightRequest, db: Session = Depends(get_db)):
-    """修改权重"""
+def set_watchlist_weight(
+    code: str,
+    req: WatchWeightRequest,
+    request: Request,
+    user: User = Depends(require_user),
+    db: Session = Depends(get_db),
+):
+    """修改权重（仅改自己 user 的）"""
     from models import Watchlist
-    w = db.query(Watchlist).filter(Watchlist.code == code).first()
+    w = db.query(Watchlist).filter(
+        Watchlist.user_id == user.id, Watchlist.code == code
+    ).first()
     if not w:
-        return {"status": "error", "message": "not found"}
+        return {"status": "error", "message": f"{code} 不在关注清单"}
     w.weight = req.weight
     db.commit()
     return {"status": "ok"}
@@ -3048,18 +3056,18 @@ def get_top10_holdings(
     from sqlalchemy import func as _func
 
     # ---- 1. 拿 undrilled + drilled 全量数据（复用 full-holding-table 的核心逻辑）----
+    from middleware.auth import _resolve_eff_from_request
+    _u, eff_uid = _resolve_eff_from_request(request, db)
     a_snap_raw = {a.stock_code.split(".")[0]: a for a in
-                  db.query(AShareFinancialSnapshot).filter_by(as_of_date=as_of_date).all()}
+                  db.query(AShareFinancialSnapshot).filter_by(as_of_date=as_of_date, user_id=eff_uid).all()}
     h_snap_raw = {h.stock_code.split(".")[0]: h for h in
-                  db.query(HKShareFinancialSnapshot).filter_by(as_of_date=as_of_date).all()}
+                  db.query(HKShareFinancialSnapshot).filter_by(as_of_date=as_of_date, user_id=eff_uid).all()}
     for k, v in list(a_snap_raw.items()):
         a_snap_raw.setdefault(v.stock_code, v)
     for k, v in list(h_snap_raw.items()):
         h_snap_raw.setdefault(v.stock_code, v)
 
     by_code: dict[str, dict] = {}
-    from middleware.auth import _resolve_eff_from_request
-    _u, eff_uid = _resolve_eff_from_request(request, db)
     for h in db.query(Holding).filter(Holding.user_id == eff_uid).all():
         c = h.security_code
         if c not in by_code:
@@ -4255,7 +4263,7 @@ def get_kpi(
     csi300_pe = None
     try:
         from services.drillable_funds import list_drillable_indices
-        indices = list_drillable_indices(db, as_of_date)
+        indices = list_drillable_indices(db, as_of_date, user_id=eff_uid)
         csi300_card = next((c for c in indices if c.get("index_code") == "000300"), None)
         if csi300_card:
             csi300_pe = csi300_card.get("weighted_pe")

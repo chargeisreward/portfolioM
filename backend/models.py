@@ -58,16 +58,43 @@ class Currency(str, enum.Enum):
 
 
 class SecurityMaster(Base):
-    """证券基础表：维护每只证券的原币种、类型等基础属性"""
+    """证券基础表：维护每只证券的原币种、类型等基础属性 + 管理员扩展属性。"""
     __tablename__ = "security_master"
 
     security_code = Column(String(20), primary_key=True)
     security_name = Column(String(100))
     currency = Column(String(10), default="CNY")     # 原币种（上市地交易币种）
-    asset_type = Column(String(20))                   # 证券类型
+    asset_type = Column(String(20))                   # 证券类型 (a_share_equity / a_share_etf / hk_equity / ...)
     type2 = Column(String(20), nullable=True)         # 主题类型2（红利/新兴产业/黄金）
     exchange = Column(String(20), nullable=True)      # 交易所
-    updated_at = Column(DateTime, default=datetime.utcnow)
+    # --- 管理员扩展属性 (2026-06-24) ---
+    security_type = Column(String(20), nullable=True)  # fund / stock / bond
+    fund_type = Column(String(20), nullable=True)      # 仅 fund: etf(场内) / otc(场外)
+    market = Column(String(8), nullable=True)          # CN / HK / US / OF
+    is_drillable = Column(Boolean, default=False)      # 仅 fund 可下钻；stock 恒 False
+    index_code = Column(String(20), nullable=True)     # 仅 fund: 跟踪指数代码
+    index_name = Column(String(80), nullable=True)     # 仅 fund: 跟踪指数名称
+    benchmark_formula = Column(String(500), nullable=True)  # 仅 fund: 业绩比较基准
+    premium_discount = Column(Float, nullable=True)    # 仅 ETF: 折溢价率（预留）
+    note = Column(String(200), nullable=True)
+    updated_by = Column(Integer, nullable=True)        # 最后修改人 user_id
+    updated_at = Column(DateTime, default=datetime.utcnow, onupdate=datetime.utcnow)
+
+
+class DataPullTask(Base):
+    """数据拉取任务执行记录。"""
+    __tablename__ = "data_pull_task"
+
+    id = Column(Integer, primary_key=True, autoincrement=True)
+    job_id = Column(String(60), nullable=False, index=True)
+    job_name = Column(String(100))
+    started_at = Column(DateTime, nullable=False)
+    finished_at = Column(DateTime, nullable=True)
+    status = Column(String(20), nullable=False)          # SUCCESS / FAILED / RUNNING / SKIPPED
+    records_pulled = Column(Integer, default=0)
+    error_message = Column(Text, nullable=True)
+    triggered_by = Column(String(40))                    # scheduler / manual:<user_id>
+    created_at = Column(DateTime, default=datetime.utcnow)
 
 
 class SecurityTypeConfig(Base):

@@ -6,6 +6,7 @@ import AnalystPanel from './components/AnalystPanel'
 import TradingPanel from './components/TradingPanel'
 import WatchPanel from './components/WatchPanel'
 import SettingsPanel from './components/SettingsPanel'
+import AdminSettingsPanel from './components/AdminSettingsPanel'
 import DataBrowser from './components/DataBrowser'
 import StrategiesPanel from './components/StrategiesPanel'
 import AuthGate from './components/AuthGate'
@@ -31,10 +32,11 @@ const TABS = [
   { id: 'trading',   label: '交易',    icon: ICONS.trading,  visibility: ['user'] },
   { id: 'watch',     label: '关注',    icon: ICONS.watch,    visibility: ['user','advisor','admin'] },
   { id: 'relation',  label: '关联',    icon: 'M17 20h5v-2a4 4 0 00-3-3.87M9 20H4v-2a3 3 0 015.36-1.87M15 7a3 3 0 11-6 0 3 3 0 016 0zm6 7a2 2 0 11-4 0 2 2 0 014 0z', visibility: ['user','advisor'] },
-  { id: 'data',      label: '数据',    icon: ICONS.data,     visibility: ['advisor','admin'] },
+  { id: 'data',      label: '数据',    icon: ICONS.data,     visibility: ['admin'] },
   { id: 'ops',       label: '运维',    icon: 'M3 12l2-2 4 4 8-8', visibility: ['admin'] },
   { id: 'dataGap',   label: '数据补足', icon: 'M12 9v2m0 4h.01M21 12a9 9 0 11-18 0 9 9 0 0118 0z', visibility: ['admin'] },
   { id: 'strategies', label: 'API策略', icon: 'M13 10V3L4 14h7v7l9-11h-7z', visibility: ['admin'] },
+  { id: 'adminSettings', label: '管理员设置', icon: 'M10.325 4.317c.426-1.756 2.924-1.756 3.35 0a1.724 1.724 0 002.573 1.066c1.543-.94 3.31.826 2.37 2.37a1.724 1.724 0 001.066 2.573c1.756.426 1.756 2.924 0 3.35a1.724 1.724 0 00-1.066 2.573c.94 1.543-.826 3.31-2.37 2.37a1.724 1.724 0 00-2.573 1.066c-.426 1.756-2.924 1.756-3.35 0a1.724 1.724 0 00-2.573-1.066c-1.543.94-3.31-.826-2.37-2.37a1.724 1.724 0 00-1.066-2.573c-1.756-.426-1.756-2.924 0-3.35a1.724 1.724 0 001.066-2.573c-.94-1.543.826-3.31 2.37-2.37.996.608 2.296.07 2.572-1.065z', visibility: ['admin'] },
   { id: 'settings',  label: '设置',    icon: ICONS.settings, visibility: ['user','advisor','admin'] },
 ]
 
@@ -53,26 +55,81 @@ export default function App() {
   const [currentUser, setCurrentUser] = useState(() => {
     try { return JSON.parse(localStorage.getItem(USER_KEY) || 'null') } catch { return null }
   })
+  const [activeRole, setActiveRole] = useState(() => localStorage.getItem('portfoliom_active_role') || null)
   const [viewAsUser, setViewAsUser] = useState(null)
   const [allUsers, setAllUsers] = useState([])
+  const [relations, setRelations] = useState({ as_advisor: [], as_client: [] })
   const [activeTab, setActiveTab] = useState('overview')
   const [loading, setLoading] = useState(false)
 
-  // 角色 + 菜单过滤
+  // 用户最高权限角色（badge 是否有权限的依据）
   const userRole = userRoleOf(currentUser)
+  // 当前激活角色（用于菜单 + 数据权限），未登录或无保存值时取最高权限角色
+  const effectiveRole = activeRole && ['user','advisor','admin'].includes(activeRole) ? activeRole : userRole
+
+  // 持久化 activeRole
+  useEffect(() => {
+    if (activeRole) {
+      localStorage.setItem('portfoliom_active_role', activeRole)
+    } else {
+      localStorage.removeItem('portfoliom_active_role')
+    }
+  }, [activeRole])
+
+  // 登录后初始化 activeRole 为最高权限角色
+  useEffect(() => {
+    if (currentUser && !activeRole) {
+      setActiveRole(userRole)
+    }
+  }, [currentUser, activeRole, userRole])
+
+  // 角色 + 菜单过滤（基于 effectiveRole）
   const visibleTabs = useMemo(
-    () => TABS.filter(t => t.visibility.includes(userRole)),
-    [userRole]
+    () => TABS.filter(t => t.visibility.includes(effectiveRole)),
+    [effectiveRole]
   )
 
-  // 加载可切换用户列表（advisor/admin）
+  // 切换角色：清空 viewAs + 若当前 tab 不在新角色菜单中则回到 overview
+  const switchRole = (role) => {
+    setActiveRole(role)
+    setViewAsUser(null)
+    const allowed = TABS.filter(t => t.visibility.includes(role)).map(t => t.id)
+    if (!allowed.includes(activeTab)) {
+      setActiveTab('overview')
+    }
+  }
+
+  // 加载所有用户列表（admin 用）+ 关联关系（advisor 用）
   useEffect(() => {
-    if (currentUser?.is_advisor || currentUser?.is_admin) {
+    if (currentUser?.is_admin) {
       api.getUsers().then(r => setAllUsers(r.users || [])).catch(() => setAllUsers([]))
     } else {
       setAllUsers([])
     }
+    if (currentUser?.is_advisor || currentUser?.is_admin) {
+      api.listRelations().then(r => setRelations(r || { as_advisor: [], as_client: [] })).catch(() => setRelations({ as_advisor: [], as_client: [] }))
+    } else {
+      setRelations({ as_advisor: [], as_client: [] })
+    }
   }, [currentUser])
+
+  // view_as 候选用户列表（基于 effectiveRole）
+  const viewAsCandidates = useMemo(() => {
+    if (effectiveRole === 'admin') {
+      return allUsers.filter(u => u.id !== currentUser?.id)
+    }
+    if (effectiveRole === 'advisor') {
+      // 从 as_advisor 关联中提取 client 用户（other_user 即 client）
+      return relations.as_advisor
+        .filter(r => r.status === 'ACTIVE')
+        .map(r => ({
+          id: r.other_user_id,
+          username: r.other_username,
+          display_name: r.other_display_name,
+        }))
+    }
+    return []
+  }, [effectiveRole, allUsers, relations, currentUser])
 
   // 当 viewAs = 自己时清空
   useEffect(() => {
@@ -111,10 +168,14 @@ export default function App() {
   const onLoggedIn = (token, user) => {
     setSessionToken(token)
     setCurrentUser(user)
+    setActiveRole(userRoleOf(user))
+    setViewAsUser(null)
   }
   const onLogout = () => {
     setSessionToken('')
     setCurrentUser(null)
+    setActiveRole(null)
+    setViewAsUser(null)
   }
 
   const refreshAll = useCallback(async () => {
@@ -145,6 +206,7 @@ export default function App() {
       case 'ops': return <OpsPanel />
       case 'dataGap': return <DataGapPanel />
       case 'strategies': return <StrategiesPanel />
+      case 'adminSettings': return <AdminSettingsPanel />
       case 'settings': return <SettingsPanel />
       default: return null
     }
@@ -157,6 +219,61 @@ export default function App() {
           <span className="brand-icon">◆</span>
           <span className="brand-text">PortfolioM</span>
         </div>
+        <div style={{ display: 'flex', gap: 4, padding: '0 12px 8px' }}>
+          {[
+            { id: 'user', label: '用户', hasPermission: !!currentUser },
+            { id: 'advisor', label: '顾问', hasPermission: !!currentUser?.is_advisor },
+            { id: 'admin', label: '管理员', hasPermission: !!currentUser?.is_admin },
+          ].map(b => {
+            const isActive = effectiveRole === b.id
+            const clickable = b.hasPermission
+            return (
+              <button
+                key={b.id}
+                disabled={!clickable}
+                onClick={() => clickable && switchRole(b.id)}
+                style={{
+                  flex: 1, textAlign: 'center', padding: '3px 0', borderRadius: 3,
+                  fontSize: 9, fontFamily: '"GeistMono", monospace', letterSpacing: 0.3,
+                  cursor: clickable ? 'pointer' : 'default',
+                  transition: 'all 0.15s',
+                  background: isActive ? 'var(--up)' : (clickable ? 'transparent' : 'var(--bg-raised)'),
+                  color: isActive ? '#fff' : (clickable ? 'var(--up)' : 'var(--text-muted)'),
+                  border: `1px solid ${isActive ? 'var(--up)' : (clickable ? 'var(--up)' : 'var(--border)')}`,
+                  opacity: clickable && !isActive ? 0.7 : 1,
+                }}
+              >
+                {b.label}
+              </button>
+            )
+          })}
+        </div>
+        {(effectiveRole === 'advisor' || effectiveRole === 'admin') && viewAsCandidates.length > 0 && (
+          <div style={{ padding: '0 12px 8px' }}>
+            <select
+              value={viewAsUser?.id || ''}
+              onChange={e => {
+                const id = e.target.value ? Number(e.target.value) : null
+                setViewAsUser(id ? viewAsCandidates.find(u => u.id === id) : null)
+              }}
+              style={{
+                width: '100%', padding: '4px 6px', fontSize: 10,
+                background: 'var(--bg-raised)', color: 'var(--text)',
+                border: '1px solid var(--border)', borderRadius: 3,
+                cursor: 'pointer',
+              }}
+              title={effectiveRole === 'admin' ? '选择用户查看数据（管理员）' : '选择客户查看数据（顾问）'}
+            >
+              <option value="">{effectiveRole === 'admin' ? '查看自己（全部）' : '查看自己'}</option>
+              {viewAsCandidates.map(u => (
+                <option key={u.id} value={u.id}>
+                  {u.display_name || u.username}
+                  {u.is_admin ? ' [管]' : u.is_advisor ? ' [顾]' : ''}
+                </option>
+              ))}
+            </select>
+          </div>
+        )}
         <nav className="sidebar-nav">
           {visibleTabs.map(tab => (
             <button key={tab.id}
@@ -180,25 +297,6 @@ export default function App() {
             </span>
             <button onClick={onLogout} className="btn-ghost" style={{ padding: '2px 8px', fontSize: 10 }}>登出</button>
           </div>
-          {(currentUser?.is_advisor || currentUser?.is_admin) && allUsers.length > 1 && (
-            <select
-              value={viewAsUser?.id || ''}
-              onChange={e => {
-                const id = e.target.value ? Number(e.target.value) : null
-                setViewAsUser(id ? allUsers.find(u => u.id === id) : null)
-              }}
-              style={{ padding: '2px 4px', fontSize: 10, width: '100%' }}
-              title="切换查看其他用户视图"
-            >
-              <option value="">查看自己</option>
-              {allUsers.filter(u => u.id !== currentUser.id).map(u => (
-                <option key={u.id} value={u.id}>
-                  {u.display_name || u.username}
-                  {u.is_admin ? ' [管]' : u.is_advisor ? ' [顾]' : ''}
-                </option>
-              ))}
-            </select>
-          )}
         </div>
       </aside>
 

@@ -363,6 +363,21 @@ def job_update_financial_fundamentals():
         db.commit()
         logger.info("基本面数据更新完成，新增/更新 %d 只股票", updated)
 
+        # === 新增：海外持仓写入 OverseasShareFinancialSnapshot ===
+        from services.overseas_financial_service import fetch_and_store_overseas_financials
+        overseas_holdings = db.query(Holding).filter(
+            Holding.asset_type.in_([
+                AssetType.US_STOCK.value,
+                AssetType.US_ETF.value,
+            ])
+        ).all()
+        overseas_codes = list(set(h.security_code for h in overseas_holdings))
+
+        if overseas_codes:
+            result = fetch_and_store_overseas_financials(db, overseas_codes, today)
+            logger.info("海外财务数据更新：fetched=%d, stored=%d, errors=%d",
+                       result["fetched"], result["stored"], len(result["errors"]))
+
         # 基本面更新后运行穿透计算
         try:
             engine = PenetrationEngine(db)

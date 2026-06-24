@@ -42,18 +42,35 @@ def upsert_overseas_financial(db: Session, data: dict) -> dict:
     fields = (
         "stock_name", "market", "pe_ttm", "pb_mrq", "ps_ttm",
         "dividend_yield", "market_cap", "eps_fy1",
-        "sector", "industry",
+        "sector", "industry", "source",
     )
 
     if existing:
         for f in fields:
             if f in data:
                 setattr(existing, f, data[f])
+        # 更新 dynamic（当 baseline 更新时 dynamic 也更新，spec §8.3）
+        if "pe_ttm" in data:
+            existing.pe_ttm_dynamic = data["pe_ttm"]
+        if "pb_mrq" in data:
+            existing.pb_mrq_dynamic = data["pb_mrq"]
+        if "ps_ttm" in data:
+            existing.ps_ttm_dynamic = data["ps_ttm"]
     else:
         kwargs = {"stock_code": stock_code, "as_of_date": as_of, "user_id": 1, "market": market}
         for f in fields:
             if f in data:
                 kwargs[f] = data[f]
+        # 首次写入时 dynamic = baseline（spec §8.3）
+        pe_ttm = data.get("pe_ttm")
+        pb_mrq = data.get("pb_mrq")
+        ps_ttm = data.get("ps_ttm")
+        kwargs["pe_ttm_dynamic"] = pe_ttm
+        kwargs["pb_mrq_dynamic"] = pb_mrq
+        kwargs["ps_ttm_dynamic"] = ps_ttm
+        # source 默认 yfinance
+        if "source" not in kwargs or not kwargs.get("source"):
+            kwargs["source"] = "yfinance"
         snap = OverseasShareFinancialSnapshot(**kwargs)
         db.add(snap)
 

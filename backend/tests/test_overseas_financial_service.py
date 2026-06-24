@@ -158,3 +158,45 @@ def test_fetch_and_store_overseas_financials_empty(fresh_db):
     assert result["fetched"] == 0
     assert result["stored"] == 0
     assert len(result["errors"]) == 1
+
+
+def test_upsert_overseas_financial_sets_dynamic(fresh_db):
+    """首次写入时 dynamic = baseline（spec §8.3）。"""
+    from services.overseas_financial_service import upsert_overseas_financial
+
+    upsert_overseas_financial(fresh_db, {
+        "stock_code": "AAPL",
+        "pe_ttm": 28.5,
+        "pb_mrq": 45.2,
+        "ps_ttm": 7.8,
+        "as_of_date": "2026-06-24",
+    })
+
+    snap = fresh_db.query(OverseasShareFinancialSnapshot).filter(
+        OverseasShareFinancialSnapshot.stock_code == "AAPL",
+    ).first()
+    assert snap.pe_ttm_dynamic == 28.5
+    assert snap.pb_mrq_dynamic == 45.2
+    assert snap.ps_ttm_dynamic == 7.8
+    assert snap.source == "yfinance"
+
+
+def test_upsert_overseas_financial_update_dynamic(fresh_db):
+    """更新时 dynamic 也更新。"""
+    from services.overseas_financial_service import upsert_overseas_financial
+
+    upsert_overseas_financial(fresh_db, {
+        "stock_code": "AAPL",
+        "pe_ttm": 28.0,
+        "as_of_date": "2026-06-24",
+    })
+    upsert_overseas_financial(fresh_db, {
+        "stock_code": "AAPL",
+        "pe_ttm": 30.0,
+        "as_of_date": "2026-06-24",
+    })
+
+    snap = fresh_db.query(OverseasShareFinancialSnapshot).filter(
+        OverseasShareFinancialSnapshot.stock_code == "AAPL",
+    ).first()
+    assert snap.pe_ttm_dynamic == 30.0

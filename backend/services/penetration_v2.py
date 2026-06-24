@@ -29,6 +29,7 @@ from models import (
     HKShareFinancialSnapshot,
     Holding,
     IndexConstituentSnapshot,
+    OverseasShareFinancialSnapshot,
     PenetrationSnapshot,
 )
 
@@ -86,9 +87,10 @@ def _is_hk_code(code: str) -> bool:
 
 
 def _resolve_snapshot_for_code(stock_code: str, as_of_date, db):
-    """Return (snapshot, kind) where kind ∈ {'a', 'hk'}. Handles HK 4 vs 5 digit mismatch.
+    """Return (snapshot, kind) where kind ∈ {'a', 'hk', 'overseas'}. Handles HK 4 vs 5 digit mismatch.
 
     For HK codes, tries the raw normalized code first, then the padded version.
+    For overseas codes, matches stock_code exactly and takes the latest as_of_date.
     """
     code_norm = stock_code.split(".")[0]
     is_hk = _is_hk_code(stock_code)
@@ -130,6 +132,16 @@ def _resolve_snapshot_for_code(stock_code: str, as_of_date, db):
     if h_snap:
         return h_snap, "hk"
 
+    # Try Overseas (US/KR/JP/EU etc.) — exact match, latest as_of_date
+    o_snap = (
+        db.query(OverseasShareFinancialSnapshot)
+        .filter(OverseasShareFinancialSnapshot.stock_code == stock_code)
+        .order_by(OverseasShareFinancialSnapshot.as_of_date.desc())
+        .first()
+    )
+    if o_snap:
+        return o_snap, "overseas"
+
     if a_snap:
         return a_snap, "a"
     return None, None
@@ -152,6 +164,19 @@ def _resolve_industry(stock_code: str, as_of_date: _date, db: Session):
       chain_position, growth_tier, competition
     """
     snap, kind = _resolve_snapshot_for_code(stock_code, as_of_date, db)
+    if kind == "overseas":
+        # 海外市场用 yfinance 的 sector/industry 替代申万/中证分级
+        return {
+            "swy_l1": snap.sector or "其他",
+            "swy_l2": snap.industry or "其他",
+            "swy_l3": "其他",
+            "swy_l4": "其他",
+            "csi_l1": "其他", "csi_l2": "其他", "csi_l3": "其他", "csi_l4": "其他",
+            "se_l1": "其他", "se_l2": "其他", "se_l3": "其他", "se_l4": "其他",
+            "chain_position": "other",
+            "growth_tier": "unknown",
+            "competition": "unknown",
+        }
     if kind == "hk":
         return {
             "swy_l1": snap.swy_l1 or "其他",

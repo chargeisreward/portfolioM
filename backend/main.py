@@ -6,6 +6,7 @@ import secrets
 import time
 from datetime import date, datetime, timedelta
 from pathlib import Path
+from typing import List
 from fastapi import FastAPI, Depends, Query, Request, HTTPException, Body, UploadFile, File, Form
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.staticfiles import StaticFiles
@@ -5254,3 +5255,84 @@ def admin_confirm_index_pdf(
 
     db.commit()
     return {"status": "ok", "saved": saved}
+
+
+@app.post("/api/admin/upload/analyst-report")
+async def admin_upload_analyst_report(
+    files: List[UploadFile] = File(...),
+    db: Session = Depends(get_db),
+):
+    """上传股票分析报告 DOCX（支持多文件）。"""
+    from services.upload_service import save_upload_file
+    from services.analyst_parser import parse_company_report, _parse_stock_code_from_filename
+    from models import AnalystCompanyReport
+
+    results = []
+    for file in files:
+        filename = file.filename or ""
+        try:
+            # 从文件名解析股票代码
+            stock_code, _ = _parse_stock_code_from_filename(filename)
+            if not stock_code:
+                results.append({
+                    "filename": filename,
+                    "stock_code": None,
+                    "status": "error",
+                    "error": "无法解析股票代码（文件名需包含 6 位数字 + .SH/.SZ/.HK）",
+                })
+                continue
+
+            # 保存文件
+            relative_path = save_upload_file(file, "doc")
+            full_path = os.path.join(os.path.dirname(__file__), relative_path)
+
+            # 解析 DOCX
+            parsed = parse_company_report(full_path)
+
+            # Upsert 到 AnalystCompanyReport
+            existing = db.query(AnalystCompanyReport).filter(
+                AnalystCompanyReport.stock_code == stock_code
+            ).first()
+
+            if existing:
+                existing.stock_name = parsed.get("stock_name")
+                existing.section_1_market_focus = parsed.get("section_1_market_focus")
+                existing.section_2_core_competence = parsed.get("section_2_core_competence")
+                existing.section_3_supply_demand = parsed.get("section_3_supply_demand")
+                existing.section_4_marginal_change = parsed.get("section_4_marginal_change")
+                existing.section_5_valuation = parsed.get("section_5_valuation")
+                existing.section_6_risk = parsed.get("section_6_risk")
+                existing.raw_text = parsed.get("raw_text")
+                existing.source_file = relative_path
+            else:
+                report = AnalystCompanyReport(
+                    stock_code=stock_code,
+                    stock_name=parsed.get("stock_name"),
+                    section_1_market_focus=parsed.get("section_1_market_focus"),
+                    section_2_core_competence=parsed.get("section_2_core_competence"),
+                    section_3_supply_demand=parsed.get("section_3_supply_demand"),
+                    section_4_marginal_change=parsed.get("section_4_marginal_change"),
+                    section_5_valuation=parsed.get("section_5_valuation"),
+                    section_6_risk=parsed.get("section_6_risk"),
+                    raw_text=parsed.get("raw_text"),
+                    source_file=relative_path,
+                )
+                db.add(report)
+
+            db.commit()
+            results.append({
+                "filename": filename,
+                "stock_code": stock_code,
+                "status": "success",
+                "error": None,
+            })
+
+        except Exception as e:
+            results.append({
+                "filename": filename,
+                "stock_code": None,
+                "status": "error",
+                "error": str(e),
+            })
+
+    return {"results": results}

@@ -168,3 +168,60 @@ def test_upload_index_pdf_confirm_expired(client, fresh_db):
     """task_id 不存在时返回 404。"""
     res = client.post("/api/admin/upload/index-pdf/confirm", json={"task_id": "nonexistent"})
     assert res.status_code == 404
+
+
+# ========== 股票分析报告上传测试 ==========
+
+def test_upload_analyst_report_success(client, fresh_db, monkeypatch):
+    """上传 DOCX 股票报告并解析成功。"""
+    # mock save_upload_file
+    monkeypatch.setattr(
+        "services.upload_service.save_upload_file",
+        lambda file, category: f"uploads/{category}/{file.filename}"
+    )
+    # mock analyst_parser.parse_company_report
+    monkeypatch.setattr(
+        "services.analyst_parser.parse_company_report",
+        lambda path: {
+            "stock_code": "688041.SH",
+            "stock_name": "海光信息",
+            "section_1_market_focus": "市场关注内容",
+            "section_2_core_competence": "核心竞争力",
+            "section_3_supply_demand": "供需格局",
+            "section_4_marginal_change": "边际变化",
+            "section_5_valuation": "估值",
+            "section_6_risk": "风险",
+            "raw_text": "raw",
+        }
+    )
+
+    docx_content = b"fake docx content"
+    res = client.post(
+        "/api/admin/upload/analyst-report",
+        files={"files": ("688041.SH公司研究框架.docx", io.BytesIO(docx_content), "application/vnd.openxmlformats-officedocument.wordprocessingml.document")},
+    )
+
+    assert res.status_code == 200, res.text
+    data = res.json()
+    assert len(data["results"]) == 1
+    assert data["results"][0]["status"] == "success"
+    assert data["results"][0]["stock_code"] == "688041.SH"
+
+
+def test_upload_analyst_report_no_stock_code(client, fresh_db, monkeypatch):
+    """文件名无法解析股票代码时返回错误。"""
+    monkeypatch.setattr(
+        "services.upload_service.save_upload_file",
+        lambda file, category: f"uploads/{category}/{file.filename}"
+    )
+
+    docx_content = b"fake docx content"
+    res = client.post(
+        "/api/admin/upload/analyst-report",
+        files={"files": ("报告.docx", io.BytesIO(docx_content), "application/vnd.openxmlformats-officedocument.wordprocessingml.document")},
+    )
+
+    assert res.status_code == 200, res.text
+    data = res.json()
+    assert data["results"][0]["status"] == "error"
+    assert "无法解析股票代码" in data["results"][0]["error"]

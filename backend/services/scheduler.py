@@ -5,6 +5,7 @@
 2. 财务基本面数据更新（每日7:00/19:00）
 3. 行业/爬虫数据更新（每日6:00/20:00）
 """
+import contextvars
 import functools
 import logging
 import time as _time_mod
@@ -15,6 +16,7 @@ from sqlalchemy.orm import Session
 
 from database import SessionLocal
 from models import Holding, PriceCache, StockInfoCache, AssetType
+from services.data_pull_task_service import record_task_start, record_task_finish
 
 logger = logging.getLogger(__name__)
 
@@ -25,18 +27,35 @@ scheduler: BackgroundScheduler | None = None
 # 通过 track_run() 装饰器写入；手动触发也会记录（trigger_job 调用 _JOB_DISPATCH 中的 wrapper）。
 _JOB_LAST_RUN: dict[str, dict] = {}
 
+# 触发者上下文：APScheduler 自动触发为 "scheduler"，手动触发为 "manual" / "manual:<user_id>"
+# track_run 据此判断是否由自己记录 DataPullTask（自动触发时记录，手动触发时由 trigger_job 记录）
+_triggered_by_ctx: contextvars.ContextVar[str] = contextvars.ContextVar(
+    "scheduler_triggered_by", default="scheduler"
+)
+
 
 def track_run(job_id: str):
     """装饰器：把函数的执行结果 / 异常 / 耗时写入 _JOB_LAST_RUN[job_id]。
 
     APScheduler 调用与 /api/scheduler/trigger 手动调用都走包装后的函数，
     因此 last_run_at 是「真实最近一次执行」而非「最近一次 cron 触发」。
+
+    额外职责（Task 7）：当 triggered_by 上下文为 "scheduler"（APScheduler 自动触发）时，
+    同步写入 DataPullTask 表记录任务历史。手动触发（trigger_job）时由 trigger_job
+    负责记录，此处跳过以避免重复。
     """
     def deco(fn):
         @functools.wraps(fn)
         def wrapper(*args, **kwargs):
             t0 = _time_mod.time()
             run_at = datetime.now().isoformat(timespec="seconds")
+            triggered_by = _triggered_by_ctx.get()
+
+            # 仅 APScheduler 自动触发时记录 DataPullTask（手动触发由 trigger_job 记录）
+            task_id = None
+            if triggered_by == "scheduler":
+                task_id = _try_record_start(job_id, triggered_by)
+
             try:
                 result = fn(*args, **kwargs)
             except Exception as e:
@@ -47,6 +66,8 @@ def track_run(job_id: str):
                     "result": None,
                     "duration_ms": int((_time_mod.time() - t0) * 1000),
                 }
+                if task_id is not None:
+                    _try_record_finish(task_id, "FAILED", error_message=str(e)[:500])
                 raise
             _JOB_LAST_RUN[job_id] = {
                 "run_at": run_at,
@@ -56,9 +77,53 @@ def track_run(job_id: str):
                            else {"value": str(result)[:200] if result is not None else None},
                 "duration_ms": int((_time_mod.time() - t0) * 1000),
             }
+            if task_id is not None:
+                _try_record_finish(task_id, "SUCCESS", records_pulled=_extract_record_count(result))
             return result
         return wrapper
     return deco
+
+
+def _extract_record_count(result) -> int:
+    """从 job 返回值中提取记录数（用于 records_pulled 字段）。"""
+    if result is None:
+        return 0
+    if isinstance(result, (list, tuple)):
+        return len(result)
+    if isinstance(result, int):
+        return result
+    if isinstance(result, dict):
+        # 常见字段：updated / written / filled_total / records / stocks_checked / count
+        for key in ("updated", "written", "filled_total", "records", "stocks_checked", "count"):
+            val = result.get(key)
+            if isinstance(val, int):
+                return val
+        return 0
+    return 0
+
+
+def _try_record_start(job_id: str, triggered_by: str) -> int | None:
+    """尝试记录任务开始（使用独立 db 会话，失败不阻塞 job 执行）。返回 task_id 或 None。"""
+    rec_db = SessionLocal()
+    try:
+        task = record_task_start(rec_db, job_id, job_id, triggered_by)
+        return task.get("id")
+    except Exception as e:
+        logger.warning("record_task_start 失败 (job=%s): %s", job_id, e)
+        return None
+    finally:
+        rec_db.close()
+
+
+def _try_record_finish(task_id: int, status: str, records_pulled: int = 0, error_message: str | None = None) -> None:
+    """尝试记录任务结束（使用独立 db 会话，失败不阻塞）。"""
+    rec_db = SessionLocal()
+    try:
+        record_task_finish(rec_db, task_id, status, records_pulled=records_pulled, error_message=error_message)
+    except Exception as e:
+        logger.warning("record_task_finish 失败 (task_id=%s): %s", task_id, e)
+    finally:
+        rec_db.close()
 
 
 # ---------- 工具函数 ----------
@@ -878,3 +943,87 @@ def job_crawl_hot_stocks():
         logger.error("同花顺热点抓取异常: %s", e, exc_info=True)
     finally:
         db.close()
+
+
+# ============================================================================
+# Task 7: JOB_DISPATCH + trigger_job — 手动触发 + 任务历史记录
+# ============================================================================
+
+# job_id → {name, func}：供 trigger_job 查找。覆盖 start_scheduler 注册的全部 job。
+JOB_DISPATCH: dict[str, dict] = {
+    "realtime_prices": {"name": "实时行情抓取", "func": job_fetch_realtime_prices},
+    "fill_snapshot_gaps_smart": {"name": "snapshot 智能补缺", "func": job_fill_snapshot_gaps_smart},
+    "industry_crawler_data": {"name": "行业/爬虫数据更新", "func": job_update_industry_crawler_data},
+    "financial_fundamentals": {"name": "财务基本面更新", "func": job_update_financial_fundamentals},
+    "backfill_gaps": {"name": "历史价补缺", "func": job_backfill_gaps},
+    "info_global_news": {"name": "全球快讯抓取", "func": job_crawl_global_news},
+    "info_stock_news": {"name": "个股新闻抓取", "func": job_crawl_stock_news},
+    "info_announcements_research": {"name": "公告+研报抓取", "func": job_crawl_announcements_and_research},
+    "info_hot_stocks": {"name": "同花顺热点抓取", "func": job_crawl_hot_stocks},
+    "detect_data_gaps": {"name": "数据补足检测", "func": job_detect_data_gaps},
+    "drill_snapshot": {"name": "公共下钻截面生成", "func": job_generate_drill_snapshot},
+}
+
+
+def trigger_job(db: Session, job_id: str, triggered_by: str = "manual", **kwargs) -> dict:
+    """手动触发一个 job（带 DataPullTask 任务追踪）。
+
+    由 API 端点 /api/admin/data-pull-tasks/trigger/{job_id} 调用。
+    使用传入的 db 会话记录 record_task_start/finish；同时通过 contextvar
+    通知 track_run 跳过自动记录（避免重复）。
+
+    Args:
+        db: 数据库会话（用于 record_task_start/finish）
+        job_id: JOB_DISPATCH 中的 job 标识
+        triggered_by: 触发者标识，如 "manual" / "manual:123"
+        **kwargs: 传递给 job 函数的参数（如 force=True, days=30）
+
+    Returns:
+        成功: {"status": "ok", "job_id": ..., "records": N, "result": ...}
+        失败: {"status": "error", "job_id": ..., "message": ...}
+    """
+    if job_id not in JOB_DISPATCH:
+        return {
+            "status": "error",
+            "message": f"未知 job_id: {job_id}. 可用: {sorted(JOB_DISPATCH.keys())}",
+        }
+
+    entry = JOB_DISPATCH[job_id]
+    func = entry["func"]
+    job_name = entry["name"]
+
+    # 设置 triggered_by 上下文 → track_run 据此跳过自动记录（由本函数负责记录）
+    token = _triggered_by_ctx.set(triggered_by)
+    try:
+        # 记录任务开始（使用调用方传入的 db）
+        task = record_task_start(db, job_id, job_name, triggered_by)
+        task_id = task.get("id")
+    except Exception as e:
+        logger.warning("trigger_job: record_task_start 失败 (job=%s): %s", job_id, e)
+        task_id = None
+
+    try:
+        result = func(**kwargs) if kwargs else func()
+        records = _extract_record_count(result)
+        if task_id is not None:
+            try:
+                record_task_finish(db, task_id, "SUCCESS", records_pulled=records)
+            except Exception as e:
+                logger.warning("trigger_job: record_task_finish 失败 (task_id=%s): %s", task_id, e)
+        return {
+            "status": "ok",
+            "job_id": job_id,
+            "records": records,
+            "result": result if isinstance(result, dict)
+                      else {"value": str(result)[:200] if result is not None else None},
+        }
+    except Exception as e:
+        logger.error("手动触发 job 失败 (job=%s): %s", job_id, e, exc_info=True)
+        if task_id is not None:
+            try:
+                record_task_finish(db, task_id, "FAILED", error_message=str(e)[:500])
+            except Exception as rec_err:
+                logger.warning("trigger_job: record_task_finish 失败 (task_id=%s): %s", task_id, rec_err)
+        return {"status": "error", "job_id": job_id, "message": str(e)[:300]}
+    finally:
+        _triggered_by_ctx.reset(token)

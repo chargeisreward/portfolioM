@@ -5072,11 +5072,15 @@ def admin_list_fund_index_map(
 @app.post("/api/admin/fund-index-map")
 def admin_create_fund_index_map(body: dict = Body(...), db: Session = Depends(get_db)):
     """新增基金-指数映射。"""
+    # as_of_date 可能是字符串或 date 对象，统一转为 date
+    raw_date = body.get("as_of_date", date.today())
+    if isinstance(raw_date, str):
+        raw_date = date.fromisoformat(raw_date)
     fm = FundIndexMap(
         fund_code=body["fund_code"], fund_name=body.get("fund_name"),
         index_code=body["index_code"], index_name=body.get("index_name"),
         benchmark_formula=body.get("benchmark_formula"),
-        as_of_date=body.get("as_of_date", date.today()),
+        as_of_date=raw_date,
         source=body.get("source", "manual"),
     )
     db.add(fm)

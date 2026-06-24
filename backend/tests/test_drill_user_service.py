@@ -102,6 +102,46 @@ def test_get_user_fund_codes_uses_security_master(fresh_db):
     assert "159901.SZ" not in codes  # is_drillable=False，即使 asset_type 可下钻
 
 
+def test_get_user_fund_codes_falls_back_to_fund_index_map(fresh_db):
+    """SecurityMaster 有数据但 is_drillable 全 False 时，应回退到 FundIndexMap 查找可下钻基金。
+
+    场景：admin 未设置任何 is_drillable=True，但 FundIndexMap 中有映射的基金应被视为可下钻。
+    """
+    from models import SecurityMaster, Holding, FundIndexMap
+    # SecurityMaster 有数据，但 is_drillable 全 False
+    fresh_db.add(SecurityMaster(
+        security_code="510300.SH", security_name="沪深300ETF",
+        security_type="fund", asset_type="a_share_etf", is_drillable=False,
+    ))
+    fresh_db.add(SecurityMaster(
+        security_code="159901.SZ", security_name="深100ETF",
+        security_type="fund", asset_type="a_share_etf", is_drillable=False,
+    ))
+    # FundIndexMap 中只有 510300.SH 有映射
+    from datetime import date as _d
+    fresh_db.add(FundIndexMap(
+        fund_code="510300.SH", as_of_date=_d(2026, 6, 24),
+        index_code="000300.SH", index_name="沪深300",
+    ))
+    # 用户持仓
+    fresh_db.add(Holding(
+        user_id=1, security_code="510300.SH", security_name="沪深300ETF",
+        quantity=1000, asset_type="a_share_etf",
+    ))
+    fresh_db.add(Holding(
+        user_id=1, security_code="159901.SZ", security_name="深100ETF",
+        quantity=500, asset_type="a_share_etf",
+    ))
+    fresh_db.commit()
+
+    from services.drill_user_service import get_user_fund_codes
+    codes = get_user_fund_codes(fresh_db, 1)
+    # 510300.SH 在 FundIndexMap 中 → 应返回
+    assert "510300.SH" in codes
+    # 159901.SZ 不在 FundIndexMap 中 → 不应返回
+    assert "159901.SZ" not in codes
+
+
 class TestGetUserFundHoldings:
     """测试 get_user_fund_holdings — 返回用户在指定基金上的持仓。"""
 

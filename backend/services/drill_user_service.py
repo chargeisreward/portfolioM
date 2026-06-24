@@ -9,7 +9,7 @@ import logging
 
 from sqlalchemy.orm import Session
 
-from models import Holding, SecurityMaster
+from models import Holding, SecurityMaster, FundIndexMap
 
 logger = logging.getLogger(__name__)
 
@@ -27,17 +27,27 @@ def get_user_fund_codes(db: Session, user_id: int) -> set[str]:
     """返回用户持有的所有可下钻基金代码集合。
 
     优先 join SecurityMaster.is_drillable 过滤；表为空时 fallback 到旧硬编码逻辑。
+    若 SecurityMaster 有数据但 is_drillable 全 False，回退到 FundIndexMap 查找。
 
     返回：{"510300.SH", "159919.SZ", ...}
     """
     # 先尝试 join SecurityMaster
     sm_exists = db.query(SecurityMaster).count() > 0
     if sm_exists:
-        return set(
+        codes = set(
             r[0] for r in db.query(Holding.security_code)
             .join(SecurityMaster, Holding.security_code == SecurityMaster.security_code)
             .filter(Holding.user_id == user_id)
             .filter(SecurityMaster.is_drillable == True)
+            .all()
+        )
+        if codes:
+            return codes
+        # SecurityMaster 有数据但 is_drillable 全 False → 回退到 FundIndexMap
+        return set(
+            r[0] for r in db.query(Holding.security_code)
+            .join(FundIndexMap, Holding.security_code == FundIndexMap.fund_code)
+            .filter(Holding.user_id == user_id)
             .all()
         )
     # Fallback: SecurityMaster 表为空时用旧逻辑

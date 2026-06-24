@@ -99,7 +99,7 @@ def resolve_dynamic_metrics_for_stock(db: Session, stock_code: str):
 
 # ---------- bucket math ----------
 
-def _build_cache_rows(as_of_date, scope, dim, bucket, total_amount):
+def _build_cache_rows(as_of_date, scope, dim, bucket, total_amount, user_id: int = 2):
     rows: list[AggregationCache] = []
     for key, b in bucket.items():
         amt = b["amount"]
@@ -107,6 +107,7 @@ def _build_cache_rows(as_of_date, scope, dim, bucket, total_amount):
         virt_pb = b["virt_pb"]
         virt_ps = b["virt_ps"]
         rows.append(AggregationCache(
+            user_id=user_id,
             as_of_date=as_of_date,
             scope=scope,
             dimension=dim,
@@ -127,6 +128,7 @@ def _build_cache_rows(as_of_date, scope, dim, bucket, total_amount):
     sum_vps = sum(b["virt_ps"] for b in bucket.values())
     total_stocks = sum(len(b["stocks"]) for b in bucket.values())
     rows.append(AggregationCache(
+        user_id=user_id,
         as_of_date=as_of_date,
         scope=scope,
         dimension=dim,
@@ -356,60 +358,120 @@ def aggregate_dimension(db: Session, as_of_date: _date, scope: str, dim: str,
         bucket, total = _bucket_csi300(db, as_of_date, col)
     else:
         raise ValueError(f"unknown scope: {scope}")
-    return _build_cache_rows(as_of_date, scope, dim, bucket, total)
+    return _build_cache_rows(as_of_date, scope, dim, bucket, total, user_id=user_id or 2)
 
 
-def upsert_dimension(db: Session, as_of_date: _date, scope: str, dim: str):
-    db.query(AggregationCache).filter(
+def upsert_dimension(db: Session, as_of_date: _date, scope: str, dim: str,
+                     user_id: int | None = None):
+    q = db.query(AggregationCache).filter(
         AggregationCache.as_of_date == as_of_date,
         AggregationCache.scope == scope,
         AggregationCache.dimension == dim,
-    ).delete(synchronize_session=False)
-    rows = aggregate_dimension(db, as_of_date, scope, dim)
+    )
+    if user_id is not None:
+        q = q.filter(AggregationCache.user_id == user_id)
+    q.delete(synchronize_session=False)
+    rows = aggregate_dimension(db, as_of_date, scope, dim, user_id=user_id)
     if rows:
         db.bulk_save_objects(rows)
     db.commit()
 
 
-def refresh_all_dimensions(db: Session, as_of_date: _date, scopes=("portfolio", "csi300")):
+def refresh_all_dimensions(db: Session, as_of_date: _date, scopes=("portfolio", "csi300"),
+                            user_ids: list[int] | None = None):
+    """按每个 user 重算 portfolio scope；csi300 共享（user_ids 不影响）。
+    user_ids=None 时默认全部 active user。"""
+    from models import User as _User
+    if user_ids is None:
+        user_ids = [r.id for r in db.query(_User).filter(_User.is_active == True).all()]
     for scope in scopes:
         for dim in DIM_COL:
-            upsert_dimension(db, as_of_date, scope, dim)
+            if scope == "portfolio":
+                for uid in user_ids:
+                    upsert_dimension(db, as_of_date, scope, dim, user_id=uid)
+            else:
+                upsert_dimension(db, as_of_date, scope, dim)
             logger.info("aggregated scope=%s dim=%s", scope, dim)
 
 
-def write_timeseries_for_day(db: Session, calc_date: _date, business_date: _date):
+def write_timeseries_for_day(db: Session, calc_date: _date, business_date: _date,
+                              user_ids: list[int] | None = None):
+    """写 portfolio scope 时按每个 user 写一条（user_ids=None 时默认全部 active user）。
+    csi300 scope 共享一份。"""
+    from models import User as _User
+    if user_ids is None:
+        user_ids = [r.id for r in db.query(_User).filter(_User.is_active == True).all()]
     for scope in ("portfolio", "csi300"):
-        row = db.query(AggregationCache).filter(
-            AggregationCache.as_of_date == business_date,
-            AggregationCache.scope == scope,
-            AggregationCache.dimension == "l1",
-            AggregationCache.key == "_total",
-        ).first()
-        if not row:
-            continue
-        existing = db.query(AggregationTimeseries).filter(
-            AggregationTimeseries.calc_date == calc_date,
-            AggregationTimeseries.scope == scope,
-        ).first()
-        if existing:
-            existing.business_date = business_date
-            existing.stock_count = row.stock_count
-            existing.total_amount_cny = row.amount_cny
-            existing.virtual_earnings = row.virtual_earnings
-            existing.pe_weighted = row.pe_weighted
-            existing.pb_weighted = row.pb_weighted
-            existing.ps_weighted = row.ps_weighted
-        else:
-            db.add(AggregationTimeseries(
-                calc_date=calc_date,
-                business_date=business_date,
-                scope=scope,
-                stock_count=row.stock_count,
-                total_amount_cny=row.amount_cny,
-                virtual_earnings=row.virtual_earnings,
-                pe_weighted=row.pe_weighted,
-                pb_weighted=row.pb_weighted,
-                ps_weighted=row.ps_weighted,
-            ))
+        if scope == "portfolio":
+            for uid in user_ids:
+                row = db.query(AggregationCache).filter(
+                    AggregationCache.as_of_date == business_date,
+                    AggregationCache.scope == scope,
+                    AggregationCache.dimension == "l1",
+                    AggregationCache.key == "_total",
+                    AggregationCache.user_id == uid,
+                ).first()
+                if not row:
+                    continue
+                existing = db.query(AggregationTimeseries).filter(
+                    AggregationTimeseries.calc_date == calc_date,
+                    AggregationTimeseries.scope == scope,
+                    AggregationTimeseries.user_id == uid,
+                ).first()
+                if existing:
+                    existing.business_date = business_date
+                    existing.stock_count = row.stock_count
+                    existing.total_amount_cny = row.amount_cny
+                    existing.virtual_earnings = row.virtual_earnings
+                    existing.pe_weighted = row.pe_weighted
+                    existing.pb_weighted = row.pb_weighted
+                    existing.ps_weighted = row.ps_weighted
+                else:
+                    db.add(AggregationTimeseries(
+                        calc_date=calc_date,
+                        business_date=business_date,
+                        user_id=uid,
+                        scope=scope,
+                        stock_count=row.stock_count,
+                        total_amount_cny=row.amount_cny,
+                        virtual_earnings=row.virtual_earnings,
+                        pe_weighted=row.pe_weighted,
+                        pb_weighted=row.pb_weighted,
+                        ps_weighted=row.ps_weighted,
+                    ))
+        else:  # csi300 共享一份（user_id 仍按 default 2 写入即可）
+            row = db.query(AggregationCache).filter(
+                AggregationCache.as_of_date == business_date,
+                AggregationCache.scope == scope,
+                AggregationCache.dimension == "l1",
+                AggregationCache.key == "_total",
+            ).first()
+            if not row:
+                continue
+            existing = db.query(AggregationTimeseries).filter(
+                AggregationTimeseries.calc_date == calc_date,
+                AggregationTimeseries.scope == scope,
+                AggregationTimeseries.user_id == 2,  # csi300 共享 key
+            ).first()
+            if existing:
+                existing.business_date = business_date
+                existing.stock_count = row.stock_count
+                existing.total_amount_cny = row.amount_cny
+                existing.virtual_earnings = row.virtual_earnings
+                existing.pe_weighted = row.pe_weighted
+                existing.pb_weighted = row.pb_weighted
+                existing.ps_weighted = row.ps_weighted
+            else:
+                db.add(AggregationTimeseries(
+                    calc_date=calc_date,
+                    business_date=business_date,
+                    user_id=2,  # csi300 共享 key
+                    scope=scope,
+                    stock_count=row.stock_count,
+                    total_amount_cny=row.amount_cny,
+                    virtual_earnings=row.virtual_earnings,
+                    pe_weighted=row.pe_weighted,
+                    pb_weighted=row.pb_weighted,
+                    ps_weighted=row.ps_weighted,
+                ))
     db.commit()

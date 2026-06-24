@@ -564,11 +564,12 @@ class AggregationCache(Base):
     """聚合结果缓存（按维度、行业、组合/CSI300 双源）。"""
     __tablename__ = "aggregation_cache"
     __table_args__ = (
-        UniqueConstraint("as_of_date", "scope", "dimension", "key",
+        UniqueConstraint("as_of_date", "scope", "dimension", "key", "user_id",
                          name="ux_aggcache"),
     )
 
     id = Column(Integer, primary_key=True, autoincrement=True)
+    user_id = Column(Integer, nullable=False, index=True, default=2)  # 多用户隔离（2026-06-24）
     as_of_date = Column(Date, nullable=False, index=True)
     scope = Column(String(20))                            # portfolio | csi300
     dimension = Column(String(20))                        # l1 | l2 | chain | growth_tier | competition | all

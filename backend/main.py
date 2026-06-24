@@ -2809,10 +2809,10 @@ def get_full_holding(
             "fund_currency": acc["currency"],
         })
 
-    # 5) 加入 12 个可下钻指数的 constituents (drill 算法)
-    indices = list_drillable_indices(db, as_of_date)
+    # 5) 加入 12 个可下钻指数的 constituents (drill 算法，按 effective user 隔离)
+    indices = list_drillable_indices(db, as_of_date, user_id=eff_uid)
     for idx in indices:
-        detail = get_index_drill_detail(db, idx["index_code"], as_of_date)
+        detail = get_index_drill_detail(db, idx["index_code"], as_of_date, user_id=eff_uid)
         if "constituents" not in detail:
             continue
         for c in detail["constituents"]:
@@ -2968,13 +2968,13 @@ def get_full_holding_table(
                 fund_navs_map[fc]["nav_618"] = r.nav
                 fund_navs_map[fc]["cumnav_618"] = r.accumulated_nav
 
-    # 6) 下钻所有指数一次，并按 stock_code 聚合
+    # 6) 下钻所有指数一次，并按 stock_code 聚合（按 user）
     holdings_agg = {code: info for code, info in by_code.items() if info["quantity"] > 0}
     drilled_map: dict[str, dict] = {}
-    indices = list_drillable_indices(db, as_of_date)
+    indices = list_drillable_indices(db, as_of_date, user_id=eff_uid)
     for idx in indices:
         detail = get_index_drill_detail(
-            db, idx["index_code"], as_of_date,
+            db, idx["index_code"], as_of_date, user_id=eff_uid,
             holdings_agg=holdings_agg,
             fund_navs=fund_navs_map,
             a_snap=a_snap,
@@ -3118,11 +3118,11 @@ def get_top10_holdings(
                 fund_navs_map[fc]["nav_618"] = r.nav
                 fund_navs_map[fc]["cumnav_618"] = r.accumulated_nav
 
-    indices = list_drillable_indices(db, as_of_date)
+    indices = list_drillable_indices(db, as_of_date, user_id=eff_uid)
     drilled_acc: dict[str, dict] = {}
     for idx in indices:
         detail = get_index_drill_detail(
-            db, idx["index_code"], as_of_date,
+            db, idx["index_code"], as_of_date, user_id=eff_uid,
             holdings_agg=holdings_agg,
             fund_navs=fund_navs_map,
             a_snap=a_snap_raw, h_snap=h_snap_raw,
@@ -3334,12 +3334,13 @@ def get_dimension_drilled(
                 fund_navs_map[fc]["nav_618"] = r.nav
                 fund_navs_map[fc]["cumnav_618"] = r.accumulated_nav
 
-    indices = list_drillable_indices(db, as_of_date)
+    indices = list_drillable_indices(db, as_of_date, user_id=eff_uid)
 
-    # 3) 下钻证券聚合结果（一次性预加载）
+    # 3) 下钻证券聚合结果（一次性预加载，按 user）
     drilled_resp = get_all_drilled_stocks(
         db, as_of_date,
         indices=indices,
+        user_id=eff_uid,
         holdings_agg=holdings_agg,
         fund_navs=fund_navs_map,
         a_snap=a_snap,
@@ -4203,12 +4204,13 @@ def get_kpi(
         FullHoldingSnapshot.user_id == eff_uid,
     ).scalar() or 0
 
-    # Read _total row from cache (must be populated first)
+    # Read _total row from cache (must be populated first) — 按 user 过滤
     p_total = db.query(AggregationCache).filter(
         AggregationCache.as_of_date == as_of_date,
         AggregationCache.scope == "portfolio",
         AggregationCache.dimension == "l1",
         AggregationCache.key == "_total",
+        AggregationCache.user_id == eff_uid,
     ).first()
 
     # ----- 0. 共用：当前汇率 + 当前 Holding + PriceCache 最新价 → 实时动态市值映射 -----
@@ -4221,7 +4223,7 @@ def get_kpi(
         if r:
             fx_to_cny[fc] = r.rate
 
-    holdings = db.query(Holding).all()
+    holdings = db.query(Holding).filter(Holding.user_id == eff_uid).all()
     sm_map = {m.security_code: m for m in db.query(SecurityMaster).all()}
     # PriceCache 最新 close_px（按 stock_code）
     latest_px_cache: dict[str, float] = {}
@@ -4927,26 +4929,35 @@ def admin_analyst_ingest(db: Session = Depends(get_db)):
 @app.get("/api/analyst/core-companies")
 def analyst_core_companies(
     as_of_date: date = Query(...),
+    request: Request = None,
     db: Session = Depends(get_db),
 ):
-    """核心公司卡片：报告 + 组合权重 + PE/PB/PS + 最新收盘价。"""
-    return get_core_companies(db, as_of_date)
+    """核心公司卡片（按 effective user 隔离 — 2026-06-24）。"""
+    from middleware.auth import _resolve_eff_from_request
+    _u, eff_uid = _resolve_eff_from_request(request, db)
+    return get_core_companies(db, as_of_date, user_id=eff_uid)
 
 
 @app.get("/api/analyst/stock/{code}")
 def analyst_stock_detail(
     code: str,
     as_of_date: date = Query(...),
+    request: Request = None,
     db: Session = Depends(get_db),
 ):
-    """单只股票详情：来源基金（约当数量）+ 报告内容。"""
-    return get_stock_detail(db, code, as_of_date)
+    """单只股票详情（按 effective user 隔离 — 2026-06-24）。"""
+    from middleware.auth import _resolve_eff_from_request
+    _u, eff_uid = _resolve_eff_from_request(request, db)
+    return get_stock_detail(db, code, as_of_date, user_id=eff_uid)
 
 
 @app.get("/api/analyst/industry-chains")
 def analyst_industry_chains(
     as_of_date: date = Query(...),
+    request: Request = None,
     db: Session = Depends(get_db),
 ):
-    """产业链卡片：只返回当前 portfolio 持仓中的公司。"""
-    return get_industry_chains(db, as_of_date)
+    """产业链卡片（按 effective user 隔离 — 2026-06-24）。"""
+    from middleware.auth import _resolve_eff_from_request
+    _u, eff_uid = _resolve_eff_from_request(request, db)
+    return get_industry_chains(db, as_of_date, user_id=eff_uid)

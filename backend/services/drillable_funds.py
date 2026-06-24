@@ -327,11 +327,15 @@ def get_index_drill_detail(
     if fund_navs is None:
         fund_navs = _load_fund_navs(db, fund_codes)
     if a_snap is None:
-        a_snap = {a.stock_code.split(".")[0]: a for a in
-                  db.query(AShareFinancialSnapshot).filter_by(as_of_date=as_of_date).all()}
+        a_q = db.query(AShareFinancialSnapshot).filter(AShareFinancialSnapshot.as_of_date == as_of_date)
+        if user_id is not None:
+            a_q = a_q.filter(AShareFinancialSnapshot.user_id == user_id)
+        a_snap = {a.stock_code.split(".")[0]: a for a in a_q.all()}
     if h_snap is None:
-        h_snap = {h.stock_code.split(".")[0]: h for h in
-                  db.query(HKShareFinancialSnapshot).filter_by(as_of_date=as_of_date).all()}
+        h_q = db.query(HKShareFinancialSnapshot).filter(HKShareFinancialSnapshot.as_of_date == as_of_date)
+        if user_id is not None:
+            h_q = h_q.filter(HKShareFinancialSnapshot.user_id == user_id)
+        h_snap = {h.stock_code.split(".")[0]: h for h in h_q.all()}
 
     constituents = db.query(IndexConstituentSnapshot).filter(
         IndexConstituentSnapshot.as_of_date == as_of_date,
@@ -449,6 +453,7 @@ def get_all_drilled_stocks(
             fund_navs=fund_navs,
             a_snap=a_snap,
             h_snap=h_snap,
+            user_id=user_id,
         )
         if "constituents" not in detail:
             continue

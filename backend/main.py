@@ -4045,8 +4045,8 @@ def get_full_holding_summary(
     from middleware.auth import _resolve_eff_from_request
     _u, eff_uid = _resolve_eff_from_request(request, db)
 
-    indices = list_drillable_indices(db, as_of_date)
-    drilled_resp = get_all_drilled_stocks(db, as_of_date)
+    indices = list_drillable_indices(db, as_of_date, user_id=eff_uid)
+    drilled_resp = get_all_drilled_stocks(db, as_of_date, user_id=eff_uid)
     all_stocks = drilled_resp.get("stocks") or []
 
     # 拉最新汇率 (按 from_currency 取最大 rate_date), 用于将 est_market_value_cny 折算 CNY

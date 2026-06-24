@@ -273,3 +273,67 @@ def test_upload_industry_chain_success(client, fresh_db, monkeypatch):
     assert data["status"] == "success"
     assert data["chain_saved"] is True
     assert data["companies_saved"] == 2
+
+
+# ========== 财务数据上传测试 ==========
+
+def test_upload_financials_single(client, fresh_db):
+    """单条财务数据上传。"""
+    res = client.post(
+        "/api/admin/upload/financials/single",
+        json={
+            "stock_code": "600519.SH",
+            "stock_name": "贵州茅台",
+            "pe_ttm": 30.5,
+            "as_of_date": "2026-06-24",
+        },
+    )
+    assert res.status_code == 200, res.text
+    assert res.json()["status"] == "ok"
+
+
+def test_upload_financials_single_unsupported(client, fresh_db):
+    """不支持的代码后缀返回 400。"""
+    res = client.post(
+        "/api/admin/upload/financials/single",
+        json={
+            "stock_code": "000001.OF",
+            "as_of_date": "2026-06-24",
+        },
+    )
+    assert res.status_code == 400
+
+
+def test_upload_financials_excel(client, fresh_db, monkeypatch):
+    """Excel 批量上传（mock import 函数）。"""
+    monkeypatch.setattr(
+        "services.upload_service.save_upload_file",
+        lambda file, category: f"uploads/{category}/{file.filename}"
+    )
+    # mock import_a_share
+    from scripts.import_common import ImportReport
+    mock_report = ImportReport(as_of_date=date(2026, 6, 24), table="a_share_financial_snapshot")
+    mock_report.rows_inserted = 100
+
+    monkeypatch.setattr(
+        "services.financial_upload_service.import_a_share",
+        lambda db, as_of, path: mock_report,
+        raising=False
+    )
+    import services.financial_upload_service
+    monkeypatch.setattr(
+        services.financial_upload_service,
+        "import_a_share",
+        lambda db, as_of, path: mock_report,
+        raising=False
+    )
+
+    excel_content = b"fake excel"
+    res = client.post(
+        "/api/admin/upload/financials",
+        data={"market": "CN", "as_of_date": "2026-06-24"},
+        files={"file": ("financials.xlsx", io.BytesIO(excel_content), "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet")},
+    )
+
+    assert res.status_code == 200, res.text
+    assert res.json()["imported"] == 100

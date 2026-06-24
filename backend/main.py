@@ -5408,3 +5408,41 @@ async def admin_upload_industry_chain(
         "chain_saved": True,
         "companies_saved": companies_saved,
     }
+
+
+from services.financial_upload_service import upsert_financial_single, import_excel_batch
+
+
+@app.post("/api/admin/upload/financials/single")
+def admin_upload_financials_single(
+    body: dict = Body(...),
+    db: Session = Depends(get_db),
+):
+    """单条财务数据上传。"""
+    try:
+        result = upsert_financial_single(db, body)
+        return result
+    except ValueError as e:
+        raise HTTPException(400, str(e))
+
+
+@app.post("/api/admin/upload/financials")
+async def admin_upload_financials_excel(
+    market: str = Form(...),
+    as_of_date: str = Form(...),
+    file: UploadFile = File(...),
+    db: Session = Depends(get_db),
+):
+    """Excel 批量上传财务数据。"""
+    from services.upload_service import save_upload_file
+
+    # 保存文件
+    relative_path = save_upload_file(file, "csv")
+    full_path = os.path.join(os.path.dirname(__file__), relative_path)
+
+    # 解析日期
+    as_of = date.fromisoformat(as_of_date)
+
+    # 导入
+    result = import_excel_batch(db, full_path, market, as_of)
+    return result

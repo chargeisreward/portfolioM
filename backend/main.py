@@ -7,6 +7,7 @@ from datetime import date, datetime, timedelta
 from pathlib import Path
 from fastapi import FastAPI, Depends, Query, Request, HTTPException, Body
 from fastapi.middleware.cors import CORSMiddleware
+from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel
 from sqlalchemy import func
 from sqlalchemy.orm import Session
@@ -36,6 +37,11 @@ from crawlers.index_constituents import crawl_constituents
 from crawlers.price_data import get_stock_info, fetch_price_history
 
 app = FastAPI(title="PortfolioM", version="0.1.0")
+
+# 静态文件服务：uploads 目录
+UPLOAD_DIR = os.path.join(os.path.dirname(__file__), "uploads")
+os.makedirs(UPLOAD_DIR, exist_ok=True)
+app.mount("/uploads", StaticFiles(directory=UPLOAD_DIR), name="uploads")
 
 # ---- CORS: 显式白名单 (避免通配符在某些浏览器/代理场景下被拒) ----
 # 生产前端固定在 portfoliom.zeabur.app; 加上 localhost 让 vite dev/preview 可直连

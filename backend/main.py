@@ -4654,13 +4654,13 @@ def get_drillable_indices(
     request: Request = None,
     db: Session = Depends(get_db),
 ):
-    """列出所有可下钻的基金（按 effective user 隔离 — 2026-06-24）"""
-    from services.drillable_funds import list_drillable_indices
+    """下钻卡片列表 — 调 orchestration service（三层解耦架构）"""
+    from services.drill_orchestration_service import list_drillable_cards
     from middleware.auth import _resolve_eff_from_request
     _u, eff_uid = _resolve_eff_from_request(request, db)
     return {
         "as_of_date": as_of_date.isoformat(),
-        "indices": list_drillable_indices(db, as_of_date, user_id=eff_uid),
+        "indices": list_drillable_cards(db, as_of_date, eff_uid) if eff_uid else [],
     }
 
 
@@ -4671,11 +4671,16 @@ def get_fund_drill(
     request: Request = None,
     db: Session = Depends(get_db),
 ):
-    """单一基金下钻明细（按 effective user 隔离 — 2026-06-24）"""
-    from services.drillable_funds import get_index_drill_detail
+    """下钻明细 — 调 orchestration service（三层解耦架构）"""
+    from services.drill_orchestration_service import get_drill_detail
     from middleware.auth import _resolve_eff_from_request
     _u, eff_uid = _resolve_eff_from_request(request, db)
-    return get_index_drill_detail(db, index_code, as_of_date, user_id=eff_uid)
+    if not eff_uid:
+        raise HTTPException(401, "请登录")
+    result = get_drill_detail(db, as_of_date, index_code, eff_uid)
+    if result is None:
+        raise HTTPException(404, "无下钻数据（可能无 snapshot 或无持仓）")
+    return result
 
 
 @app.get("/api/penetration/all-drilled-stocks")

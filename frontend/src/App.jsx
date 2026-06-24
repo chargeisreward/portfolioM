@@ -6,12 +6,11 @@ import AnalystPanel from './components/AnalystPanel'
 import TradingPanel from './components/TradingPanel'
 import WatchPanel from './components/WatchPanel'
 import SettingsPanel from './components/SettingsPanel'
-import AdminSettingsPanel from './components/AdminSettingsPanel'
-import DataBrowser from './components/DataBrowser'
-import StrategiesPanel from './components/StrategiesPanel'
 import AuthGate from './components/AuthGate'
-import OpsPanel from './components/OpsPanel'
 import RelationPanel from './components/RelationPanel'
+import MasterDataPanel from './components/MasterDataPanel'
+import DataSourcePanel from './components/DataSourcePanel'
+import ContentUploadPanel from './components/ContentUploadPanel'
 import './App.css'
 
 // SVG path icons (no emoji — per UI UX Pro Max §4)
@@ -29,15 +28,14 @@ const TABS = [
   { id: 'overview',  label: '总览',    icon: ICONS.overview, visibility: ['user','advisor','admin'] },
   { id: 'analysis',  label: '分析',    icon: ICONS.analysis, visibility: ['user','advisor','admin'] },
   { id: 'analyst',   label: '分析师',  icon: ICONS.analyst,  visibility: ['user','advisor','admin'] },
-  { id: 'trading',   label: '交易',    icon: ICONS.trading,  visibility: ['user'] },
   { id: 'watch',     label: '关注',    icon: ICONS.watch,    visibility: ['user','advisor','admin'] },
+  { id: 'trading',   label: '交易',    icon: ICONS.trading,  visibility: ['user'] },
   { id: 'relation',  label: '关联',    icon: 'M17 20h5v-2a4 4 0 00-3-3.87M9 20H4v-2a3 3 0 015.36-1.87M15 7a3 3 0 11-6 0 3 3 0 016 0zm6 7a2 2 0 11-4 0 2 2 0 014 0z', visibility: ['user','advisor'] },
-  { id: 'data',      label: '数据',    icon: ICONS.data,     visibility: ['admin'] },
-  { id: 'ops',       label: '运维',    icon: 'M3 12l2-2 4 4 8-8', visibility: ['admin'] },
-  { id: 'dataGap',   label: '数据补足', icon: 'M12 9v2m0 4h.01M21 12a9 9 0 11-18 0 9 9 0 0118 0z', visibility: ['admin'] },
-  { id: 'strategies', label: 'API策略', icon: 'M13 10V3L4 14h7v7l9-11h-7z', visibility: ['admin'] },
-  { id: 'adminSettings', label: '管理员设置', icon: 'M10.325 4.317c.426-1.756 2.924-1.756 3.35 0a1.724 1.724 0 002.573 1.066c1.543-.94 3.31.826 2.37 2.37a1.724 1.724 0 001.066 2.573c1.756.426 1.756 2.924 0 3.35a1.724 1.724 0 00-1.066 2.573c.94 1.543-.826 3.31-2.37 2.37a1.724 1.724 0 00-2.573 1.066c-.426 1.756-2.924 1.756-3.35 0a1.724 1.724 0 00-2.573-1.066c-1.543.94-3.31-.826-2.37-2.37a1.724 1.724 0 00-1.066-2.573c-1.756-.426-1.756-2.924 0-3.35a1.724 1.724 0 001.066-2.573c-.94-1.543.826-3.31 2.37-2.37.996.608 2.296.07 2.572-1.065z', visibility: ['admin'] },
   { id: 'settings',  label: '设置',    icon: ICONS.settings, visibility: ['user','advisor','admin'] },
+  // --- 分割线（仅 admin 可见） ---
+  { id: 'masterData',   label: '主数据',   icon: 'M4 6h16M4 12h16M4 18h7', visibility: ['admin'] },
+  { id: 'dataSource',   label: '数据源',   icon: 'M4 7v10m4-14v18m4-14v10m4-14v18', visibility: ['admin'] },
+  { id: 'contentUpload', label: '内容上传', icon: 'M9 13h6m-3-3v6m-9 1V7a2 2 0 012-2h14a2 2 0 012 2v10a2 2 0 01-2 2H5a2 2 0 01-2-2z', visibility: ['admin'] },
 ]
 
 function userRoleOf(u) {
@@ -202,12 +200,10 @@ export default function App() {
       case 'trading': return <TradingPanel />
       case 'watch': return <WatchPanel />
       case 'relation': return <RelationPanel currentUser={currentUser} />
-      case 'data': return <DataBrowser />
-      case 'ops': return <OpsPanel />
-      case 'dataGap': return <DataGapPanel />
-      case 'strategies': return <StrategiesPanel />
-      case 'adminSettings': return <AdminSettingsPanel />
       case 'settings': return <SettingsPanel />
+      case 'masterData': return <MasterDataPanel />
+      case 'dataSource': return <DataSourcePanel />
+      case 'contentUpload': return <ContentUploadPanel />
       default: return null
     }
   }
@@ -275,18 +271,24 @@ export default function App() {
           </div>
         )}
         <nav className="sidebar-nav">
-          {visibleTabs.map(tab => (
-            <button key={tab.id}
-              className={`nav-item ${activeTab === tab.id ? 'active' : ''}`}
-              onClick={() => setActiveTab(tab.id)}>
-              <span className="nav-icon">
-                <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round">
-                  <path d={tab.icon} />
-                </svg>
-              </span>
-              <span className="nav-label">{tab.label}</span>
-            </button>
-          ))}
+          {visibleTabs.map(tab => {
+            // masterData 之前插入灰色分割线（仅 admin 可见，因 masterData 只对 admin 可见）
+            const showDivider = tab.id === 'masterData'
+            return (
+              <React.Fragment key={tab.id}>
+                {showDivider && <div className="sidebar-divider" style={{height:1, background:'var(--border, #ccc)', margin:'8px 0'}} />}
+                <button className={`nav-item ${activeTab === tab.id ? 'active' : ''}`}
+                  onClick={() => setActiveTab(tab.id)}>
+                  <span className="nav-icon">
+                    <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round">
+                      <path d={tab.icon} />
+                    </svg>
+                  </span>
+                  <span className="nav-label">{tab.label}</span>
+                </button>
+              </React.Fragment>
+            )
+          })}
         </nav>
         <div className="sidebar-footer" style={{ display: 'flex', flexDirection: 'column', gap: 6 }}>
           <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center' }}>

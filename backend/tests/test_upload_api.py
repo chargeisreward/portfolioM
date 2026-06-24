@@ -225,3 +225,51 @@ def test_upload_analyst_report_no_stock_code(client, fresh_db, monkeypatch):
     data = res.json()
     assert data["results"][0]["status"] == "error"
     assert "无法解析股票代码" in data["results"][0]["error"]
+
+
+# ========== 产业链报告上传测试 ==========
+
+def test_upload_industry_chain_success(client, fresh_db, monkeypatch):
+    """上传产业链总结 + 公司清单 MD 文件。"""
+    monkeypatch.setattr(
+        "services.upload_service.save_upload_file",
+        lambda file, category: f"uploads/{category}/{file.filename}"
+    )
+    # mock parse_chain_summary
+    monkeypatch.setattr(
+        "services.analyst_parser.parse_chain_summary",
+        lambda path: {
+            "chain_name": "AI产业链",
+            "narrative_md": "# AI产业链总结\n...",
+            "source_file": path,
+        }
+    )
+    # mock parse_chain_company_list
+    monkeypatch.setattr(
+        "services.analyst_parser.parse_chain_company_list",
+        lambda path: {
+            "chain_name": "AI产业链",
+            "companies": [
+                {"chain_position": "上游", "company_name": "公司A", "stock_code": "600001"},
+                {"chain_position": "下游", "company_name": "公司B", "stock_code": "600002"},
+            ],
+        }
+    )
+
+    summary_content = "# AI产业链总结".encode("utf-8")
+    company_content = "| 位置 | 公司 | 代码 |\n|---|---|---|\n| 上游 | 公司A | 600001 |".encode("utf-8")
+
+    res = client.post(
+        "/api/admin/upload/industry-chain",
+        data={"chain_name": "AI产业链"},
+        files={
+            "summary_file": ("AI产业链总结.md", io.BytesIO(summary_content), "text/markdown"),
+            "company_list_file": ("AI产业链公司清单.md", io.BytesIO(company_content), "text/markdown"),
+        },
+    )
+
+    assert res.status_code == 200, res.text
+    data = res.json()
+    assert data["status"] == "success"
+    assert data["chain_saved"] is True
+    assert data["companies_saved"] == 2

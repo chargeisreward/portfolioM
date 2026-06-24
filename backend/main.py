@@ -5336,3 +5336,75 @@ async def admin_upload_analyst_report(
             })
 
     return {"results": results}
+
+
+@app.post("/api/admin/upload/industry-chain")
+async def admin_upload_industry_chain(
+    chain_name: str = Form(...),
+    summary_file: UploadFile = File(...),
+    company_list_file: UploadFile = File(...),
+    db: Session = Depends(get_db),
+):
+    """上传产业链报告（总结 MD + 公司清单 MD）。"""
+    from services.upload_service import save_upload_file
+    from services.analyst_parser import parse_chain_summary, parse_chain_company_list
+    from models import AnalystIndustryChain, AnalystIndustryChainCompany
+
+    # 保存文件
+    summary_path = save_upload_file(summary_file, "md")
+    company_path = save_upload_file(company_list_file, "md")
+
+    summary_full = os.path.join(os.path.dirname(__file__), summary_path)
+    company_full = os.path.join(os.path.dirname(__file__), company_path)
+
+    # 解析
+    summary_parsed = parse_chain_summary(summary_full)
+    company_parsed = parse_chain_company_list(company_full)
+
+    # Upsert 产业链总结
+    existing_chain = db.query(AnalystIndustryChain).filter(
+        AnalystIndustryChain.chain_name == chain_name
+    ).first()
+
+    if existing_chain:
+        existing_chain.narrative_md = summary_parsed.get("narrative_md")
+        existing_chain.source_file = summary_path
+    else:
+        chain = AnalystIndustryChain(
+            chain_name=chain_name,
+            narrative_md=summary_parsed.get("narrative_md"),
+            source_file=summary_path,
+        )
+        db.add(chain)
+
+    # 删除旧公司清单并写入新清单
+    db.query(AnalystIndustryChainCompany).filter(
+        AnalystIndustryChainCompany.chain_name == chain_name
+    ).delete()
+
+    companies_saved = 0
+    for c in company_parsed.get("companies", []):
+        company = AnalystIndustryChainCompany(
+            chain_name=chain_name,
+            chain_position=c.get("chain_position", ""),
+            sub_segment=c.get("sub_segment"),
+            company_name=c.get("company_name", ""),
+            stock_code=c.get("stock_code"),
+            market_cap_range=c.get("market_cap_range"),
+            relevance_stars=c.get("relevance_stars"),
+            relevance_reason=c.get("relevance_reason"),
+            latest_progress=c.get("latest_progress"),
+            order_visibility=c.get("order_visibility"),
+            earnings_elasticity=c.get("earnings_elasticity"),
+            customer_onboarding=c.get("customer_onboarding"),
+            source_file=company_path,
+        )
+        db.add(company)
+        companies_saved += 1
+
+    db.commit()
+    return {
+        "status": "success",
+        "chain_saved": True,
+        "companies_saved": companies_saved,
+    }

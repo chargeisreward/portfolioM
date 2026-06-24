@@ -3,9 +3,10 @@ import hashlib
 import os
 import re as _re
 import secrets
+import time
 from datetime import date, datetime, timedelta
 from pathlib import Path
-from fastapi import FastAPI, Depends, Query, Request, HTTPException, Body
+from fastapi import FastAPI, Depends, Query, Request, HTTPException, Body, UploadFile, File, Form
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel
@@ -5148,3 +5149,108 @@ def admin_trigger_data_pull_task(job_id: str, request: Request):
     user_id = getattr(request.state, 'user_id', None) or getattr(request.state, 'user', None)
     triggered_by = f"manual:{user_id}" if user_id else "manual"
     return {"status": "ok", "job_id": job_id, "triggered_by": triggered_by, "message": "触发请求已记录，Task 7 将集成 scheduler"}
+
+
+# ========== 内容上传端点（子项目 2）==========
+
+# 解析结果内存缓存：{task_id: {index_code, as_of_date, constituents, parsed_at}}
+_parse_cache: dict[str, dict] = {}
+_PARSE_CACHE_TTL = 3600  # 1 小时
+
+
+def _cleanup_parse_cache():
+    """清理过期的解析缓存。"""
+    now = time.time()
+    expired = [k for k, v in _parse_cache.items() if now - v["parsed_at"] > _PARSE_CACHE_TTL]
+    for k in expired:
+        del _parse_cache[k]
+
+
+@app.post("/api/admin/upload/index-pdf")
+async def admin_upload_index_pdf(
+    index_code: str = Form(...),
+    as_of_date: str = Form(...),
+    file: UploadFile = File(...),
+    db: Session = Depends(get_db),
+):
+    """上传指数构成 PDF，返回解析预览。"""
+    from services.upload_service import save_upload_file
+    from services.pdf_parser_service import parse_index_pdf
+
+    _cleanup_parse_cache()
+
+    # 保存文件
+    relative_path = save_upload_file(file, "pdf")
+
+    # 解析 PDF
+    full_path = os.path.join(os.path.dirname(__file__), relative_path)
+    result = parse_index_pdf(full_path, index_code)
+
+    if not result.success:
+        return {
+            "status": "parse_failed",
+            "method": result.method,
+            "error": result.error,
+            "preview": [],
+        }
+
+    # 暂存解析结果
+    task_id = secrets.token_urlsafe(8)
+    _parse_cache[task_id] = {
+        "index_code": index_code,
+        "as_of_date": as_of_date,
+        "constituents": result.constituents,
+        "parsed_at": time.time(),
+    }
+
+    return {
+        "status": "success",
+        "task_id": task_id,
+        "method": result.method,
+        "preview": result.constituents,
+    }
+
+
+@app.post("/api/admin/upload/index-pdf/confirm")
+def admin_confirm_index_pdf(
+    body: dict = Body(...),
+    db: Session = Depends(get_db),
+):
+    """确认写入指数成分股。"""
+    from models import IndexConstituentSnapshot
+    from datetime import date as _date
+
+    _cleanup_parse_cache()
+
+    task_id = body.get("task_id")
+    if not task_id or task_id not in _parse_cache:
+        raise HTTPException(404, "task_id 不存在或已过期")
+
+    cached = _parse_cache.pop(task_id)
+    as_of = _date.fromisoformat(cached["as_of_date"])
+    index_code = cached["index_code"]
+
+    # 删除旧数据（同 index_code + as_of_date）
+    db.query(IndexConstituentSnapshot).filter(
+        IndexConstituentSnapshot.as_of_date == as_of,
+        IndexConstituentSnapshot.index_code == index_code,
+    ).delete()
+
+    # 写入新数据
+    saved = 0
+    for c in cached["constituents"]:
+        stock_code = c.get("stock_code", "")
+        if not stock_code:
+            continue
+        snap = IndexConstituentSnapshot(
+            as_of_date=as_of,
+            index_code=index_code,
+            stock_code=stock_code,
+            stock_name=c.get("stock_name"),
+            weight=c.get("weight"),
+        )
+        db.add(snap)
+        saved += 1
+
+    db.commit()
+    return {"status": "ok", "saved": saved}

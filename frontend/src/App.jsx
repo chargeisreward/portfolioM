@@ -174,6 +174,7 @@ export default function App() {
     setCurrentUser(null)
     setActiveRole(null)
     setViewAsUser(null)
+    localStorage.removeItem('portfoliom_admin_token')
   }
 
   const refreshAll = useCallback(async () => {

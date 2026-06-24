@@ -15,6 +15,13 @@ api.interceptors.request.use((config) => {
   if (token) {
     config.headers['x-session-token'] = token
   }
+  // admin 端点注入 x-admin-token
+  if (config.url?.includes('/admin/')) {
+    const adminToken = localStorage.getItem('portfoliom_admin_token')
+    if (adminToken) {
+      config.headers['x-admin-token'] = adminToken
+    }
+  }
   // 注入 view_as（多用户视图代理）
   const viewAsId = localStorage.getItem('portfoliom_view_as')
   if (viewAsId) {

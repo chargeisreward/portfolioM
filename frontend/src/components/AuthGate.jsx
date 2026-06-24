@@ -49,6 +49,13 @@ export default function AuthGate({ onLoggedIn }) {
     try {
       const res = await api.login(username, password)
       if (res.status === 'ok' && res.token) {
+        // admin 用户存储 admin token（用于 admin API 鉴权）
+        // admin token = 登录密码（与后端 APP_PASSWORD/ADMIN_TOKEN 一致）
+        if (res.user?.is_admin) {
+          localStorage.setItem('portfoliom_admin_token', password)
+        } else {
+          localStorage.removeItem('portfoliom_admin_token')
+        }
         onLoggedIn(res.token, res.user)
       } else if (res.status === 'banned') {
         setBanned({ until: res.banned_until, remaining: res.remaining_seconds })

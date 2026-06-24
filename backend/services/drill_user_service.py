@@ -9,7 +9,7 @@ import logging
 
 from sqlalchemy.orm import Session
 
-from models import Holding
+from models import Holding, SecurityMaster
 
 logger = logging.getLogger(__name__)
 
@@ -26,20 +26,27 @@ DRILLABLE_ASSET_TYPES = frozenset({
 def get_user_fund_codes(db: Session, user_id: int) -> set[str]:
     """返回用户持有的所有可下钻基金代码集合。
 
-    过滤 asset_type in DRILLABLE_ASSET_TYPES 且 quantity > 0。
+    优先 join SecurityMaster.is_drillable 过滤；表为空时 fallback 到旧硬编码逻辑。
 
     返回：{"510300.SH", "159919.SZ", ...}
     """
-    rows = db.query(Holding).filter(
-        Holding.user_id == user_id,
-    ).all()
-
-    codes: set[str] = set()
-    for h in rows:
-        asset_type = (h.asset_type or "").lower()
-        if asset_type in DRILLABLE_ASSET_TYPES and (h.quantity or 0) > 0:
-            codes.add(h.security_code)
-    return codes
+    # 先尝试 join SecurityMaster
+    sm_exists = db.query(SecurityMaster).count() > 0
+    if sm_exists:
+        return set(
+            r[0] for r in db.query(Holding.security_code)
+            .join(SecurityMaster, Holding.security_code == SecurityMaster.security_code)
+            .filter(Holding.user_id == user_id)
+            .filter(SecurityMaster.is_drillable == True)
+            .all()
+        )
+    # Fallback: SecurityMaster 表为空时用旧逻辑
+    return set(
+        r[0] for r in db.query(Holding.security_code).filter(
+            Holding.user_id == user_id,
+            Holding.asset_type.in_(DRILLABLE_ASSET_TYPES),
+        ).all()
+    )
 
 
 def get_user_fund_holdings(db: Session, user_id: int, fund_codes: list[str]) -> dict[str, dict]:

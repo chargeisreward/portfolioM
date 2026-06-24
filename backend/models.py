@@ -557,6 +557,39 @@ class HKShareFinancialSnapshot(Base):
     created_at = Column(DateTime, default=datetime.utcnow)
 
 
+class OverseasShareFinancialSnapshot(Base):
+    """海外市场（非 A 股、非港股）估值快照。"""
+    __tablename__ = "overseas_share_financial_snapshot"
+    __table_args__ = (
+        UniqueConstraint("as_of_date", "stock_code",
+                         name="ux_osfs_asof_stock"),
+    )
+
+    id = Column(Integer, primary_key=True, autoincrement=True)
+    user_id = Column(Integer, nullable=False, index=True)
+    as_of_date = Column(Date, nullable=False, index=True)
+    stock_code = Column(String(20), nullable=False, index=True)
+    stock_name = Column(String(80))
+    market = Column(String(8), nullable=False, index=True)
+    pe_ttm = Column(Float)
+    pb_mrq = Column(Float)
+    ps_ttm = Column(Float)
+    dividend_yield = Column(Float)
+    market_cap = Column(Float)
+    eps_fy1 = Column(Float)
+    eps_fy2 = Column(Float)
+    sector = Column(String(60))
+    industry = Column(String(80))
+    baseline_price = Column(Float)
+    current_price = Column(Float)
+    current_price_date = Column(Date)
+    pe_ttm_dynamic = Column(Float)
+    pb_mrq_dynamic = Column(Float)
+    ps_ttm_dynamic = Column(Float)
+    source = Column(String(40))
+    created_at = Column(DateTime, default=datetime.utcnow)
+
+
 class PenetrationSnapshot(Base):
     """基金下钻结果（按持仓单只下钻）。"""
     __tablename__ = "penetration_snapshot"

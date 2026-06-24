@@ -1,11 +1,31 @@
-import React from 'react'
+import React, { useState } from 'react'
+import SecurityMasterTab from './SecurityMasterTab'
+import FundIndexMapTab from './FundIndexMapTab'
 
-/** 主数据页 — Task 9 实现完整功能，当前占位。 */
+/**
+ * 主数据页 — 证券主数据 + 基金-指数映射。
+ * 复用现有 .subtab-bar / .subtab 样式实现 tab 切换。
+ */
 export default function MasterDataPanel() {
+  const [tab, setTab] = useState('security')
+
   return (
-    <div className="raised" style={{ padding: 24 }}>
-      <div style={{ fontSize: 18, fontWeight: 600, marginBottom: 8 }}>主数据</div>
-      <div style={{ color: 'var(--text-muted)' }}>证券主数据 + 基金-指数映射（Task 9 实现）</div>
+    <div style={{ padding: 16 }}>
+      <div className="subtab-bar">
+        <button
+          className={tab === 'security' ? 'subtab active' : 'subtab'}
+          onClick={() => setTab('security')}
+        >
+          证券主数据
+        </button>
+        <button
+          className={tab === 'fundIndex' ? 'subtab active' : 'subtab'}
+          onClick={() => setTab('fundIndex')}
+        >
+          基金-指数映射
+        </button>
+      </div>
+      {tab === 'security' ? <SecurityMasterTab /> : <FundIndexMapTab />}
     </div>
   )
 }

@@ -1,11 +1,43 @@
-import React from 'react'
+import React, { useState } from 'react'
+import DataReadinessTab from './DataReadinessTab'
+import TaskHistoryTab from './TaskHistoryTab'
+import ApiStrategyTab from './ApiStrategyTab'
+import TradingCalendarView from './TradingCalendarView'
+import DataBrowser from './DataBrowser'
 
-/** 数据源页 — Task 10 实现完整功能，当前占位。 */
+/**
+ * 数据源页 — 数据就绪 + 任务历史 + API策略 + 交易日历 + 数据浏览。
+ * 复用现有 .subtab-bar / .subtab 样式实现 tab 切换（与 MasterDataPanel 一致）。
+ */
 export default function DataSourcePanel() {
+  const [tab, setTab] = useState('readiness')
+
+  const tabs = [
+    { id: 'readiness', label: '数据就绪' },
+    { id: 'tasks', label: '任务历史' },
+    { id: 'apiStrategy', label: 'API策略' },
+    { id: 'calendar', label: '交易日历' },
+    { id: 'browser', label: '数据浏览' },
+  ]
+
   return (
-    <div className="raised" style={{ padding: 24 }}>
-      <div style={{ fontSize: 18, fontWeight: 600, marginBottom: 8 }}>数据源</div>
-      <div style={{ color: 'var(--text-muted)' }}>数据就绪 + 任务历史 + API策略 + 交易日历 + 数据浏览（Task 10 实现）</div>
+    <div style={{ padding: 16 }}>
+      <div className="subtab-bar">
+        {tabs.map(t => (
+          <button
+            key={t.id}
+            className={tab === t.id ? 'subtab active' : 'subtab'}
+            onClick={() => setTab(t.id)}
+          >
+            {t.label}
+          </button>
+        ))}
+      </div>
+      {tab === 'readiness' && <DataReadinessTab />}
+      {tab === 'tasks' && <TaskHistoryTab />}
+      {tab === 'apiStrategy' && <ApiStrategyTab />}
+      {tab === 'calendar' && <TradingCalendarView />}
+      {tab === 'browser' && <DataBrowser />}
     </div>
   )
 }

@@ -353,6 +353,7 @@ class IndexConstituentSnapshot(Base):
     stock_name = Column(String(80))
     exchange = Column(String(8))                       # SSE/SZSE/HKEx
     weight = Column(Float)                             # 5/29 权重 % (akshare 拉取)
+    baseline_price = Column(Float)                      # 5/29 当日收盘价（fund_drill_snapshot 算法用）
 
 
 class FundDrillSnapshot(Base):

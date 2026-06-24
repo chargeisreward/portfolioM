@@ -40,14 +40,26 @@ STOCK_RATIO = 1 - CASH_RATIO         # 95% 成分股
 
 
 def _latest_index_constituents(db: Session, idx_code: str, on_or_before: date) -> list[IndexConstituentSnapshot]:
-    """取 idx_code 在 on_or_before 或之前的最近一份成分股快照。"""
-    return (
-        db.query(IndexConstituentSnapshot)
+    """取 idx_code 在 on_or_before 或之前的最近一份成分股快照。
+
+    取最新 as_of_date 那一组（用子查询确定 max_date），避免不同月份同只股票去重失败。
+    """
+    max_date_sub = (
+        db.query(IndexConstituentSnapshot.as_of_date)
         .filter(
             IndexConstituentSnapshot.index_code == idx_code,
             IndexConstituentSnapshot.as_of_date <= on_or_before,
         )
         .order_by(IndexConstituentSnapshot.as_of_date.desc())
+        .limit(1)
+        .scalar_subquery()
+    )
+    return (
+        db.query(IndexConstituentSnapshot)
+        .filter(
+            IndexConstituentSnapshot.index_code == idx_code,
+            IndexConstituentSnapshot.as_of_date == max_date_sub,
+        )
         .all()
     )
 
@@ -169,9 +181,28 @@ def generate_drill_snapshot_for_date(db: Session, as_of_date: date) -> dict:
                 is_stale_price=bool(stale),
             ))
 
-        db.bulk_save_objects(fund_rows)
+        # 用 INSERT ... ON CONFLICT DO NOTHING 幂等写入
+        from sqlalchemy.dialects.postgresql import insert as pg_insert
+        from datetime import datetime as _dt
+        stmt = pg_insert(FundDrillSnapshot.__table__).values([
+            {
+                "fund_code": r.fund_code,
+                "as_of_date": r.as_of_date,
+                "stock_code": r.stock_code,
+                "stock_name": r.stock_name,
+                "weight_pct": r.weight_pct,
+                "baseline_price": r.baseline_price,
+                "current_price": r.current_price,
+                "shares_equivalent": r.shares_equivalent,
+                "is_stale_price": r.is_stale_price,
+                "updated_at": _dt.utcnow(),
+            }
+            for r in fund_rows
+        ])
+        stmt = stmt.on_conflict_do_nothing(index_elements=["fund_code", "as_of_date", "stock_code"])
+        result = db.execute(stmt)
         funds_processed += 1
-        rows_inserted += len(fund_rows)
+        rows_inserted += result.rowcount or 0
         details.append({
             "fund": fund_code, "index": idx_code,
             "fund_price": round(fund_price, 4),

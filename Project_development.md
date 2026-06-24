@@ -217,6 +217,51 @@ RUNNING → SKIPPED  (跳过执行)
 - 子项目 2：内容上传套件（指数构成 PDF、股票报告、产业链报告、财务数据手动上传）
 - 子项目 3：yfinance 集成（非中港市场 PE/PB/PS 自动补足）
 
+### 2026-06-24 子项目 2：内容上传套件
+
+**影响范围**：大（9 个 Task，后端 4 service + 8 API 端点，前端 ContentUploadPanel 4 tab + admin token 拦截器修复）
+
+**完成内容**：
+
+| Task | 内容 | Commit |
+|------|------|--------|
+| Task 1 | upload_service + StaticFiles 挂载 + 依赖 | aa92f46 |
+| Task 2 | llm_service（AI 辅助解析层） | 05c95db |
+| Task 3 | pdf_parser_service（三层解析策略） | 672cfc9 |
+| Task 4 | 指数构成 PDF 上传 + 确认端点 | 83dd39d |
+| Task 5 | 股票分析报告上传端点 | b7e6362 |
+| Task 6 | 产业链报告上传端点 | 355bfb9 |
+| Task 7 | 财务数据上传（单条 + Excel 批量）端点 | ea37341 |
+| Task 8 | ContentUploadPanel 4 tab + admin token 拦截器 | 1b08706 |
+| Task 9 | 集成测试 + 最终验证 | - |
+
+**测试结果**：26 个后端测试全部通过（4 upload_service + 4 llm_service + 5 pdf_parser + 4 financial_upload + 9 upload_api），前端 build 成功
+
+**关键设计决策**：
+1. PDF 三层解析策略：pdfplumber → OCR（pytesseract）→ AI 辅助（LLM API），逐层降级
+2. task_id 内存缓存 + 1 小时 TTL + `secrets.token_urlsafe(8)` 生成（指数 PDF 两步上传：预览 → 确认）
+3. admin 端点通过 `x-admin-token` 头鉴权（独立于用户 session），前端 axios 拦截器自动注入
+4. 财务数据上传复用现有 `import_a_share`/`import_hk_share` 脚本，单条写入支持 upsert
+5. `.OF` 后缀不支持单条财务上传，返回 400 错误
+6. 前端 admin token = 登录密码（与后端 `APP_PASSWORD`/`ADMIN_TOKEN` 一致），登录时存储到 localStorage
+
+**新增文件**：
+- `backend/services/upload_service.py` — 文件保存 + 路径管理
+- `backend/services/llm_service.py` — LLM API 调用（AI 辅助层）
+- `backend/services/pdf_parser_service.py` — PDF 三层解析
+- `backend/services/financial_upload_service.py` — 财务数据 upsert + Excel 批量导入
+- `frontend/src/components/IndexPdfUploadTab.jsx` — 指数构成 PDF 上传
+- `frontend/src/components/AnalystReportTab.jsx` — 股票分析报告上传
+- `frontend/src/components/IndustryChainTab.jsx` — 产业链报告上传
+- `frontend/src/components/FinancialUploadTab.jsx` — 财务数据上传（Excel + 单条）
+
+**新增依赖**：
+- pdfplumber, pytesseract, Pillow, pdf2image, python-multipart
+
+**系统依赖**：
+- tesseract-ocr（OCR 引擎，Windows 安装 Tesseract-OCR，Linux: `apt install tesseract-ocr`）
+- poppler（pdf2image 依赖，Windows 安装 poppler 并加入 PATH，Linux: `apt install poppler-utils`）
+
 ### 2026-06-24 下钻架构重构（已完成）
 
 **影响范围**：中（三层 service 架构）

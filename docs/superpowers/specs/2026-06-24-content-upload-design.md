@@ -381,12 +381,12 @@ formData.append('as_of_date', asOfDate);
 
 const res = await fetch('/api/admin/upload/index-pdf', {
   method: 'POST',
-  headers: { 'Authorization': `Bearer ${token}` },  // 不设置 Content-Type，让浏览器自动设置 boundary
+  headers: { 'x-admin-token': adminToken },  // 不设置 Content-Type，让浏览器自动设置 boundary
   body: formData,
 });
 ```
 
-无需修改 `api.js`，直接在组件中使用 `fetch` 调用上传端点。
+无需修改 `api.js`，直接在组件中使用 `fetch` 调用上传端点。`adminToken` 从现有 admin 组件的 props/context 获取（与 SecurityMasterTab 等现有 admin 组件一致）。
 
 ## 9. 测试策略
 
@@ -411,7 +411,9 @@ const res = await fetch('/api/admin/upload/index-pdf', {
 
 ## 11. 鉴权
 
-所有上传端点走 `/api/admin/upload/` 前缀，复用现有 session token + admin 角色校验（与子项目 1 一致）。
+所有上传端点走 `/api/admin/upload/` 前缀，复用现有 `x-admin-token` 头校验机制（与子项目 1 一致，独立于用户 session）。
+
+前端调用时需在请求头中添加 `x-admin-token: <token>`（与现有 admin 端点一致）。
 
 ## 12. 后续子项目
 

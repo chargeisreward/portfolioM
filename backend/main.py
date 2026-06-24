@@ -1845,6 +1845,7 @@ def register_job_handlers() -> None:
         job_crawl_stock_news,
         job_crawl_announcements_and_research,
         job_crawl_hot_stocks,
+        job_generate_drill_snapshot,
     )
     _JOB_DISPATCH = {
         "realtime_prices": job_fetch_realtime_prices,
@@ -1856,6 +1857,7 @@ def register_job_handlers() -> None:
         "info_stock_news": job_crawl_stock_news,
         "info_announcements_research": job_crawl_announcements_and_research,
         "info_hot_stocks": job_crawl_hot_stocks,
+        "drill_snapshot": job_generate_drill_snapshot,
     }
 
 

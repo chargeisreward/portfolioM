@@ -696,6 +696,18 @@ def start_scheduler():
         misfire_grace_time=300,
     )
 
+    # 任务10：公共下钻截面生成（每日 18:00 — A股/港股收盘后，生成 fund_drill_snapshot）
+    scheduler.add_job(
+        job_generate_drill_snapshot,
+        "cron",
+        hour=18,
+        minute=0,
+        id="drill_snapshot",
+        name="公共下钻截面生成",
+        max_instances=1,
+        misfire_grace_time=3600,
+    )
+
     scheduler.start()
     logger.info(
         "调度器已启动，注册 %d 个定时任务",
@@ -712,6 +724,43 @@ def job_detect_data_gaps():
         return detect_all_gaps(db)
     except Exception as e:
         logger.error("detect_data_gaps failed: %s", e, exc_info=True)
+        raise
+    finally:
+        db.close()
+
+
+@track_run("drill_snapshot")
+def job_generate_drill_snapshot(as_of_date=None):
+    """T+1 收盘后生成公共下钻截面（fund_drill_snapshot — 2026-06-24 引入）。
+
+    算法（参考 services/drill_snapshot.py）：
+      对每只可下钻基金 × as_of_date：
+        读 index_constituents[最近月份] + PriceCache[T]
+        校验 95% 价格可得，缺失用 T-1 价
+        算 shares_equivalent = fund_price × 0.95 × (weight/100) / current_price
+    默认生成最近一个交易日（市场全部收盘后）。
+    """
+    from datetime import date as _date
+    from services.drill_snapshot import generate_drill_snapshot_for_date
+    if as_of_date is None:
+        # 取最近一个有 PriceCache 的交易日（视为最近收盘日）
+        from models import PriceCache
+        from sqlalchemy import func
+        last = c = None  # noqa
+        db_probe = SessionLocal()
+        try:
+            c = db_probe.query(func.max(PriceCache.trade_date)).scalar()
+        finally:
+            db_probe.close()
+        as_of_date = c
+    if as_of_date is None:
+        logger.warning("drill_snapshot: no PriceCache date found, skip")
+        return {"skipped": "no_price_cache_date"}
+    db = SessionLocal()
+    try:
+        return generate_drill_snapshot_for_date(db, as_of_date)
+    except Exception as e:
+        logger.error("drill_snapshot failed: %s", e, exc_info=True)
         raise
     finally:
         db.close()

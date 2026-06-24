@@ -355,6 +355,39 @@ class IndexConstituentSnapshot(Base):
     weight = Column(Float)                             # 5/29 权重 % (akshare 拉取)
 
 
+class FundDrillSnapshot(Base):
+    """公共下钻截面快照（按 fund × as_of_date 批量生成 — 2026-06-24 引入）。
+
+    算法（参考 spec §3.2 weight-invariant + 用户确认 95/5 拆分）：
+      1. 读取 index_constituents[最近月份] 的成分股 + 权重 weight + baseline_price
+      2. 取每只成分股 T 日 current_price；缺失用 T-1 价（视为停牌）
+      3. 校验：当日获得收盘价的成分股占比 >= 95% 才生成
+      4. shares_equivalent = fund_price × 0.95 × (weight/100) / current_price
+         其中 fund_price = Holding.price（fund 当日基金价格）
+         5% 现金部分：cash_per_unit = fund_price × 0.05（不需要存股票级记录）
+      5. user 层：user_drill[s] = Holding.quantity × shares_equivalent[s]
+
+    公共数据，不带 user_id。
+    """
+    __tablename__ = "fund_drill_snapshot"
+    __table_args__ = (
+        UniqueConstraint("fund_code", "as_of_date", "stock_code",
+                         name="ux_fds_code_date_stock"),
+    )
+
+    id = Column(Integer, primary_key=True, autoincrement=True)
+    fund_code = Column(String(20), nullable=False, index=True)
+    as_of_date = Column(Date, nullable=False, index=True)
+    stock_code = Column(String(20), nullable=False, index=True)
+    stock_name = Column(String(80))
+    weight_pct = Column(Float, nullable=False)            # 指数权重 %（来自 index_constituents）
+    baseline_price = Column(Float)                          # 成分股基准日收盘价
+    current_price = Column(Float, nullable=False)           # 成分股当日收盘价（缺失时用 T-1）
+    shares_equivalent = Column(Float, nullable=False)       # 1 份基金对应股数
+    is_stale_price = Column(Boolean, default=False)          # True=current_price 是 T-1 替补
+    updated_at = Column(DateTime, default=datetime.utcnow, onupdate=datetime.utcnow)
+
+
 class FundDailyNav(Base):
     """基金每日净值 (用于下钻精确定价)。
 

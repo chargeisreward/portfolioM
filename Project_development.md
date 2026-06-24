@@ -262,6 +262,45 @@ RUNNING → SKIPPED  (跳过执行)
 - tesseract-ocr（OCR 引擎，Windows 安装 Tesseract-OCR，Linux: `apt install tesseract-ocr`）
 - poppler（pdf2image 依赖，Windows 安装 poppler 并加入 PATH，Linux: `apt install poppler-utils`）
 
+### 2026-06-24 子项目 3：yfinance 集成 — 非中港市场 PE/PB/PS 自动补足
+
+**影响范围**：中（7 个 Task，后端 1 模型 + 1 service + 2 API 端点 + scheduler 集成 + 穿透分析集成）
+
+**完成内容**：
+
+| Task | 内容 | Commit |
+|------|------|--------|
+| Task 1 | OverseasShareFinancialSnapshot 模型 | 133de7f |
+| Task 2 | yfinance 增强（PB/PS + market 推断） | f65220a |
+| Task 3 | overseas_financial_service | 631f4d7 |
+| Task 4 | resolve_dynamic_metrics_for_stock 集成海外查询 | 5ae9963 |
+| Task 5 | scheduler 集成 | a7b1800 |
+| Task 6 | API 端点（列表 + 手动触发） | cd2e796 |
+| Task 7 | 集成测试 + 最终验证 | - |
+
+**测试结果**：19 个新测试全部通过（累计 45 个测试）
+
+**关键设计决策**：
+1. 新建 OverseasShareFinancialSnapshot 通用表，market 字段区分 US/KR/JP/EU 等
+2. yfinance 增强：补全 PB（priceToBook）和 PS（priceToSalesTrailing12Months）
+3. 穿透分析查询顺序：HK → CN → Overseas
+4. 复用现有 job_update_financial_fundamentals，不新建独立 job
+5. 无新增依赖（yfinance 已安装）
+
+**新增文件**：
+- `backend/services/overseas_financial_service.py`
+- `backend/tests/test_yfinance_enhanced.py`
+- `backend/tests/test_overseas_financial_service.py`
+- `backend/tests/test_aggregation_overseas.py`
+- `backend/tests/test_overseas_financial_api.py`
+
+**修改文件**：
+- `backend/models.py`（新增 OverseasShareFinancialSnapshot 类）
+- `backend/crawlers/price_data.py`（增强 fetch_yfinance_info + 新增 _infer_market_from_ticker）
+- `backend/services/aggregation.py`（resolve_dynamic_metrics_for_stock 添加海外查询）
+- `backend/services/scheduler.py`（job_update_financial_fundamentals 添加海外写入）
+- `backend/main.py`（2 个 API 端点 + import 补充）
+
 ### 2026-06-24 下钻架构重构（已完成）
 
 **影响范围**：中（三层 service 架构）

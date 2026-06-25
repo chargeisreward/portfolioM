@@ -7,28 +7,55 @@ const baseURL = import.meta.env.VITE_API_URL
   ? `${import.meta.env.VITE_API_URL.replace(/\/$/, '')}/api`
   : `${import.meta.env.BASE_URL.replace(/\/$/, '')}/api`
 
-const api = axios.create({ baseURL, timeout: 30000 })
+// withCredentials=true：跨域请求携带 cookie（HttpOnly session_token）
+// token 不再存 localStorage，由后端 Set-Cookie 管理，JS 不可读，防 XSS 窃取
+const api = axios.create({ baseURL, timeout: 30000, withCredentials: true })
 
-// 自动注入 session token（从 localStorage）
+// view_as 内存变量（不持久化，刷新后重置）
+let _viewAsUserId = null
+
+/**
+ * 设置 view_as 用户 ID（内存中，不持久化到 localStorage）
+ * @param {number|null} userId - 视图代理目标用户 ID，null 表示查看自己
+ */
+export function setViewAs(userId) {
+  _viewAsUserId = userId
+}
+
+// 401 未授权回调（App 注册后，401 时触发跳转登录页）
+let _onUnauthorized = null
+
+/**
+ * 注册 401 未授权回调
+ * @param {() => void} callback - 401 时调用，App 用于重置状态显示 AuthGate
+ */
+export function onUnauthorized(callback) {
+  _onUnauthorized = callback
+}
+
+// 请求拦截：注入 view_as（从内存变量，不再读 localStorage）
 api.interceptors.request.use((config) => {
-  const token = localStorage.getItem('portfoliom_session')
-  if (token) {
-    config.headers['x-session-token'] = token
+  if (_viewAsUserId) {
+    config.params = { ...(config.params || {}), view_as: _viewAsUserId }
   }
   return config
 })
 
-// 401 拦截：清掉 token 触发 App 跳到登录页
+// 401 响应拦截：通知 App 重置状态（不再操作 localStorage，不再 reload）
+// 防抖：短时间内多个 401 只触发一次回调
+let _unauthScheduled = false
 api.interceptors.response.use(
   (r) => r,
   (err) => {
     if (err?.response?.status === 401) {
-      // 避免无限递归
+      // 排除 /api/auth/ 路径（登录/登出接口的 401 不触发跳转）
       if (!err.config?.url?.includes('/api/auth/')) {
-        localStorage.removeItem('portfoliom_session')
-        // 触发刷新
-        if (!window.location.hash.includes('auth')) {
-          window.location.reload()
+        if (_onUnauthorized && !_unauthScheduled) {
+          _unauthScheduled = true
+          setTimeout(() => {
+            _unauthScheduled = false
+            _onUnauthorized && _onUnauthorized()
+          }, 100)
         }
       }
     }
@@ -105,8 +132,23 @@ export const getTrend = (days = 90, target = 'CNY') => api.get('/trend', { param
 
 // Auth
 export const getAuthStatus = () => api.get('/auth/status').then(r => r.data)
-export const login = (password) => api.post('/auth/login', { password }).then(r => r.data)
+export const login = (username, password) => api.post('/auth/login', { username, password }).then(r => r.data)
+// 兼容旧调用（仅密码 → 旧单密码模式）
+export const loginPasswordOnly = (password) => api.post('/auth/login', { password }).then(r => r.data)
+export const getAuthMe = () => api.get('/auth/me').then(r => r.data.user)
+export const getUsers = () => api.get('/auth/users').then(r => r.data)
 export const logout = () => api.post('/auth/logout').then(r => r.data)
+
+// 关联管理
+export const listRelations = () => api.get('/auth/relations').then(r => r.data)
+export const createRelation = (body) => api.post('/auth/relations', body).then(r => r.data)
+export const confirmRelation = (id) => api.post(`/auth/relations/${id}/confirm`).then(r => r.data)
+export const cancelRelation = (id) => api.post(`/auth/relations/${id}/cancel`).then(r => r.data)
+
+// 数据补足（admin）
+export const getGapReport = (params = {}) => api.get('/data-gap/report', { params }).then(r => r.data)
+export const fixGap = (id) => api.post(`/data-gap/fix/${id}`).then(r => r.data)
+export const setIndexClassification = (body) => api.post('/data-gap/index-classification', body).then(r => r.data)
 
 // ============================================================================
 // Fund Penetration & Industry Aggregation (spec §4)
@@ -136,3 +178,43 @@ export const getFullHoldingTable = (asOfDate) => api.get('/penetration/full-hold
 export const getTop10Holdings = (asOfDate, limit = 10) => api.get('/penetration/top10-holdings', { params: { as_of_date: asOfDate, limit } }).then(r => r.data)
 export const getDimensionDrilled = (dim, asOfDate, market = 'A+H') => api.get('/penetration/dimension-drilled', { params: { dim, as_of_date: asOfDate, market } }).then(r => r.data)
 export const getLatestExchangeRates = () => api.get('/exchange-rates/latest').then(r => r.data)
+
+// ---------- 交易记录驱动的持仓重建 (2026-06-26) ----------
+export const parseTrades = (text) =>
+  api.post('/trades/parse', { text }).then(r => r.data)
+
+export const confirmTrades = (trades) =>
+  api.post('/trades/confirm', { trades }).then(r => r.data)
+
+export const getTrades = (params) =>
+  api.get('/trades', { params }).then(r => r.data)
+
+export const updateTrade = (tradeId, trade) =>
+  api.put(`/trades/${tradeId}`, trade, { timeout: 120000 }).then(r => r.data)
+
+export const deleteTrade = (tradeId) =>
+  api.delete(`/trades/${tradeId}`, { timeout: 120000 }).then(r => r.data)
+
+export const getTradingSession = () =>
+  api.get('/trading-session').then(r => r.data)
+
+export const getSnapshot = (params) =>
+  api.get('/holdings/snapshot', { params }).then(r => r.data)
+
+export const getSnapshotRange = () =>
+  api.get('/holdings/snapshot-range').then(r => r.data)
+
+export const getDailyTrades = (params) =>
+  api.get('/holdings/daily-trades', { params }).then(r => r.data)
+
+// ---------- 管理员价格刷新（2026-06-26）----------
+// 全用户持仓并集 + 增量（TTL），公共数据层模式
+export const adminFillPricesAll = () =>
+  api.post('/admin/fill-prices-all', null, { timeout: 120000 }).then(r => r.data)
+
+// 分析页全持仓收盘价增量刷新（下钻股票 NULL 填充 + 未下钻基金净值补缺）
+export const adminRefreshAnalysisPrices = (asOfDate, days = 5, maxCodes = 200) =>
+  api.post('/admin/refresh-analysis-prices', null, {
+    params: { as_of_date: asOfDate, days, max_codes: maxCodes },
+    timeout: 120000,
+  }).then(r => r.data)

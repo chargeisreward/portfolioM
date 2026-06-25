@@ -38,52 +38,47 @@ def _resolve_stock_name(db: Session, stock_code: str) -> str | None:
     return None
 
 
-def _total_portfolio_amount(db: Session, as_of_date: date) -> float:
-    total = (
-        db.query(func.sum(FullHoldingSnapshot.amount_cny))
-        .filter(FullHoldingSnapshot.as_of_date == as_of_date)
-        .scalar()
+def _total_portfolio_amount(db: Session, as_of_date: date, user_id: int | None = None) -> float:
+    q = db.query(func.sum(FullHoldingSnapshot.amount_cny)).filter(
+        FullHoldingSnapshot.as_of_date == as_of_date,
     )
+    if user_id is not None:
+        q = q.filter(FullHoldingSnapshot.user_id == user_id)
+    total = q.scalar()
     return float(total or 0.0)
 
 
-def _total_drilled_amount(db: Session, as_of_date: date) -> float:
+def _total_drilled_amount(db: Session, as_of_date: date, user_id: int | None = None) -> float:
     """下钻口径总金额：drilled_fund + direct_stock 的 amount_cny 合计。"""
     METRIC_SOURCES = ("drilled_fund", "direct_stock")
-    total = (
-        db.query(func.sum(FullHoldingSnapshot.amount_cny))
-        .filter(
-            FullHoldingSnapshot.as_of_date == as_of_date,
-            FullHoldingSnapshot.source_type.in_(METRIC_SOURCES),
-        )
-        .scalar()
+    q = db.query(func.sum(FullHoldingSnapshot.amount_cny)).filter(
+        FullHoldingSnapshot.as_of_date == as_of_date,
+        FullHoldingSnapshot.source_type.in_(METRIC_SOURCES),
     )
+    if user_id is not None:
+        q = q.filter(FullHoldingSnapshot.user_id == user_id)
+    total = q.scalar()
     return float(total or 0.0)
 
 
-def _get_snapshot_price(db: Session, stock_code: str, as_of_date: date) -> tuple[float | None, date | None]:
-    """优先 A/H 财务快照的 current_price/current_price_date，缺失回退 PriceCache。"""
+def _get_snapshot_price(db: Session, stock_code: str, as_of_date: date, user_id: int | None = None) -> tuple[float | None, date | None]:
+    """优先 A/H 财务快照的 current_price/current_price_date，缺失回退 PriceCache。
+
+    估值是市场公共数据，不按 user_id 过滤（2026-06-25）。user_id 参数保留以兼容旧调用方。
+    """
     for Model in (AShareFinancialSnapshot, HKShareFinancialSnapshot):
-        row = (
-            db.query(Model)
-            .filter(Model.stock_code == stock_code, Model.as_of_date == as_of_date)
-            .first()
-        )
+        q = db.query(Model).filter(Model.stock_code == stock_code, Model.as_of_date == as_of_date)
+        row = q.first()
         if row and row.current_price:
             return row.current_price, row.current_price_date
 
-    # 后缀无关再查一次（如 688041 和 688041.SH）
     code_no_suffix = stock_code.split(".")[0]
     for Model in (AShareFinancialSnapshot, HKShareFinancialSnapshot):
-        row = (
-            db.query(Model)
-            .filter(
-                Model.as_of_date == as_of_date,
-                (Model.stock_code == code_no_suffix) | (Model.stock_code == stock_code),
-            )
-            .order_by(func.coalesce(Model.current_price_date, Model.as_of_date).desc())
-            .first()
+        q = db.query(Model).filter(
+            Model.as_of_date == as_of_date,
+            (Model.stock_code == code_no_suffix) | (Model.stock_code == stock_code),
         )
+        row = q.order_by(func.coalesce(Model.current_price_date, Model.as_of_date).desc()).first()
         if row and row.current_price:
             return row.current_price, row.current_price_date
 
@@ -98,14 +93,12 @@ def _get_snapshot_price(db: Session, stock_code: str, as_of_date: date) -> tuple
     return None, None
 
 
-def _get_snapshot_metrics(db: Session, stock_code: str, as_of_date: date) -> dict[str, float | None]:
+def _get_snapshot_metrics(db: Session, stock_code: str, as_of_date: date, user_id: int | None = None) -> dict[str, float | None]:
+    """估值是市场公共数据，不按 user_id 过滤（2026-06-25）。user_id 参数保留以兼容旧调用方。"""
     pe = pb = ps = None
     for Model in (AShareFinancialSnapshot, HKShareFinancialSnapshot):
-        row = (
-            db.query(Model)
-            .filter(Model.stock_code == stock_code, Model.as_of_date == as_of_date)
-            .first()
-        )
+        q = db.query(Model).filter(Model.stock_code == stock_code, Model.as_of_date == as_of_date)
+        row = q.first()
         if row:
             pe = row.pe_ttm_dynamic if row.pe_ttm_dynamic is not None else row.pe_ttm
             pb = row.pb_mrq_dynamic if row.pb_mrq_dynamic is not None else row.pb_mrq
@@ -192,23 +185,25 @@ def ingest_analyst_data(db: Session, researcher_dir: str | None = None) -> dict[
 # 核心公司列表
 # -----------------------------------------------------------------------------
 
-def get_core_companies(db: Session, as_of_date: date) -> dict[str, Any]:
+def get_core_companies(db: Session, as_of_date: date, user_id: int | None = None) -> dict[str, Any]:
+    """分析师核心公司（按 effective user 隔离 — 2026-06-24）。
+    reports 本身是共享主数据（管理员维护），但 amount/total/snapshot 都需要按 user。
+    user_id=None 时按全部 user 聚合（admin 维护场景）。"""
     reports = db.query(AnalystCompanyReport).order_by(AnalystCompanyReport.stock_code).all()
-    total = _total_portfolio_amount(db, as_of_date)
+    total = _total_portfolio_amount(db, as_of_date, user_id=user_id)
     companies = []
 
     for report in reports:
-        amount = (
-            db.query(func.sum(FullHoldingSnapshot.amount_cny))
-            .filter(
-                FullHoldingSnapshot.as_of_date == as_of_date,
-                FullHoldingSnapshot.stock_code == report.stock_code,
-            )
-            .scalar()
-        ) or 0.0
+        q = db.query(func.sum(FullHoldingSnapshot.amount_cny)).filter(
+            FullHoldingSnapshot.as_of_date == as_of_date,
+            FullHoldingSnapshot.stock_code == report.stock_code,
+        )
+        if user_id is not None:
+            q = q.filter(FullHoldingSnapshot.user_id == user_id)
+        amount = q.scalar() or 0.0
 
-        metrics = _get_snapshot_metrics(db, report.stock_code, as_of_date)
-        latest_close, latest_close_date = _get_snapshot_price(db, report.stock_code, as_of_date)
+        metrics = _get_snapshot_metrics(db, report.stock_code, as_of_date, user_id=user_id)
+        latest_close, latest_close_date = _get_snapshot_price(db, report.stock_code, as_of_date, user_id=user_id)
 
         stock_name = report.stock_name or _resolve_stock_name(db, report.stock_code)
 
@@ -246,41 +241,40 @@ def get_core_companies(db: Session, as_of_date: date) -> dict[str, Any]:
 # 个股详情（来源基金 + 约当数量）
 # -----------------------------------------------------------------------------
 
-def get_stock_detail(db: Session, stock_code: str, as_of_date: date) -> dict[str, Any] | None:
+def get_stock_detail(db: Session, stock_code: str, as_of_date: date, user_id: int | None = None) -> dict[str, Any] | None:
     report = (
         db.query(AnalystCompanyReport)
         .filter(AnalystCompanyReport.stock_code == stock_code)
         .first()
     )
 
-    amount = (
-        db.query(func.sum(FullHoldingSnapshot.amount_cny))
-        .filter(
-            FullHoldingSnapshot.as_of_date == as_of_date,
-            FullHoldingSnapshot.stock_code == stock_code,
-        )
-        .scalar()
-    ) or 0.0
-
-    total = _total_portfolio_amount(db, as_of_date)
-    metrics = _get_snapshot_metrics(db, stock_code, as_of_date)
-    latest_close, latest_close_date = _get_snapshot_price(db, stock_code, as_of_date)
-
-    # 来源基金：用 PenetrationSnapshot 按 holding_code 聚合（动态金额）
-    source_rows = (
-        db.query(
-            PenetrationSnapshot.holding_code,
-            PenetrationSnapshot.holding_name,
-            func.sum(PenetrationSnapshot.amount_cny_dynamic).label("amount_dynamic"),
-            func.max(PenetrationSnapshot.holding_amount_cny).label("holding_amount_cny"),
-        )
-        .filter(
-            PenetrationSnapshot.as_of_date == as_of_date,
-            PenetrationSnapshot.stock_code == stock_code,
-        )
-        .group_by(PenetrationSnapshot.holding_code, PenetrationSnapshot.holding_name)
-        .all()
+    q = db.query(func.sum(FullHoldingSnapshot.amount_cny)).filter(
+        FullHoldingSnapshot.as_of_date == as_of_date,
+        FullHoldingSnapshot.stock_code == stock_code,
     )
+    if user_id is not None:
+        q = q.filter(FullHoldingSnapshot.user_id == user_id)
+    amount = q.scalar() or 0.0
+
+    total = _total_portfolio_amount(db, as_of_date, user_id=user_id)
+    metrics = _get_snapshot_metrics(db, stock_code, as_of_date, user_id=user_id)
+    latest_close, latest_close_date = _get_snapshot_price(db, stock_code, as_of_date, user_id=user_id)
+
+    # 来源基金：用 PenetrationSnapshot 按 holding_code 聚合（按 user）
+    ps_q = db.query(
+        PenetrationSnapshot.holding_code,
+        PenetrationSnapshot.holding_name,
+        func.sum(PenetrationSnapshot.amount_cny_dynamic).label("amount_dynamic"),
+        func.max(PenetrationSnapshot.holding_amount_cny).label("holding_amount_cny"),
+    ).filter(
+        PenetrationSnapshot.as_of_date == as_of_date,
+        PenetrationSnapshot.stock_code == stock_code,
+    )
+    if user_id is not None:
+        ps_q = ps_q.filter(PenetrationSnapshot.user_id == user_id)
+    source_rows = ps_q.group_by(
+        PenetrationSnapshot.holding_code, PenetrationSnapshot.holding_name
+    ).all()
 
     # 预载基金名
     fund_codes = {r.holding_code for r in source_rows if r.holding_code}
@@ -467,19 +461,19 @@ def _chain_position_sort_key(chain_position: str) -> int:
     return 99
 
 
-def get_industry_chains(db: Session, as_of_date: date) -> dict[str, Any]:
-    print(f"[DEBUG] get_industry_chains called for {as_of_date}")
-    total = _total_portfolio_amount(db, as_of_date)
-    drilled_total = _total_drilled_amount(db, as_of_date)
+def get_industry_chains(db: Session, as_of_date: date, user_id: int | None = None) -> dict[str, Any]:
+    """按 effective user 隔离 — 2026-06-24。"""
+    print(f"[DEBUG] get_industry_chains called for {as_of_date} user={user_id}")
+    total = _total_portfolio_amount(db, as_of_date, user_id=user_id)
+    drilled_total = _total_drilled_amount(db, as_of_date, user_id=user_id)
 
-    # 当前 portfolio 中所有持仓股票代码
-    held_codes = {
-        row[0]
-        for row in db.query(FullHoldingSnapshot.stock_code)
-        .filter(FullHoldingSnapshot.as_of_date == as_of_date)
-        .distinct()
-        .all()
-    }
+    # 当前 portfolio 中所有持仓股票代码（按 user）
+    q = db.query(FullHoldingSnapshot.stock_code).filter(
+        FullHoldingSnapshot.as_of_date == as_of_date,
+    )
+    if user_id is not None:
+        q = q.filter(FullHoldingSnapshot.user_id == user_id)
+    held_codes = {row[0] for row in q.distinct().all()}
 
     chains_out = []
     chains = db.query(AnalystIndustryChain).order_by(AnalystIndustryChain.chain_name).all()
@@ -499,14 +493,13 @@ def get_industry_chains(db: Session, as_of_date: date) -> dict[str, Any]:
         for c in companies:
             if not c.stock_code or c.stock_code not in held_codes:
                 continue
-            amount = (
-                db.query(func.sum(FullHoldingSnapshot.amount_cny))
-                .filter(
-                    FullHoldingSnapshot.as_of_date == as_of_date,
-                    FullHoldingSnapshot.stock_code == c.stock_code,
-                )
-                .scalar()
-            ) or 0.0
+            amount_q = db.query(func.sum(FullHoldingSnapshot.amount_cny)).filter(
+                FullHoldingSnapshot.as_of_date == as_of_date,
+                FullHoldingSnapshot.stock_code == c.stock_code,
+            )
+            if user_id is not None:
+                amount_q = amount_q.filter(FullHoldingSnapshot.user_id == user_id)
+            amount = amount_q.scalar() or 0.0
             in_portfolio.append({
                 "company_name": c.company_name,
                 "stock_code": c.stock_code,

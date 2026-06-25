@@ -47,6 +47,15 @@ export default function OverviewPanel() {
   const [bizDate, setBizDate] = useState(null) // for KPI fetch param
   const [expandedKpi, setExpandedKpi] = useState(null)  // 'pe' | 'daily_change' | 'tech_weight' | null
   const [kpiWindow, setKpiWindow] = useState(90)
+  const [drillableCodes, setDrillableCodes] = useState(new Set())  // 可下钻基金代码集合
+
+  // 获取可下钻基金代码列表（SecurityMaster.is_drillable=True）
+  useEffect(() => {
+    rawApi.get('/securities').then(r => {
+      const codes = new Set((r.data || []).filter(s => s.is_drillable).map(s => s.security_code))
+      setDrillableCodes(codes)
+    }).catch(() => {})
+  }, [])
 
   useEffect(() => {
     api.getHoldingsConverted(currency).then(setHoldingsLocal).catch(()=>{})
@@ -119,7 +128,9 @@ export default function OverviewPanel() {
     ]).then(() => {
       setTimeout(() => {
         if (pieRef.current) {
-          const c = echarts.init(pieRef.current)
+          // 复用已有 instance，避免重复 init 警告
+          let c = echarts.getInstanceByDom(pieRef.current)
+          if (!c) c = echarts.init(pieRef.current)
           // 用 displayHoldings 按 asset_type 聚合，标签与「类型」过滤保持一致（CAT_SHORT）
           const buckets = {}
           displayHoldings.forEach(h => {
@@ -140,7 +151,8 @@ export default function OverviewPanel() {
         }
         if (radarRef.current) {
           // 雷达图替换为主题（type2）构成环形图
-          const c = echarts.init(radarRef.current)
+          let c = echarts.getInstanceByDom(radarRef.current)
+          if (!c) c = echarts.init(radarRef.current)
           const buckets = {}
           displayHoldings.forEach(h => {
             const lbl = h.type2 ? (TYPE2_LABELS[h.type2] || h.type2) : '其他'
@@ -277,7 +289,10 @@ export default function OverviewPanel() {
     if (sortKey === key) setSortDir(d => d === 'desc' ? 'asc' : 'desc')
     else { setSortKey(key); setSortDir('desc') }
   }
-  const totalAmtLocal = displayHoldings.reduce((s,h) => s + (h.amount_local || h.amount || 0), 0)
+  // 总资产 = 持仓市值 + 现金。现金来自 HoldingDailySnapshot 最新日 CASH 行（summary.cash_cny，CNY 口径）。
+  // 非 CNY 视图下不叠加（cash_cny 未做汇率换算），保持口径一致避免误差。
+  const cashAmount = (currency === 'CNY' && summary?.cash_cny) ? summary.cash_cny : 0
+  const totalAmtLocal = displayHoldings.reduce((s,h) => s + (h.amount_local || h.amount || 0), 0) + cashAmount
   const filteredTotal = filteredHoldings.reduce((s,h) => s + (h.amount_local || h.amount || 0), 0)
 
   return (
@@ -526,7 +541,18 @@ export default function OverviewPanel() {
                 return (
                 <tr key={h.id || `${h.security_code}#${h.quantity}#${h.amount}`}>
                   <td title={h.security_code} style={{overflow:'hidden',textOverflow:'ellipsis',whiteSpace:'nowrap'}}>{h.security_code}</td>
-                  <td title={h.security_name} style={{overflow:'hidden',textOverflow:'ellipsis',whiteSpace:'nowrap'}}>{h.security_name||'-'}</td>
+                  <td title={h.security_name} style={{overflow:'hidden',textOverflow:'ellipsis',whiteSpace:'nowrap'}}>
+                    {drillableCodes.has(h.security_code) && (
+                      <span style={{
+                        display:'inline-block', width:'16px', height:'16px', lineHeight:'16px',
+                        textAlign:'center', fontSize:9, fontWeight:700, fontFamily:'"GeistMono",monospace',
+                        color:'#ffd700', background:'rgba(255,215,0,0.12)',
+                        border:'1px solid rgba(255,215,0,0.4)', borderRadius:2,
+                        marginRight:5, verticalAlign:'middle', flexShrink:0,
+                      }} title="可下钻基金">钻</span>
+                    )}
+                    {h.security_name||'-'}
+                  </td>
                   <td style={{textAlign:'center',color:'var(--text-secondary)',fontSize:11}}>{CAT_SHORT[h.asset_type]||h.asset_type||''}</td>
                   <td style={{textAlign:'right',fontFamily:'"GeistMono",monospace',color:'var(--text-secondary)'}}>{fmtPct(ratio)}</td>
                   <td style={{textAlign:'right',fontFamily:'"GeistMono",monospace'}}>{fmtQty(h.quantity)}</td>

@@ -42,6 +42,8 @@ def init_db():
     """Create all tables + lightweight column migrations for SQLite"""
     import models  # noqa: F401 — ensure models are registered
     Base.metadata.create_all(bind=engine)
+    # === 启动时自动 seed admin (若无 users) ===
+    _ensure_seed_admin()
 
     # Lightweight ALTER for new columns on existing tables
     _MIGRATIONS = [
@@ -74,6 +76,25 @@ def init_db():
         ("csi300_constituent_snapshot", "se_l4", "VARCHAR(60)"),
         # Index constituent weight (added 2026-06 via pull_index_weights.py)
         ("index_constituent_snapshot", "weight", "FLOAT"),
+        # === Multi-user: user_id columns (auth-upgrade M1) ===
+        ("holdings", "user_id", "BIGINT NOT NULL DEFAULT 1"),
+        ("watchlist", "user_id", "BIGINT NOT NULL DEFAULT 1"),
+        ("access_sessions", "user_id", "BIGINT"),
+        ("penetration_snapshot", "user_id", "BIGINT NOT NULL DEFAULT 2"),
+        ("csi300_constituent_snapshot", "user_id", "BIGINT NOT NULL DEFAULT 2"),
+        # === 2026-06-25 FundDrillSnapshot 估值字段补全 ===
+        ("fund_drill_snapshot", "pe_ttm", "FLOAT"),
+        ("fund_drill_snapshot", "pb_mrq", "FLOAT"),
+        ("fund_drill_snapshot", "ps_ttm", "FLOAT"),
+        ("fund_drill_snapshot", "dividend_yield", "FLOAT"),
+        # === 2026-06-25 FundDrillSnapshot 动态估值字段（来自 A/H 估值表的 *_dynamic 字段）===
+        ("fund_drill_snapshot", "pe_ttm_dynamic", "FLOAT"),
+        ("fund_drill_snapshot", "pb_mrq_dynamic", "FLOAT"),
+        ("fund_drill_snapshot", "ps_ttm_dynamic", "FLOAT"),
+        # === 2026-06-25 FundDrillSnapshot 双币种：baseline_price_cny（本币基准价，公共层算好）===
+        ("fund_drill_snapshot", "baseline_price_cny", "FLOAT"),
+        # === 2026-06-26 HoldingDailySnapshot holding_uid：区分同代码不同批次 ===
+        ("holding_daily_snapshot", "holding_uid", "INTEGER"),
     ]
     from sqlalchemy import inspect
     insp = inspect(engine)
@@ -89,3 +110,102 @@ def init_db():
                     conn.execute(text(f'ALTER TABLE {table} ADD COLUMN {col} {coltype}'))
                 except Exception:
                     pass
+
+        # === Watchlist PK 改复合 (user_id, code) ===
+        try:
+            pk_info = insp.get_pk_constraint("watchlist")
+            pk_cols = pk_info.get("constrained_columns", []) if pk_info else []
+            if pk_cols == ["code"]:
+                if "sqlite" in DATABASE_URL:
+                    # SQLite 不能 DROP/ADD PK — 重建表
+                    conn.execute(text("""
+                        CREATE TABLE watchlist_new (
+                            user_id BIGINT NOT NULL DEFAULT 1,
+                            code VARCHAR(20) NOT NULL,
+                            name VARCHAR(100),
+                            market VARCHAR(10),
+                            industry VARCHAR(50),
+                            weight FLOAT,
+                            added_at DATETIME,
+                            PRIMARY KEY (user_id, code)
+                        )
+                    """))
+                    conn.execute(text("""
+                        INSERT OR IGNORE INTO watchlist_new
+                            (user_id, code, name, market, industry, weight, added_at)
+                        SELECT user_id, code, name, market, industry, weight, added_at
+                        FROM watchlist
+                    """))
+                    conn.execute(text("DROP TABLE watchlist"))
+                    conn.execute(text("ALTER TABLE watchlist_new RENAME TO watchlist"))
+                else:
+                    # PG: 直接 DROP/ADD PK
+                    conn.execute(text("ALTER TABLE watchlist DROP CONSTRAINT IF EXISTS watchlist_pkey"))
+                    conn.execute(text("ALTER TABLE watchlist ADD PRIMARY KEY (user_id, code)"))
+        except Exception as e:
+            print(f"[init_db] watchlist PK migration: {e}")
+
+        # === 索引 ===
+        for ix_table, ix_col in [("holdings", "user_id"), ("watchlist", "user_id"),
+                                  ("access_sessions", "user_id"),
+                                  # 2026-06-26 交易记录驱动的持仓重建
+                                  ("transaction_record", "user_id"),
+                                  ("transaction_record", "trade_date"),
+                                  ("holding_daily_snapshot", "user_id"),
+                                  ("holding_daily_snapshot", "as_of_date"),
+                                  ("trading_session", "user_id")]:
+            try:
+                ix_name = f"ix_{ix_table}_{ix_col}"
+                conn.execute(text(f"CREATE INDEX IF NOT EXISTS {ix_name} ON {ix_table} ({ix_col})"))
+            except Exception:
+                pass
+
+        # === 2026-06-26 holding_daily_snapshot 唯一约束变更（加入 holding_uid）===
+        # 同代码不同批次（不同 Holding.id）需可共存，NULL=交易新建/CASH 不受约束
+        try:
+            ucs = insp.get_unique_constraints("holding_daily_snapshot") or []
+            need_update = True
+            for uc in ucs:
+                if uc.get("name") == "ux_holding_daily_user_date_code":
+                    if "holding_uid" in (uc.get("column_names") or []):
+                        need_update = False
+                    break
+            if need_update:
+                conn.execute(text(
+                    "ALTER TABLE holding_daily_snapshot "
+                    "DROP CONSTRAINT IF EXISTS ux_holding_daily_user_date_code"
+                ))
+                conn.execute(text(
+                    "ALTER TABLE holding_daily_snapshot "
+                    "ADD CONSTRAINT ux_holding_daily_user_date_code "
+                    "UNIQUE (user_id, as_of_date, security_code, holding_uid)"
+                ))
+                print("[init_db] holding_daily_snapshot UC 已更新（含 holding_uid）")
+        except Exception as e:
+            print(f"[init_db] holding_daily_snapshot UC migration: {e}")
+
+
+def _ensure_seed_admin():
+    """启动时若无 users 表行，自动 seed 一个 admin 账户。"""
+    try:
+        import bcrypt
+        from sqlalchemy.orm import Session
+        from sqlalchemy import text
+        from config import SEED_ADMIN_USERNAME, SEED_ADMIN_PASSWORD
+        from models import User
+        # 用 globals()['engine'] 而非模块顶部 import-time 的 engine（支持测试 monkeypatch）
+        eng = globals()["engine"]
+        with Session(eng) as db:
+            if db.query(User).count() > 0:
+                return
+            pw_hash = bcrypt.hashpw(SEED_ADMIN_PASSWORD.encode(),
+                                    bcrypt.gensalt(rounds=10)).decode()
+            admin = User(
+                username=SEED_ADMIN_USERNAME, password_hash=pw_hash,
+                is_admin=True, is_advisor=False,
+                display_name="系统管理员", is_active=True
+            )
+            db.add(admin); db.commit()
+            print(f"[SEED] 已创建 admin 用户 (id={admin.id}): {SEED_ADMIN_USERNAME}")
+    except Exception as e:
+        print(f"[SEED] 自动 seed admin 失败（不影响启动）: {e}")

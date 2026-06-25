@@ -238,23 +238,47 @@ def _fetch_yfinance_kline(ticker: str, days: int = 365) -> list[dict]:
         return []
 
 
+def _infer_market_from_ticker(ticker: str) -> str:
+    """根据 yfinance ticker 后缀推断市场代码。"""
+    if "." not in ticker:
+        return "US"
+    suffix = ticker.rsplit(".", 1)[-1].upper()
+    market_map = {
+        "KS": "KR", "KQ": "KR",
+        "T": "JP",
+        "L": "GB",
+        "DE": "DE",
+        "PA": "FR",
+        "AS": "NL",
+        "MI": "IT",
+        "SW": "CH",
+        "AX": "AU",
+        "TO": "CA",
+    }
+    return market_map.get(suffix, suffix)
+
+
 def fetch_yfinance_info(ticker: str) -> dict | None:
-    """yfinance 财务信息补充"""
+    """yfinance 财务信息补充（增强版：含 PB/PS + market 推断）"""
     try:
         stock = yf.Ticker(ticker)
         info = stock.info
         return {
             "code": ticker,
             "name": info.get("shortName", ""),
+            "market": _infer_market_from_ticker(ticker),
             "pe_ttm": info.get("trailingPE"),
+            "pb_mrq": info.get("priceToBook"),
+            "ps_ttm": info.get("priceToSalesTrailing12Months"),
             "market_cap_b": info.get("marketCap", 0) / 1e8,  # 亿
             "revenue_b": info.get("totalRevenue", 0) / 1e8,
             "net_income_b": info.get("netIncomeToCommon", 0) / 1e8,
             "profit_growth": info.get("earningsGrowth"),
             "revenue_growth": info.get("revenueGrowth"),
             "dividend_yield": info.get("dividendYield"),
-            "industry": info.get("industry"),
+            "eps_fy1": info.get("forwardEPS"),
             "sector": info.get("sector"),
+            "industry": info.get("industry"),
             "source": "yfinance",
         }
     except Exception:

@@ -1,6 +1,6 @@
 # PortfolioM 项目状态与任务清单
 
-**更新日期：** 2026-06-18  
+**更新日期：** 2026-06-25  
 **当前分支：** main（存在大量未提交实现）  
 **最近提交：** `0838ea8 spec: fund penetration + industry aggregation design`
 
@@ -139,18 +139,30 @@
    - 为 `penetration_v2`、`aggregation`、`data_version` 增加单元测试
    - 至少覆盖：权重不变重算公式、虚拟盈利 PE 公式、跨市场代码匹配
 
+8. **双币种规则推广到其他单价出现处**（2026-06-25 确立规则，下钻已修复，其他待改）
+   - 规则：所有单价同时存「原币」+「本币(CNY)」，本币在公共数据层算好存表，下游取公共数据不临时算
+   - 待改点 1：`backend/services/drillable_funds.py`（旧模块，deprecated）— full-holding-table 端点已迁移到三层 service，此模块不再被该端点使用，仅作为旧逻辑留存
+   - ✅ 已完成 — 待改点 2：`backend/main.py` 的 `/api/penetration/full-holding-table` 端点（2026-06-25 迁移到 `drill_orchestration_service.get_all_drill_constituents`）
+   - ✅ 已完成 — 待改点 3：`frontend/src/components/FullHoldingTable.jsx`（2026-06-25 drilled 段去掉 `toCNY` 双重折算，优先用后端本币字段 + 动态估值字段）
+   - ✅ 已完成 — 4 口径估值卡片算法统一（2026-06-25 `/api/penetration/full-holding-summary` 迁移到 `compute_scope_metrics`，与下钻卡片算法完全一致；详见 `Project_development.md`「2026-06-25 全持仓下钻迁移到三层架构 + 4 口径指标统一算法」章节）
+   - 待改点 4：`ExchangeRate` 表 HKD→CNY 恒定 0.92（2026-06-21~25 全同），真实汇率应每日波动 — 量纲正确但精度不足，需接入真实每日汇率源
+   - 待改点 5：`PriceCache` 表无 `currency` 字段 — 币种完全靠 `_guess_currency` 后缀推断，目前与腾讯数据源一致（实证 .HK 返回 HKD），但若换数据源会静默出错；建议加 `currency` 列在拉取时标记
+   - 待改点 6：`_guess_currency`（drill_snapshot.py line 187）按后缀推断币种缺防御性 — 应改为优先取 `SecurityMaster.currency` / `PriceCache.currency`，后缀推断仅作 fallback
+   - 参考：`Project_development.md` 「2026-06-25 港股通下钻汇率量纲修正 + 双币种规则」 + 「2026-06-25 全持仓下钻迁移到三层架构 + 4 口径指标统一算法」章节
+   - 验证脚本：`backend/scripts/verify_hk_drill_fx.py`（偏差）、`backend/scripts/verify_hk_currency.py`（币种实证）、`backend/scripts/verify_full_holding_migration.py`（全持仓迁移验证）
+
 ### 低优先级 / 后续迭代
 
-8. **部署与数据同步**
+9. **部署与数据同步**
    - 本地 SQLite → Zeabur Postgres 的同步脚本验证
    - `portfolio.db` 大文件不应提交到 git
    - 生产环境 `ADMIN_TOKEN`、`APP_PASSWORD` 配置
 
-9. **性能优化**
-   - `/api/trend` 当前已优化到 ~0.3s，可继续观察 180/360 天窗口表现
-   - `pull_history_prices.py` 可考虑并发请求加速
+10. **性能优化**
+    - `/api/trend` 当前已优化到 ~0.3s，可继续观察 180/360 天窗口表现
+    - `pull_history_prices.py` 可考虑并发请求加速
 
-10. **文档补充**
+11. **文档补充**
     - 补充前端组件使用说明
     - 补充部署操作手册
     - 补充数据导入失败排查指南

@@ -42,10 +42,12 @@ export default function WatchPanel() {
     return () => clearTimeout(timer)
   }, [q])
 
-  // 饼图
+  // 饼图（复用已有 instance，避免重复 init 警告）
   useEffect(() => {
+    const charts = []
     if (indRef.current) {
-      const c = echarts.init(indRef.current)
+      let c = echarts.getInstanceByDom(indRef.current)
+      if (!c) { c = echarts.init(indRef.current); charts.push(c) }
       const byInd = {}
       list.forEach(w => { byInd[w.industry || '未分类'] = (byInd[w.industry || '未分类'] || 0) + w.weight })
       c.setOption({
@@ -58,7 +60,8 @@ export default function WatchPanel() {
       })
     }
     if (regRef.current) {
-      const c = echarts.init(regRef.current)
+      let c = echarts.getInstanceByDom(regRef.current)
+      if (!c) { c = echarts.init(regRef.current); charts.push(c) }
       const byReg = {}
       list.forEach(w => { byReg[w.market || '其他'] = (byReg[w.market || '其他'] || 0) + w.weight })
       c.setOption({
@@ -70,6 +73,8 @@ export default function WatchPanel() {
         }],
       })
     }
+    // unmount 时 dispose 新创建的实例
+    return () => { charts.forEach(c => { try { c.dispose() } catch {} }) }
   }, [list])
 
   const add = async (r) => {

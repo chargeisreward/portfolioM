@@ -3,23 +3,37 @@ import hashlib
 import os
 import re as _re
 import secrets
+import time
 from datetime import date, datetime, timedelta
 from pathlib import Path
-from fastapi import FastAPI, Depends, Query, Request, HTTPException
+from typing import List
+from fastapi import FastAPI, Depends, Query, Request, HTTPException, Body, UploadFile, File, Form, Response
 from fastapi.middleware.cors import CORSMiddleware
+from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel
 from sqlalchemy import func
 from sqlalchemy.orm import Session
 
 from database import get_db, init_db
+from models import FundIndexMap, Holding, AssetType, OverseasShareFinancialSnapshot
 from schemas import (
     HoldingOut, HoldingSummary, PenetrationRow, PenetrationSummary,
     IndustryChainAnalysis, GrowthAnalysis, ValuationMetrics,
     PriceSeries, PricePoint, ImportRequest, CrawlResponse,
     SecurityMasterOut, SecurityMasterUpsert,
     SecurityTypeConfigOut, SecurityTypeConfigUpsert,
+    TradeParseRequest, TradeParseResponse, ParsedTradeItem,
+    TradeConfirmRequest, TradeConfirmResponse, TradeUpdateRequest,
+    TradeOut, HoldingSnapshotOut, TradingSessionOut, SnapshotRangeOut,
 )
 from services.importer import import_excel, get_holdings_summary
+from services.trading_rebuild_service import (
+    ensure_initial_snapshot, rebuild_holdings_to_date,
+    get_snapshot_for_date, get_snapshot_date_range, get_trades_for_date,
+)
+from services.llm_service import parse_trades_with_llm
+from services.security_onboarding_service import onboard_new_security
+from middleware.auth import require_user, require_advisor, require_admin
 from services.penetration import PenetrationEngine
 from services.growth_bucketer import GrowthBucketer, IndustryChainAnalyzer
 from services.csi300 import Csi300Analyzer
@@ -34,6 +48,11 @@ from crawlers.index_constituents import crawl_constituents
 from crawlers.price_data import get_stock_info, fetch_price_history
 
 app = FastAPI(title="PortfolioM", version="0.1.0")
+
+# 静态文件服务：uploads 目录
+UPLOAD_DIR = os.path.join(os.path.dirname(__file__), "uploads")
+os.makedirs(UPLOAD_DIR, exist_ok=True)
+app.mount("/uploads", StaticFiles(directory=UPLOAD_DIR), name="uploads")
 
 # ---- CORS: 显式白名单 (避免通配符在某些浏览器/代理场景下被拒) ----
 # 生产前端固定在 portfoliom.zeabur.app; 加上 localhost 让 vite dev/preview 可直连
@@ -62,11 +81,11 @@ def _is_allowed_origin(origin: str | None) -> bool:
 
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=_ALLOWED_ORIGINS,   # 显式列表, 不再 "*"
+    allow_origins=_ALLOWED_ORIGINS,   # 显式列表（allow_credentials=True 时不能用 "*"）
     allow_origin_regex=r"^https://[a-z0-9-]+\.zeabur\.app$",
     allow_methods=["GET", "POST", "PUT", "DELETE", "OPTIONS", "PATCH"],
     allow_headers=["*"],
-    allow_credentials=False,           # 前端 axios 不发 cookie, 显式 False 避免 wildcard 冲突
+    allow_credentials=True,            # 生产环境：cookie 认证需要 credentials=True
     max_age=600,
 )
 
@@ -159,13 +178,14 @@ def _record_success(db: Session, ip: str):
         db.commit()
 
 
-def _create_session(db: Session, ip: str) -> str:
-    """创建新 session，返回 token。默认 24h 过期"""
+def _create_session(db: Session, ip: str, user_id: int | None = None) -> str:
+    """创建新 session，返回 token。默认 24h 过期。user_id 可选（多用户场景）"""
     from models import AccessSession
     token = secrets.token_hex(32)
     sess = AccessSession(
         token=token,
         ip=ip,
+        user_id=user_id,
         created_at=datetime.utcnow(),
         expires_at=datetime.utcnow() + timedelta(days=1),
     )
@@ -174,19 +194,41 @@ def _create_session(db: Session, ip: str) -> str:
     return token
 
 
-def _verify_token(db: Session, token: str) -> bool:
-    """验证 session token 是否有效"""
+def _verify_token(db: Session, token: str):
+    """验证 session token 是否有效。返回 AccessSession 或 None。"""
     from models import AccessSession
     if not token:
-        return False
+        return None
     sess = db.query(AccessSession).filter(AccessSession.token == token).first()
     if not sess:
-        return False
+        return None
     if sess.expires_at < datetime.utcnow():
         db.delete(sess)
         db.commit()
-        return False
-    return True
+        return None
+    return sess
+
+
+def _extract_token(request: Request) -> str | None:
+    """统一从 cookie / header / query 读取 session token。
+    优先级：x-session-token header（显式传递，兼容旧前端 + 内部脚本）
+          > cookie（HttpOnly，生产环境主路径）
+          > query session（极端兼容，如 SSE/EventSource 不能带 header）。
+    设计理由：header 是显式传递的，应优先；生产环境前端不再设 header，cookie 自动生效。
+    """
+    # 1. header（显式传递，优先）
+    header_token = request.headers.get("x-session-token")
+    if header_token:
+        return header_token
+    # 2. cookie（生产环境主路径）
+    cookie_token = request.cookies.get("session_token")
+    if cookie_token:
+        return cookie_token
+    # 3. query（极端兼容，如 SSE/EventSource 不能带 header）
+    query_token = request.query_params.get("session")
+    if query_token:
+        return query_token
+    return None
 
 
 def require_auth(request: Request, db: Session = Depends(get_db)):
@@ -199,13 +241,25 @@ def require_auth(request: Request, db: Session = Depends(get_db)):
         return True
     # 跳过 admin 端点（用于本地同步脚本）— 需额外 token
     # 跳过 static 资源
-    token = request.headers.get("x-session-token") or request.query_params.get("session")
+    token = _extract_token(request)
     if not _verify_token(db, token):
         raise HTTPException(status_code=401, detail="需要登录")
 
 
 class LoginRequest(BaseModel):
     password: str
+    username: str | None = None  # 多用户登录；缺省走单密码兼容模式
+
+
+def _user_public(u) -> dict:
+    """统一序列化 user 字段到 API 响应"""
+    return {
+        "id": u.id,
+        "username": u.username,
+        "display_name": u.display_name,
+        "is_advisor": bool(u.is_advisor),
+        "is_admin": bool(u.is_admin),
+    }
 
 
 @app.get("/api/auth/status")
@@ -224,8 +278,11 @@ def auth_status(request: Request, db: Session = Depends(get_db)):
 
 
 @app.post("/api/auth/login")
-def auth_login(req: LoginRequest, request: Request, db: Session = Depends(get_db)):
-    """提交密码。正确→发 token；错→按 IP 限流规则封禁"""
+def auth_login(req: LoginRequest, request: Request, response: Response, db: Session = Depends(get_db)):
+    """多用户登录：username + password (bcrypt)。
+    兼容：username 缺省 + 走单密码模式 (APP_PASSWORD) → 找任意 admin 用户。
+    成功后通过 HttpOnly cookie 下发 session_token（生产环境安全要求）。
+    """
     ip = _client_ip(request)
     # 先检查是否被锁
     banned_until, remaining = _check_ban(db, ip)
@@ -235,15 +292,45 @@ def auth_login(req: LoginRequest, request: Request, db: Session = Depends(get_db
             "banned_until": banned_until.isoformat(),
             "remaining_seconds": remaining,
         }
-    # 密码长度校验
-    if not (6 <= len(req.password) <= 12):
-        return {"status": "error", "message": "密码长度需 6-12 位"}
-    # 校验密码
-    if _hash_pw(req.password) != APP_PASSWORD_HASH:
+    # 长度校验（兼容旧 6-12）
+    if not (6 <= len(req.password) <= 128):
+        return {"status": "error", "message": "密码长度需 6-128 位"}
+
+    user = None
+    if req.username:
+        # === 多用户模式：按 username 查表 + bcrypt 校验 ===
+        from models import User
+        import bcrypt as _bcrypt
+        try:
+            u = db.query(User).filter(
+                User.username == req.username, User.is_active == True
+            ).first()
+        except Exception:
+            u = None
+        if u:
+            try:
+                if _bcrypt.checkpw(req.password.encode("utf-8"), u.password_hash.encode("utf-8")):
+                    user = u
+            except Exception:
+                user = None
+    else:
+        # === 兼容：旧单密码模式 → APP_PASSWORD 走 SHA-256 旧 hash ===
+        if _hash_pw(req.password) == APP_PASSWORD_HASH:
+            from models import User
+            user = db.query(User).filter(User.is_admin == True, User.is_active == True).first()
+        if user is None and APP_PASSWORD and req.password == APP_PASSWORD:
+            # 旧库可能没 admin 用户（理论上 _ensure_seed_admin 已建）— 找不到就失败
+            from models import User
+            user = db.query(User).filter(User.is_admin == True, User.is_active == True).first()
+            if not user:
+                _record_fail(db, ip)
+                raise HTTPException(status_code=401, detail="单密码登录要求至少存在 admin 用户")
+
+    if user is None:
         rec, ban_for = _record_fail(db, ip)
         result = {
             "status": "error",
-            "message": "密码错误",
+            "message": "用户名或密码错误",
             "attempts_1y": rec.fails_1y,
         }
         if ban_for:
@@ -252,25 +339,290 @@ def auth_login(req: LoginRequest, request: Request, db: Session = Depends(get_db
             result["remaining_seconds"] = int(ban_for.total_seconds())
             result["message"] = f"输错 {rec.fails_1y} 次，已封禁 {int(ban_for.total_seconds()//3600)} 小时"
         return result
+
     # 成功
     _record_success(db, ip)
-    token = _create_session(db, ip)
+    token = _create_session(db, ip, user_id=user.id)
+    user.last_login_at = datetime.utcnow()
+    db.commit()
+    # 通过 HttpOnly cookie 下发 token（JS 不可读，防 XSS 窃取）
+    # Secure 在本地 http 测试环境会阻止 cookie 发送，生产环境通过 nginx 代理是 https 时自动启用
+    # 这里通过环境变量控制，本地 dev 默认不启用 Secure
+    cookie_secure = os.environ.get("COOKIE_SECURE", "").lower() in ("1", "true", "yes")
+    response.set_cookie(
+        key="session_token",
+        value=token,
+        max_age=86400,
+        httponly=True,
+        secure=cookie_secure,
+        samesite="lax",
+        path="/",
+    )
     return {
         "status": "ok",
         "token": token,
         "expires_in": 86400,
+        "user": _user_public(user),
     }
 
 
 @app.post("/api/auth/logout")
-def auth_logout(request: Request, db: Session = Depends(get_db)):
-    """登出（删除当前 session）"""
+def auth_logout(request: Request, response: Response, db: Session = Depends(get_db)):
+    """登出（删除当前 session + 清除 cookie）"""
     from models import AccessSession
-    token = request.headers.get("x-session-token") or request.query_params.get("session")
+    token = _extract_token(request)
     if token:
         db.query(AccessSession).filter(AccessSession.token == token).delete()
         db.commit()
+    # 清除 cookie
+    response.delete_cookie(key="session_token", path="/")
     return {"status": "ok"}
+
+
+@app.get("/api/auth/me")
+def auth_me(request: Request, db: Session = Depends(get_db)):
+    """返回当前登录用户信息（middleware 已注入 request.state.user）"""
+    u = getattr(request.state, "user", None)
+    if not u:
+        raise HTTPException(status_code=401, detail="未登录")
+    return {"user": _user_public(u)}
+
+
+@app.get("/api/auth/users")
+def list_users(request: Request, db: Session = Depends(get_db),
+               user: User = Depends(require_advisor)):
+    """返回所有 active 用户（advisor/admin 用 — 用于 view_as 下拉）"""
+    from models import User as U
+    users = db.query(U).filter(U.is_active == True).order_by(U.id).all()
+    return {"users": [_user_public(u) for u in users]}
+
+
+# ==================== 数据补足（admin） ====================
+
+@app.get("/api/data-gap/report")
+def data_gap_report(
+    gap_type: str | None = None,
+    status: str = "OPEN",
+    user: User = Depends(require_admin),
+    db: Session = Depends(get_db),
+):
+    """列出数据缺口（按 gap_type / status 过滤）"""
+    from models import DataGapReport
+    q = db.query(DataGapReport)
+    if gap_type:
+        q = q.filter(DataGapReport.gap_type == gap_type)
+    if status:
+        q = q.filter(DataGapReport.status == status)
+    items = q.order_by(DataGapReport.detected_at.desc()).limit(500).all()
+    return {
+        "items": [{
+            "id": g.id,
+            "user_id": g.user_id,
+            "gap_type": g.gap_type,
+            "stock_code": g.stock_code,
+            "index_code": g.index_code,
+            "as_of_date": g.as_of_date.isoformat() if g.as_of_date else None,
+            "description": g.description,
+            "status": g.status,
+            "detected_at": g.detected_at.isoformat() if g.detected_at else None,
+        } for g in items],
+        "counts": {
+            "OPEN": db.query(DataGapReport).filter(DataGapReport.status == "OPEN").count(),
+            "FIXED": db.query(DataGapReport).filter(DataGapReport.status == "FIXED").count(),
+        }
+    }
+
+
+@app.post("/api/data-gap/fix/{gap_id}")
+def fix_data_gap(
+    gap_id: int,
+    user: User = Depends(require_admin),
+    db: Session = Depends(get_db),
+):
+    """标记某个缺口为 FIXED。index_constituent 类型尝试触发抓取。"""
+    from models import DataGapReport
+    g = db.query(DataGapReport).filter(DataGapReport.id == gap_id).first()
+    if not g:
+        raise HTTPException(404, "缺口记录不存在")
+    if g.gap_type == "index_constituent" and g.index_code and g.as_of_date:
+        try:
+            from crawlers.index_constituents import crawl_constituents
+            crawl_constituents(g.index_code, db, as_of_date=g.as_of_date)
+        except Exception as e:
+            import logging
+            logging.getLogger(__name__).warning("crawl_constituents failed for %s: %s", g.index_code, e)
+    g.status = "FIXED"
+    g.resolved_at = datetime.utcnow()
+    db.commit()
+    return {"status": "fixed", "id": g.id}
+
+
+@app.post("/api/data-gap/index-classification")
+def set_index_classification(
+    body: dict,
+    user: User = Depends(require_admin),
+    db: Session = Depends(get_db),
+):
+    """设置指数分类。body: {index_code, index_name?, category, theme?, benchmark_formula?}"""
+    from models import IndexClassification
+    code = body.get("index_code")
+    if not code:
+        raise HTTPException(400, "index_code 必填")
+    cls = db.query(IndexClassification).filter(IndexClassification.index_code == code).first()
+    if not cls:
+        cls = IndexClassification(index_code=code)
+        db.add(cls)
+    if body.get("index_name"):
+        cls.index_name = body["index_name"]
+    if body.get("category"):
+        cls.category = body["category"]
+    if body.get("theme"):
+        cls.theme = body["theme"]
+    if body.get("benchmark_formula"):
+        cls.benchmark_formula = body["benchmark_formula"]
+    db.commit()
+    return {"status": "ok"}
+
+
+# ==================== 顾问-客户关联 ====================
+
+class RelationCreateIn(BaseModel):
+    advisor_username: str | None = None
+    client_username: str | None = None
+
+
+def _relation_to_dict(rel, current_user_id: int, other_username: str, other_display_name: str | None) -> dict:
+    """序列化为 API 响应。other_user 字段总是非当前用户那一方。"""
+    is_as_advisor = (rel.advisor_user_id == current_user_id)
+    other_user_id = rel.client_user_id if is_as_advisor else rel.advisor_user_id
+    return {
+        "id": rel.id,
+        "advisor_user_id": rel.advisor_user_id,
+        "client_user_id": rel.client_user_id,
+        "other_user_id": other_user_id,
+        "other_username": other_username,
+        "other_display_name": other_display_name,
+        "status": rel.status,
+        "initiator_user_id": rel.initiator_user_id,
+        "created_at": rel.created_at.isoformat() if rel.created_at else None,
+    }
+
+
+@app.get("/api/auth/relations")
+def list_relations(request: Request, db: Session = Depends(get_db),
+                   user: User = Depends(require_user)):
+    """返回当前 user 的所有关联（作为顾问 + 作为客户）"""
+    from models import UserRelation, User as U
+    # 作为顾问（advisor_user_id = me）
+    as_adv = db.query(UserRelation, U).join(
+        U, U.id == UserRelation.client_user_id
+    ).filter(UserRelation.advisor_user_id == user.id).all()
+    # 作为客户（client_user_id = me）
+    as_cli = db.query(UserRelation, U).join(
+        U, U.id == UserRelation.advisor_user_id
+    ).filter(UserRelation.client_user_id == user.id).all()
+
+    out = {"as_advisor": [], "as_client": []}
+    for rel, other in as_adv:
+        out["as_advisor"].append(
+            _relation_to_dict(rel, user.id, other.username, other.display_name)
+        )
+    for rel, other in as_cli:
+        out["as_client"].append(
+            _relation_to_dict(rel, user.id, other.username, other.display_name)
+        )
+    return out
+
+
+@app.post("/api/auth/relations")
+def create_relation(body: RelationCreateIn, request: Request, db: Session = Depends(get_db),
+                    user: User = Depends(require_user)):
+    """发起关联 — 双向预占（PENDING），需对方 confirm → ACTIVE。
+
+    - 用户发起：body.advisor_username = "顾问用户名"
+    - 顾问/管理员发起：body.client_username = "客户用户名"
+    """
+    from models import UserRelation, User as U
+    if body.advisor_username:
+        advisor = db.query(U).filter(
+            U.username == body.advisor_username, U.is_advisor == True, U.is_active == True
+        ).first()
+        if not advisor:
+            raise HTTPException(404, "顾问不存在")
+        advisor_id, client_id = advisor.id, user.id
+    elif body.client_username:
+        client = db.query(U).filter(
+            U.username == body.client_username, U.is_active == True
+        ).first()
+        if not client:
+            raise HTTPException(404, "用户不存在")
+        advisor_id, client_id = user.id, client.id
+        if not (user.is_advisor or user.is_admin):
+            raise HTTPException(403, "只有顾问或管理员能邀请客户")
+    else:
+        raise HTTPException(400, "请提供 advisor_username 或 client_username")
+
+    if advisor_id == client_id:
+        raise HTTPException(400, "不能与自己建立关联")
+
+    existing = db.query(UserRelation).filter(
+        UserRelation.advisor_user_id == advisor_id,
+        UserRelation.client_user_id == client_id,
+    ).first()
+    if existing and existing.status in ("PENDING", "ACTIVE"):
+        return {"status": "exists", "relation_id": existing.id, "current_status": existing.status}
+    if existing and existing.status == "CANCELLED":
+        # 重置
+        existing.status = "PENDING"
+        existing.initiator_user_id = user.id
+        existing.updated_at = datetime.utcnow()
+        db.commit()
+        return {"status": "recreated", "relation_id": existing.id}
+
+    rel = UserRelation(
+        advisor_user_id=advisor_id, client_user_id=client_id,
+        status="PENDING", initiator_user_id=user.id,
+    )
+    db.add(rel); db.commit(); db.refresh(rel)
+    return {"status": "created", "relation_id": rel.id}
+
+
+@app.post("/api/auth/relations/{rel_id}/confirm")
+def confirm_relation(rel_id: int, request: Request, db: Session = Depends(get_db),
+                     user: User = Depends(require_user)):
+    """对方确认 → ACTIVE"""
+    from models import UserRelation
+    rel = db.query(UserRelation).filter(UserRelation.id == rel_id).first()
+    if not rel:
+        raise HTTPException(404, "关联不存在")
+    if user.id not in (rel.advisor_user_id, rel.client_user_id):
+        raise HTTPException(403, "无权操作")
+    if rel.initiator_user_id == user.id:
+        raise HTTPException(400, "不能确认自己发起的关联")
+    if rel.status == "ACTIVE":
+        return {"status": "already_active"}
+    if rel.status == "CANCELLED":
+        raise HTTPException(400, "已取消的关联无法确认")
+    rel.status = "ACTIVE"
+    rel.updated_at = datetime.utcnow()
+    db.commit()
+    return {"status": "active"}
+
+
+@app.post("/api/auth/relations/{rel_id}/cancel")
+def cancel_relation(rel_id: int, request: Request, db: Session = Depends(get_db),
+                    user: User = Depends(require_user)):
+    """任一方取消 → CANCELLED"""
+    from models import UserRelation
+    rel = db.query(UserRelation).filter(UserRelation.id == rel_id).first()
+    if not rel:
+        raise HTTPException(404, "关联不存在")
+    if user.id not in (rel.advisor_user_id, rel.client_user_id) and not user.is_admin:
+        raise HTTPException(403, "无权操作")
+    rel.status = "CANCELLED"
+    rel.updated_at = datetime.utcnow()
+    db.commit()
+    return {"status": "cancelled"}
 
 
 # 给所有受保护端点加依赖
@@ -298,30 +650,49 @@ async def auth_middleware(request: Request, call_next):
     # CORS 预检：直接放行（让 CORSMiddleware 响应 OPTIONS）
     if method == "OPTIONS":
         return await call_next(request)
-    # admin 端点（需 X-Admin-Token，独立于用户密码）
-    if path.startswith("/api/admin/"):
-        admin_token = os.environ.get("ADMIN_TOKEN", APP_PASSWORD)
-        provided = request.headers.get("x-admin-token")
-        if provided != admin_token:
-            return _json_error(401, "admin token required", request)
-        return await call_next(request)
+    # admin 端点权限验证由 require_admin 依赖项完成（检查 session token + is_admin）
     # 公开路径
     PUBLIC_PATHS = (
         "/api/auth/", "/api/strategies",
         "/openapi.json", "/docs", "/docs/oauth2-redirect", "/redoc", "/favicon.ico",
     )
-    if any(path.startswith(p) for p in PUBLIC_PATHS):
+    is_public = any(path.startswith(p) for p in PUBLIC_PATHS)
+    # 始终尝试注入 user（即使公开路径，也要让 /me、/auth/users 等能用 request.state.user）
+    token = _extract_token(request)
+    db = next(get_db())
+    try:
+        sess = _verify_token(db, token) if token else None
+        if sess:
+            try:
+                from models import User
+                if sess.user_id:
+                    u = db.query(User).filter(User.id == sess.user_id, User.is_active == True).first()
+                    if u:
+                        request.state.user = u
+                        request.state.user_id = u.id
+                        request.state.is_advisor = bool(u.is_advisor)
+                        request.state.is_admin = bool(u.is_admin)
+            except Exception as _e:
+                import logging
+                logging.getLogger(__name__).warning("user inject failed: %s", _e)
+            # view_as 解析（来自 query / header）
+            view_as = (
+                request.query_params.get("view_as")
+                or request.headers.get("x-view-as")
+            )
+            if view_as:
+                try:
+                    request.state.view_as_user_id = int(view_as)
+                except (TypeError, ValueError):
+                    pass
+    finally:
+        db.close()
+    if is_public:
         return await call_next(request)
     if not path.startswith("/api/"):
         return await call_next(request)
-    # 检查 session
-    token = request.headers.get("x-session-token") or request.query_params.get("session")
-    db = next(get_db())
-    try:
-        if not _verify_token(db, token):
-            return _json_error(401, "需要登录", request)
-    finally:
-        db.close()
+    if not sess:
+        return _json_error(401, "需要登录", request)
     return await call_next(request)
 
 
@@ -336,6 +707,7 @@ def _json_error(status: int, msg: str, request: Request | None = None):
         content={"detail": msg},
         headers={
             "Access-Control-Allow-Origin": allowed_origin,
+            "Access-Control-Allow-Credentials": "true",
             "Vary": "Origin",
             "Access-Control-Allow-Methods": "GET, POST, PUT, DELETE, OPTIONS, PATCH",
             "Access-Control-Allow-Headers": "*",
@@ -449,14 +821,28 @@ def shutdown():
 # ==================== 持仓 ====================
 
 @app.get("/api/holdings", response_model=list[HoldingOut])
-def list_holdings(db: Session = Depends(get_db)):
+def list_holdings(
+    request: Request,
+    view_as: int | None = None,
+    user: User = Depends(require_user),
+    db: Session = Depends(get_db),
+):
     from models import Holding as HoldingModel
-    return db.query(HoldingModel).all()
+    from middleware.auth import _resolve_eff_from_request
+    _u, eff_uid = _resolve_eff_from_request(request, db)
+    return db.query(HoldingModel).filter(HoldingModel.user_id == eff_uid).all()
 
 
 @app.get("/api/holdings/summary", response_model=HoldingSummary)
-def holdings_summary(db: Session = Depends(get_db)):
-    return get_holdings_summary(db)
+def holdings_summary(
+    request: Request,
+    view_as: int | None = None,
+    user: User = Depends(require_user),
+    db: Session = Depends(get_db),
+):
+    from middleware.auth import _resolve_eff_from_request
+    _u, eff_uid = _resolve_eff_from_request(request, db)
+    return get_holdings_summary(db, user_id=eff_uid)
 
 
 # ==================== 证券基础表 ====================
@@ -642,13 +1028,16 @@ def list_exchange_rates_latest(target: str = Query("CNY"), db: Session = Depends
 
 
 @app.get("/api/holdings/converted")
-def holdings_converted(target: str = Query("CNY"), db: Session = Depends(get_db)):
+def holdings_converted(target: str = Query("CNY"), request: Request = None, db: Session = Depends(get_db)):
     """Get holdings with amounts converted to target currency.
     Joins with security_master for currency and asset_type.
-    Joins with security_type_config for price_precision."""
+    Joins with security_type_config for price_precision.
+    多用户隔离：仅返回 effective user 的 holdings（view_as 已在前置依赖里解析）。"""
     from models import Holding as HoldingModel, SecurityMaster, SecurityTypeConfig
     from crawlers.exchange_rates import get_rate
-    rows = db.query(HoldingModel).all()
+    from middleware.auth import _resolve_eff_from_request
+    _u, eff_uid = _resolve_eff_from_request(request, db)
+    rows = db.query(HoldingModel).filter(HoldingModel.user_id == eff_uid).all()
     # Build lookup from security_master
     sm_map = {}
     for sm in db.query(SecurityMaster).all():
@@ -699,23 +1088,19 @@ def holdings_converted(target: str = Query("CNY"), db: Session = Depends(get_db)
 def get_portfolio_trend(
     days: int = Query(90, ge=1, le=365),
     target: str = Query("CNY"),
+    request: Request = None,
     db: Session = Depends(get_db),
 ):
-    """组合 90 天资产走势：每日期末总市值 = Σ(qty × close_px × fx_rate)
-    用 PriceCache.close_px + ExchangeRate.rate 计算。无历史价则用最近已知价补齐。"""
+    """组合 90 天资产走势（按 effective user 隔离 — 2026-06-24）"""
     from datetime import date, timedelta
     import logging
     from models import Holding, PriceCache, ExchangeRate
+    from middleware.auth import _resolve_eff_from_request
+    _u, eff_uid = _resolve_eff_from_request(request, db)
 
     logger = logging.getLogger(__name__)
 
-    # 整个函数包 try/except: Zeabur 边缘 < 30s 容易触发 502,
-    # 任何异常(慢 PBoC, OOM, DB 失联)都返回空序列让前端优雅降级, 而不是挂掉 worker.
     try:
-        # 兜底：仅当当日汇率缺失时才拉（update_rates_today 内部有 17s 的 PBoC 接口, 频繁调很慢）
-        # Cloud: PBoC 网络常失败/超时, 直接 skip; 用 DB 里已有的 ExchangeRate 即可.
-        # 重要: PBoC 失败时 update_rates_today 内部 raise 但 SQLAlchemy session
-        #       会进入 PendingRollbackError, 必须 rollback 才能继续 query.
         try:
             from crawlers.exchange_rates import update_rates_today
             update_rates_today(db)
@@ -726,8 +1111,7 @@ def get_portfolio_trend(
             except Exception:
                 pass
 
-        # 1. 取当前所有 holdings
-        rows = db.query(Holding).all()
+        rows = db.query(Holding).filter(Holding.user_id == eff_uid).all()
         if not rows:
             return {"series": [], "currency": target, "days": days}
 
@@ -1131,7 +1515,12 @@ def code_map_coverage(
 
 
 @app.post("/api/admin/backfill-prices")
-def admin_backfill_prices(days: int = 90, db: Session = Depends(get_db)):
+def admin_backfill_prices(
+    request: Request,
+    days: int = 90,
+    db: Session = Depends(get_db),
+    user: User = Depends(require_admin),
+):
     """拉所有 holding 过去 N 天 daily price，写入 price_cache。
     来源：腾讯 K 线（A 股/港股/美股 ETF）+ akshare 净值走势（OF 基金）。
     只插真实数据；不编造。"""
@@ -1145,7 +1534,9 @@ def admin_backfill_prices(days: int = 90, db: Session = Depends(get_db)):
         return {"status": "error", "message": f"import failed: {e}"}
 
     try:
-        holdings = db.query(Holding).all()
+        from middleware.auth import _resolve_eff_from_request
+        _u, eff_uid = _resolve_eff_from_request(request, db)
+        holdings = db.query(Holding).filter(Holding.user_id == eff_uid).all()
         results = []
         cutoff = date.today() - timedelta(days=days)
 
@@ -1226,26 +1617,30 @@ def admin_backfill_prices(days: int = 90, db: Session = Depends(get_db)):
 
 
 @app.post("/api/holdings/import", response_model=CrawlResponse)
-def import_holdings(req: ImportRequest, db: Session = Depends(get_db)):
-    """从Excel导入持仓"""
+def import_holdings(
+    req: ImportRequest,
+    user: User = Depends(require_user),
+    db: Session = Depends(get_db),
+):
+    """从Excel导入持仓（按 user 隔离；只删/只写自己 user 的）"""
     xlsx_files = list(DATA_DIR.glob("*.xlsx")) + list(DATA_DIR.glob("*.xls"))
     if not xlsx_files:
         return CrawlResponse(status="error", message="No Excel files found in project root")
 
     filepath = str(xlsx_files[0])
-    count = import_excel(filepath, db)
+    count = import_excel(filepath, db, user_id=user.id)
     return CrawlResponse(status="ok", message=f"Imported {count} holdings", count=count)
 
 
 @app.post("/api/holdings/fill-prices", response_model=CrawlResponse)
-def fill_holdings_prices(db: Session = Depends(get_db)):
-    """获取所有持仓的最新价格并计算金额"""
+def fill_holdings_prices(request: Request = None, db: Session = Depends(get_db)):
+    """获取当前用户所有持仓的最新价格（按 user 隔离 — 2026-06-24）"""
     from services.importer import fill_prices
     from crawlers.exchange_rates import update_rates_today
-    # First update rates
+    from middleware.auth import _resolve_eff_from_request
+    _u, eff_uid = _resolve_eff_from_request(request, db)
     update_rates_today(db)
-    # Then update prices
-    updated = fill_prices(db)
+    updated = fill_prices(db, user_id=eff_uid)
     return CrawlResponse(status="ok", message=f"Updated prices for {updated} holdings", count=updated)
 
 
@@ -1285,22 +1680,26 @@ def calculate_penetration(db: Session = Depends(get_db)):
 
 
 @app.get("/api/penetration/table", response_model=list[PenetrationRow])
-def penetration_table(db: Session = Depends(get_db)):
-    """获取底层股票穿透表"""
+def penetration_table(request: Request = None, db: Session = Depends(get_db)):
+    """获取底层股票穿透表（按 effective user 隔离 — 2026-06-24）"""
     from models import PenetrationResult
-    rows = db.query(PenetrationResult).order_by(
-        PenetrationResult.penetration_weight.desc()
-    ).all()
+    from middleware.auth import _resolve_eff_from_request
+    _u, eff_uid = _resolve_eff_from_request(request, db)
+    rows = db.query(PenetrationResult).filter(
+        PenetrationResult.user_id == eff_uid
+    ).order_by(PenetrationResult.penetration_weight.desc()).all()
     return rows
 
 
 @app.get("/api/penetration/summary", response_model=PenetrationSummary)
-def penetration_summary(db: Session = Depends(get_db)):
-    """穿透汇总"""
+def penetration_summary(request: Request = None, db: Session = Depends(get_db)):
+    """穿透汇总（按 effective user 隔离 — 2026-06-24）"""
     from models import PenetrationResult
-    rows = db.query(PenetrationResult).order_by(
-        PenetrationResult.penetration_weight.desc()
-    ).all()
+    from middleware.auth import _resolve_eff_from_request
+    _u, eff_uid = _resolve_eff_from_request(request, db)
+    rows = db.query(PenetrationResult).filter(
+        PenetrationResult.user_id == eff_uid
+    ).order_by(PenetrationResult.penetration_weight.desc()).all()
     total = sum(r.penetration_weight for r in rows)
     return PenetrationSummary(
         total_penetrated=round(total, 2),
@@ -1312,10 +1711,11 @@ def penetration_summary(db: Session = Depends(get_db)):
 # ==================== 分析 ====================
 
 @app.get("/api/analysis/industry-chain", response_model=IndustryChainAnalysis)
-def industry_chain_analysis(db: Session = Depends(get_db)):
-    """产业链分布分析 + 沪深300对比"""
+def industry_chain_analysis(request: Request = None, db: Session = Depends(get_db)):
+    """产业链分布分析 + 沪深300对比（按 effective user 隔离 — 2026-06-24）"""
     from models import PenetrationResult
-    results = db.query(PenetrationResult).all()
+    from middleware.auth import user_scope_query
+    results = user_scope_query(db.query(PenetrationResult), PenetrationResult, request, db).all()
     portfolio = IndustryChainAnalyzer.compute_distribution(results)
 
     csi300 = Csi300Analyzer(db)
@@ -1330,8 +1730,10 @@ def industry_chain_analysis(db: Session = Depends(get_db)):
 
 
 @app.get("/api/analysis/growth", response_model=GrowthAnalysis)
-def growth_analysis(db: Session = Depends(get_db)):
-    """增长分层分析 + 沪深300对比"""
+def growth_analysis(request: Request = None, db: Session = Depends(get_db)):
+    """增长分层分析 + 沪深300对比（按 effective user 隔离 — 2026-06-24）"""
+    from middleware.auth import _resolve_eff_from_request
+    _u, eff_uid = _resolve_eff_from_request(request, db)
     bucketer = GrowthBucketer(db)
     csi300_analyzer = Csi300Analyzer(db)
     baselines = csi300_analyzer.get_baselines()
@@ -1341,7 +1743,7 @@ def growth_analysis(db: Session = Depends(get_db)):
         # No thresholds yet - use defaults
         thresholds = {"high_cutoff": 20.0, "med_cutoff": 10.0}
 
-    portfolio = bucketer.compute_portfolio_growth_distribution(thresholds)
+    portfolio = bucketer.compute_portfolio_growth_distribution(thresholds, user_id=eff_uid)
 
     growth_data = baselines.get("growth", {})
     csi300_dist = {
@@ -1358,10 +1760,13 @@ def growth_analysis(db: Session = Depends(get_db)):
 
 
 @app.get("/api/analysis/valuation", response_model=ValuationMetrics)
-def valuation_analysis(db: Session = Depends(get_db)):
-    """估值分析"""
+def valuation_analysis(request: Request = None, db: Session = Depends(get_db)):
+    """估值分析（按 effective user 隔离 — 2026-06-24）"""
     from models import PenetrationResult
+    from middleware.auth import _resolve_eff_from_request
+    _u, eff_uid = _resolve_eff_from_request(request, db)
     results = db.query(PenetrationResult).filter(
+        PenetrationResult.user_id == eff_uid,
         PenetrationResult.ttm_pe.isnot(None),
         PenetrationResult.ttm_pe > 0,
         PenetrationResult.ttm_pe < 500,
@@ -1496,6 +1901,7 @@ def register_job_handlers() -> None:
         job_crawl_stock_news,
         job_crawl_announcements_and_research,
         job_crawl_hot_stocks,
+        job_generate_drill_snapshot,
     )
     _JOB_DISPATCH = {
         "realtime_prices": job_fetch_realtime_prices,
@@ -1507,6 +1913,7 @@ def register_job_handlers() -> None:
         "info_stock_news": job_crawl_stock_news,
         "info_announcements_research": job_crawl_announcements_and_research,
         "info_hot_stocks": job_crawl_hot_stocks,
+        "drill_snapshot": job_generate_drill_snapshot,
     }
 
 
@@ -2137,25 +2544,47 @@ def _enrich_watch_row(w, db) -> dict:
 
 
 @app.get("/api/watchlist")
-def list_watchlist(db: Session = Depends(get_db)):
-    """获取关注清单（带实时行情补全）"""
+def list_watchlist(
+    request: Request,
+    view_as: int | None = None,
+    user: User = Depends(require_user),
+    db: Session = Depends(get_db),
+):
+    """获取关注清单（带实时行情补全）— 按 user 隔离"""
     from models import Watchlist
-    rows = db.query(Watchlist).order_by(Watchlist.added_at.desc()).all()
+    from middleware.auth import _resolve_eff_from_request
+    _u, eff_uid = _resolve_eff_from_request(request, db)
+    rows = db.query(Watchlist).filter(
+        Watchlist.user_id == eff_uid
+    ).order_by(Watchlist.added_at.desc()).all()
     return [_enrich_watch_row(r, db) for r in rows]
 
 
 @app.post("/api/watchlist")
-def add_watchlist(req: WatchAddRequest, db: Session = Depends(get_db)):
-    """添加关注。code 任意合法证券代码；后端拉一次行情回填 name/market/industry"""
+def add_watchlist(
+    req: WatchAddRequest,
+    request: Request,
+    user: User = Depends(require_user),
+    db: Session = Depends(get_db),
+):
+    """添加关注。code 任意合法证券代码；后端拉一次行情回填 name/market/industry。
+    写入当前 user（不写入 view_as 目标 — 视图代理只读不写）。
+    """
     from models import Watchlist
     from crawlers.price_data import fetch_tencent_quote
+    from middleware.auth import _resolve_eff_from_request
+    _u, eff_uid = _resolve_eff_from_request(request, db)
+    # 写入始终对自己（user.id），不是 view_as
+    write_uid = user.id
 
     code = req.code.strip().upper()
     if not code:
         return {"status": "error", "message": "code 不能为空"}
 
-    # 查重
-    if db.query(Watchlist).filter(Watchlist.code == code).first():
+    # 查重（按 user_id 隔离）
+    if db.query(Watchlist).filter(
+        Watchlist.user_id == write_uid, Watchlist.code == code
+    ).first():
         return {"status": "error", "message": f"{code} 已在关注清单"}
 
     # 拉行情回填 name/industry
@@ -2170,6 +2599,7 @@ def add_watchlist(req: WatchAddRequest, db: Session = Depends(get_db)):
         market = "A股"
 
     w = Watchlist(
+        user_id=write_uid,
         code=code,
         name=name,
         market=market,
@@ -2183,10 +2613,17 @@ def add_watchlist(req: WatchAddRequest, db: Session = Depends(get_db)):
 
 
 @app.delete("/api/watchlist/{code}")
-def remove_watchlist(code: str, db: Session = Depends(get_db)):
-    """移除关注"""
+def remove_watchlist(
+    code: str,
+    request: Request,
+    user: User = Depends(require_user),
+    db: Session = Depends(get_db),
+):
+    """移除关注（仅删自己 user 的）"""
     from models import Watchlist
-    w = db.query(Watchlist).filter(Watchlist.code == code).first()
+    w = db.query(Watchlist).filter(
+        Watchlist.user_id == user.id, Watchlist.code == code
+    ).first()
     if not w:
         return {"status": "error", "message": f"{code} 不在关注清单"}
     db.delete(w)
@@ -2195,12 +2632,20 @@ def remove_watchlist(code: str, db: Session = Depends(get_db)):
 
 
 @app.put("/api/watchlist/{code}/weight")
-def set_watchlist_weight(code: str, req: WatchWeightRequest, db: Session = Depends(get_db)):
-    """修改权重"""
+def set_watchlist_weight(
+    code: str,
+    req: WatchWeightRequest,
+    request: Request,
+    user: User = Depends(require_user),
+    db: Session = Depends(get_db),
+):
+    """修改权重（仅改自己 user 的）"""
     from models import Watchlist
-    w = db.query(Watchlist).filter(Watchlist.code == code).first()
+    w = db.query(Watchlist).filter(
+        Watchlist.user_id == user.id, Watchlist.code == code
+    ).first()
     if not w:
-        return {"status": "error", "message": "not found"}
+        return {"status": "error", "message": f"{code} 不在关注清单"}
     w.weight = req.weight
     db.commit()
     return {"status": "ok"}
@@ -2330,35 +2775,26 @@ def _pct_change_3m(stock_code: str, current_price: float | None, db) -> float | 
 @app.get("/api/penetration/full-holding")
 def get_full_holding(
     as_of_date: date = Query(...),
+    request: Request = None,
     db: Session = Depends(get_db),
 ):
-    """FullHoldingTable = Overview - 可下钻基金 + 下钻基金下钻/展开后的股票.
-
-    算法 (用户口径):
-      1. 拉取 Holding 全表 (Overview 的 44 笔持仓)
-      2. 通过 FundIndexMap 识别 14 只可下钻基金 (12 个指数 + 多基金)
-      3. 移除这些可下钻基金
-      4. 加入 12 个可下钻指数的 constituents (按 drill 算法展开)
-      5. 同代码的证券已合并为单行 (amount 求和)
-      6. 未下钻: 估算市值 = 数量 × 收盘价 (Holding.quantity × NAV/current_price × 汇率)
-      7. 下钻: 估算市值 = drill 算法 (shares_equivalent × current_price × 汇率)
-      8. PE/PB/PS = *_dynamic 优先, baseline 5/29 兜底
-
-    字段:
-      source_type: 'undrilled_fund' | 'direct_stock' | 'cash' | 'drilled'
-      est_market_value_cny: 在原币种下 (前端做 CNY 折算)
-      currency: 原币种 (前端用此判断是否需要折算)
-    """
+    """FullHoldingTable = Overview - 可下钻基金 + 下钻基金下钻/展开后的股票（按 effective user 隔离 — 2026-06-24）"""
     from models import (
         AShareFinancialSnapshot, HKShareFinancialSnapshot, Holding, FundIndexMap,
     )
+    from middleware.auth import _resolve_eff_from_request
+    _u, eff_uid = _resolve_eff_from_request(request, db)
     from services.drillable_funds import list_drillable_indices, get_index_drill_detail
 
-    # 1) 拉取快照数据 (用于 PE/PB/PS)
+    # 1) 拉取快照数据 (用于 PE/PB/PS) — 估值是市场公共数据，不按 user 隔离（2026-06-25）
     a_snap = {a.stock_code.split(".")[0]: a for a in
-              db.query(AShareFinancialSnapshot).filter_by(as_of_date=as_of_date).all()}
+              db.query(AShareFinancialSnapshot).filter(
+                  AShareFinancialSnapshot.as_of_date == as_of_date,
+              ).all()}
     h_snap = {h.stock_code.split(".")[0]: h for h in
-              db.query(HKShareFinancialSnapshot).filter_by(as_of_date=as_of_date).all()}
+              db.query(HKShareFinancialSnapshot).filter(
+                  HKShareFinancialSnapshot.as_of_date == as_of_date,
+              ).all()}
     # 同样索引 suffix-stripped
     def _norm_keys(snap_dict):
         for k, v in list(snap_dict.items()):
@@ -2367,8 +2803,8 @@ def get_full_holding(
     a_snap = _norm_keys(a_snap)
     h_snap = _norm_keys(h_snap)
 
-    # 2) 拉 Holding 全部 + 合并同代码 (quantity/amount 累加)
-    holdings = db.query(Holding).all()
+    # 2) 拉 Holding 全部 (按 user) + 合并同代码 (quantity/amount 累加)
+    holdings = db.query(Holding).filter(Holding.user_id == eff_uid).all()
     by_code: dict[str, dict] = {}
     for h in holdings:
         code = h.security_code
@@ -2437,10 +2873,10 @@ def get_full_holding(
             "fund_currency": acc["currency"],
         })
 
-    # 5) 加入 12 个可下钻指数的 constituents (drill 算法)
-    indices = list_drillable_indices(db, as_of_date)
+    # 5) 加入 12 个可下钻指数的 constituents (drill 算法，按 effective user 隔离)
+    indices = list_drillable_indices(db, as_of_date, user_id=eff_uid)
     for idx in indices:
-        detail = get_index_drill_detail(db, idx["index_code"], as_of_date)
+        detail = get_index_drill_detail(db, idx["index_code"], as_of_date, user_id=eff_uid)
         if "constituents" not in detail:
             continue
         for c in detail["constituents"]:
@@ -2481,27 +2917,31 @@ def get_full_holding(
 @app.get("/api/penetration/full-holding-table")
 def get_full_holding_table(
     as_of_date: date = Query(...),
+    request: Request = None,
     db: Session = Depends(get_db),
 ):
-    """全持仓表格专用接口：一次返回 undrilled + drilled 聚合，避免重复下钻。
+    """全持仓表格专用接口（按 effective user 隔离 — 2026-06-24）
 
-    与分别调用 /full-holding 和 /all-drilled-stocks 相比：
-      - 只下钻一次所有指数
-      - 快照 / holdings / fund_navs 只加载一次
-      - drilled 部分在后端按 stock_code 聚合，避免前端重复合并
-      - undrilled 部分不再包含 drilled 成分股，防止重复计算
+    2026-06-25 迁移：drilled 段从旧模块 drillable_funds 切换到三层 service 架构
+    (drill_orchestration_service.get_all_drill_constituents)，用双币种算法，
+    保证与下钻页面 / 4 口径卡片算法一致。undrilled 段保持不变。
     """
     from models import (
         AShareFinancialSnapshot, HKShareFinancialSnapshot, Holding, FundIndexMap,
-        FundDailyNav,
     )
-    from services.drillable_funds import list_drillable_indices, get_index_drill_detail
+    from services.drill_orchestration_service import get_all_drill_constituents
+    from middleware.auth import _resolve_eff_from_request
+    _u, eff_uid = _resolve_eff_from_request(request, db)
 
-    # 1) 快照一次性加载
+    # 1) 快照一次性加载（估值是市场公共数据，不按 user 隔离 — 2026-06-25）
     a_snap_raw = {a.stock_code.split(".")[0]: a for a in
-                  db.query(AShareFinancialSnapshot).filter_by(as_of_date=as_of_date).all()}
+                  db.query(AShareFinancialSnapshot).filter(
+                      AShareFinancialSnapshot.as_of_date == as_of_date,
+                  ).all()}
     h_snap_raw = {h.stock_code.split(".")[0]: h for h in
-                  db.query(HKShareFinancialSnapshot).filter_by(as_of_date=as_of_date).all()}
+                  db.query(HKShareFinancialSnapshot).filter(
+                      HKShareFinancialSnapshot.as_of_date == as_of_date,
+                  ).all()}
 
     def _norm_keys(snap_dict):
         for k, v in list(snap_dict.items()):
@@ -2512,7 +2952,7 @@ def get_full_holding_table(
     h_snap = _norm_keys(h_snap_raw)
 
     # 2) Holding 聚合（按代码）
-    holdings = db.query(Holding).all()
+    holdings = db.query(Holding).filter(Holding.user_id == eff_uid).all()
     by_code: dict[str, dict] = {}
     for h in holdings:
         code = h.security_code
@@ -2531,10 +2971,9 @@ def get_full_holding_table(
         acc["amount"] += (h.amount or 0.0)
         acc["amount_cny"] += (h.amount_cny or 0.0)
 
-    # 3) 可下钻基金
+    # 3) 可下钻基金 — FundIndexMap 是静态映射表（fund_code → index_code），不按日期过滤
     drillable_codes = {
-        m.fund_code for m in
-        db.query(FundIndexMap).filter(FundIndexMap.as_of_date == as_of_date).all()
+        m.fund_code for m in db.query(FundIndexMap).all()
     }
 
     # 4) 构建 undrilled 行（直接持股 + 未下钻基金 + 现金）
@@ -2571,71 +3010,40 @@ def get_full_holding_table(
             "fund_currency": acc["currency"],
         })
 
-    # 5) 一次性加载所有相关 fund NAVs
-    all_fund_codes = sorted(drillable_codes)
-    fund_navs_map: dict[str, dict] = {}
-    if all_fund_codes:
-        nav_rows = (
-            db.query(FundDailyNav)
-            .filter(
-                FundDailyNav.fund_code.in_(all_fund_codes),
-                FundDailyNav.trade_date.in_([as_of_date, date(2026, 6, 18)]),
-            )
-            .all()
-        )
-        for fc in all_fund_codes:
-            fund_navs_map[fc] = {"nav_529": None, "cumnav_529": None, "nav_618": None, "cumnav_618": None}
-        for r in nav_rows:
-            fc = r.fund_code
-            if r.trade_date == as_of_date:
-                fund_navs_map[fc]["nav_529"] = r.nav
-                fund_navs_map[fc]["cumnav_529"] = r.accumulated_nav
-            elif r.trade_date == date(2026, 6, 18):
-                fund_navs_map[fc]["nav_618"] = r.nav
-                fund_navs_map[fc]["cumnav_618"] = r.accumulated_nav
-
-    # 6) 下钻所有指数一次，并按 stock_code 聚合
-    holdings_agg = {code: info for code, info in by_code.items() if info["quantity"] > 0}
+    # 5) 下钻：跨所有可下钻指数聚合成分股（按 user，含 CASH 行）
+    #    2026-06-25 迁移到三层 service 架构 (drill_orchestration_service.get_all_drill_constituents)，
+    #    双币种算法（est_market_value_cny = shares × current_price_cny，本币 CNY），
+    #    保证与下钻页面 / 4 口径卡片算法一致。
+    #    现金-下钻行（CASH）由 FundDrillSnapshot 公共数据分解生成，service 自动返回。
+    drilled_resp = get_all_drill_constituents(db, as_of_date, eff_uid)
     drilled_map: dict[str, dict] = {}
-    indices = list_drillable_indices(db, as_of_date)
-    for idx in indices:
-        detail = get_index_drill_detail(
-            db, idx["index_code"], as_of_date,
-            holdings_agg=holdings_agg,
-            fund_navs=fund_navs_map,
-            a_snap=a_snap,
-            h_snap=h_snap,
-        )
-        if "constituents" not in detail:
-            continue
-        idx_code = idx["index_code"]
-        for c in detail["constituents"]:
-            code = c["stock_code"]
-            if code not in drilled_map:
-                drilled_map[code] = {
-                    "stock_code": code,
-                    "stock_name": c.get("stock_name"),
-                    "shares_equivalent": 0,
-                    "current_price": c.get("current_price"),
-                    "baseline_price": c.get("baseline_price"),
-                    "est_market_value_cny": 0.0,
-                    "pe_ttm": c.get("pe_ttm"),
-                    "pb_mrq": c.get("pb_mrq"),
-                    "ps_ttm": c.get("ps_ttm"),
-                    "dividend_yield": c.get("dividend_yield"),
-                    "indices": set(),
-                }
-            acc = drilled_map[code]
-            acc["shares_equivalent"] += (c.get("shares_equivalent") or 0)
-            acc["est_market_value_cny"] += (c.get("est_market_value_cny") or 0)
-            acc["indices"].add(idx_code)
-            for k in ("current_price", "baseline_price", "pe_ttm", "pb_mrq", "ps_ttm", "dividend_yield"):
-                if acc.get(k) is None and c.get(k) is not None:
-                    acc[k] = c.get(k)
-
-    for s in drilled_map.values():
-        s["indices"] = sorted(s["indices"])
-        s["est_market_value_cny"] = round(s["est_market_value_cny"], 4)
+    if drilled_resp:
+        for s in drilled_resp.get("stocks", []):
+            code = s["stock_code"]
+            drilled_map[code] = {
+                "stock_code": code,
+                "stock_name": s.get("stock_name"),
+                "shares_equivalent": s.get("shares_equivalent", 0.0),
+                "baseline_price": s.get("baseline_price"),
+                "current_price": s.get("current_price"),
+                # 双币种字段 (2026-06-25)：本币(CNY)价，公共层算好存表
+                "baseline_price_cny": s.get("baseline_price_cny"),
+                "current_price_cny": s.get("current_price_cny"),
+                "est_market_value_cny": s.get("est_market_value_cny", 0.0),  # 本币 CNY（= shares × current_price_cny）
+                # 基准日估值（fallback 用）
+                "pe_ttm": s.get("pe_ttm"),
+                "pb_mrq": s.get("pb_mrq"),
+                "ps_ttm": s.get("ps_ttm"),
+                "dividend_yield": s.get("dividend_yield"),
+                # 动态估值（优先用，基于最新收盘价调整）
+                "pe_ttm_dynamic": s.get("pe_ttm_dynamic"),
+                "pb_mrq_dynamic": s.get("pb_mrq_dynamic"),
+                "ps_ttm_dynamic": s.get("ps_ttm_dynamic"),
+                "currency": s.get("currency"),
+                "fx_rate": s.get("fx_rate"),
+                "indices": s.get("indices", []),
+                "is_cash": s.get("is_cash", False),
+            }
 
     return {
         "as_of_date": as_of_date.isoformat(),
@@ -2648,9 +3056,10 @@ def get_full_holding_table(
 def get_top10_holdings(
     as_of_date: date = Query(...),
     limit: int = Query(10, ge=1, le=50),
+    request: Request = None,
     db: Session = Depends(get_db),
 ):
-    """前 N 大底层持仓（穿透 + 未穿透，仅股票，不含未穿透基金）。
+    """前 N 大底层持仓（穿透 + 未穿透，仅股票，不含未穿透基金；按 effective user 隔离 — 2026-06-24）。
 
     口径：
       - 合并 undrilled.direct_stock + drilled 全部行
@@ -2671,6 +3080,8 @@ def get_top10_holdings(
     from sqlalchemy import func as _func
 
     # ---- 1. 拿 undrilled + drilled 全量数据（复用 full-holding-table 的核心逻辑）----
+    from middleware.auth import _resolve_eff_from_request
+    _u, eff_uid = _resolve_eff_from_request(request, db)
     a_snap_raw = {a.stock_code.split(".")[0]: a for a in
                   db.query(AShareFinancialSnapshot).filter_by(as_of_date=as_of_date).all()}
     h_snap_raw = {h.stock_code.split(".")[0]: h for h in
@@ -2681,7 +3092,7 @@ def get_top10_holdings(
         h_snap_raw.setdefault(v.stock_code, v)
 
     by_code: dict[str, dict] = {}
-    for h in db.query(Holding).all():
+    for h in db.query(Holding).filter(Holding.user_id == eff_uid).all():
         c = h.security_code
         if c not in by_code:
             by_code[c] = {"security_code": c, "security_name": h.security_name,
@@ -2741,11 +3152,11 @@ def get_top10_holdings(
                 fund_navs_map[fc]["nav_618"] = r.nav
                 fund_navs_map[fc]["cumnav_618"] = r.accumulated_nav
 
-    indices = list_drillable_indices(db, as_of_date)
+    indices = list_drillable_indices(db, as_of_date, user_id=eff_uid)
     drilled_acc: dict[str, dict] = {}
     for idx in indices:
         detail = get_index_drill_detail(
-            db, idx["index_code"], as_of_date,
+            db, idx["index_code"], as_of_date, user_id=eff_uid,
             holdings_agg=holdings_agg,
             fund_navs=fund_navs_map,
             a_snap=a_snap_raw, h_snap=h_snap_raw,
@@ -2805,9 +3216,9 @@ def get_top10_holdings(
                         PriceCache.stock_code.in_(codes)).all())
         prev_px_map = {r[0]: float(r[1]) for r in rows if r[1] is not None}
 
-    # Holding.price 兜底（与「当日涨幅」denominator 一致）
+    # Holding.price 兜底（按 user 隔离）
     holding_px: dict[str, float] = {}
-    for h in db.query(Holding).all():
+    for h in db.query(Holding).filter(Holding.user_id == eff_uid).all():
         if h.security_code and h.price:
             holding_px.setdefault(h.security_code, float(h.price))
 
@@ -2858,14 +3269,10 @@ def get_dimension_drilled(
     dim: str = Query(...),
     as_of_date: date = Query(...),
     market: str = Query("A+H", pattern="^(A\\+H|A|H)$"),
+    request: Request = None,
     db: Session = Depends(get_db),
 ):
-    """下钻证券维度聚合 + CSI300 对照（仅用于需要 drill 视角的维度，如 swy1）。
-
-    组合部分：仅对下钻证券（drilled constituents）按 dim 列聚合，金额按最新汇率折算为 CNY，
-             PE 采用虚拟盈利法 Σamount / Σ(amount/PE_dynamic)。
-    CSI300 部分：使用 csi300_constituent_snapshot 的最新权重作为分母，同行业算法计算 PE。
-    market=A 时仅保留 A 股（.SH/.SZ），market=H 时仅保留港股（.HK）。
+    """下钻证券维度聚合 + CSI300 对照（按 effective user 隔离 — 2026-06-24）。
 
     返回包含 stock_details，用于前端点击行业行展开下钻证券明细。
     """
@@ -2875,6 +3282,8 @@ def get_dimension_drilled(
         Csi300ConstituentSnapshot, ExchangeRate,
         FundIndexMap, FundDailyNav, Holding,
     )
+    from middleware.auth import _resolve_eff_from_request
+    _u, eff_uid = _resolve_eff_from_request(request, db)
 
     DIM_COL_DRILLED = {
         "swy1": "swy_l1", "swy2": "swy_l2", "swy3": "swy_l3", "swy4": "swy_l4",
@@ -2887,11 +3296,15 @@ def get_dimension_drilled(
         raise HTTPException(status_code=400, detail=f"Unsupported dim: {dim}")
     col = DIM_COL_DRILLED[dim]
 
-    # 1) 快照（用于 dim 分类 + CSI300 PE/PB/PS 补全）
+    # 1) 快照（估值是市场公共数据，不按 user 隔离 — 2026-06-25）
     a_snap = {a.stock_code.split(".")[0]: a for a in
-              db.query(AShareFinancialSnapshot).filter_by(as_of_date=as_of_date).all()}
+              db.query(AShareFinancialSnapshot).filter(
+                  AShareFinancialSnapshot.as_of_date == as_of_date,
+              ).all()}
     h_snap = {h.stock_code.split(".")[0]: h for h in
-              db.query(HKShareFinancialSnapshot).filter_by(as_of_date=as_of_date).all()}
+              db.query(HKShareFinancialSnapshot).filter(
+                  HKShareFinancialSnapshot.as_of_date == as_of_date,
+              ).all()}
 
     def _norm_keys(snap_dict):
         for k, v in list(snap_dict.items()):
@@ -2919,7 +3332,7 @@ def get_dimension_drilled(
         db.query(FundIndexMap).filter(FundIndexMap.as_of_date == as_of_date).all()
     }
     holdings_agg: dict[str, dict] = {}
-    for h in db.query(Holding).all():
+    for h in db.query(Holding).filter(Holding.user_id == eff_uid).all():
         code = h.security_code
         if code not in holdings_agg:
             holdings_agg[code] = {
@@ -2953,12 +3366,13 @@ def get_dimension_drilled(
                 fund_navs_map[fc]["nav_618"] = r.nav
                 fund_navs_map[fc]["cumnav_618"] = r.accumulated_nav
 
-    indices = list_drillable_indices(db, as_of_date)
+    indices = list_drillable_indices(db, as_of_date, user_id=eff_uid)
 
-    # 3) 下钻证券聚合结果（一次性预加载）
+    # 3) 下钻证券聚合结果（一次性预加载，按 user）
     drilled_resp = get_all_drilled_stocks(
         db, as_of_date,
         indices=indices,
+        user_id=eff_uid,
         holdings_agg=holdings_agg,
         fund_navs=fund_navs_map,
         a_snap=a_snap,
@@ -3207,16 +3621,14 @@ def get_dimension(
     dim: str = Query(..., pattern="^(swy1|swy2|swy3|swy4|csi1|csi2|csi3|csi4|se1|se2|se3|se4|l1|l2|chain|growth_tier|competition)$"),
     as_of_date: date = Query(...),
     market: str = Query("A+H", pattern="^(A\\+H|A|H)$"),
+    request: Request = None,
     db: Session = Depends(get_db),
 ):
-    """统一维度聚合（组合 vs CSI300）。
-
-    支持 9 套行业系统 (申万 L1-L4 + 中证 L1-L4 + 战略新兴 L1-L4)
-    + 链位置 / 增长分层 / 竞争格局。
-    market=A+H (全部) / A (A 股) / H (港股)。
-    """
+    """统一维度聚合（组合 vs CSI300）— portfolio 部分按 effective user 隔离（2026-06-24）。"""
     from models import AggregationCache
-    portfolio = aggregate_dimension(db, as_of_date, "portfolio", dim, market=market)
+    from middleware.auth import _resolve_eff_from_request
+    _u, eff_uid = _resolve_eff_from_request(request, db)
+    portfolio = aggregate_dimension(db, as_of_date, "portfolio", dim, market=market, user_id=eff_uid)
     csi300 = aggregate_dimension(db, as_of_date, "csi300", dim)
     return {
         "as_of_date": as_of_date.isoformat(),
@@ -3272,10 +3684,13 @@ def get_dimension_detail(
     key: str = Query(...),
     as_of_date: date = Query(...),
     market: str = Query("A+H", pattern="^(A\\+H|A|H)$"),
+    request: Request = None,
     db: Session = Depends(get_db),
 ):
-    """下钻明细：某维度 key 下的每只股票。"""
+    """下钻明细：某维度 key 下的每只股票（按 effective user 隔离 — 2026-06-24）"""
     from models import FullHoldingSnapshot, Csi300ConstituentSnapshot
+    from middleware.auth import _resolve_eff_from_request
+    _u, eff_uid = _resolve_eff_from_request(request, db)
     from sqlalchemy import func
     DIM_COL = {
         "swy1": "swy_l1", "swy2": "swy_l2", "swy3": "swy_l3", "swy4": "swy_l4",
@@ -3287,6 +3702,7 @@ def get_dimension_detail(
     col = DIM_COL[dim]
     q = db.query(FullHoldingSnapshot).filter(
         FullHoldingSnapshot.as_of_date == as_of_date,
+        FullHoldingSnapshot.user_id == eff_uid,
         getattr(FullHoldingSnapshot, col) == key,
     )
     if market == "A":
@@ -3409,7 +3825,8 @@ def _guess_currency_from_code(code: str) -> str:
     return "CNY"
 
 
-def _portfolio_scope_totals(db: Session, as_of_date: date, market: str):
+def _portfolio_scope_totals(db: Session, as_of_date: date, market: str,
+                           user_id: int | None = None):
     """Compute virtual-earnings totals for portfolio over a market scope.
 
     market: 'A+H' (all stocks), 'A' (A-share only), 'H' (HK only)
@@ -3436,16 +3853,24 @@ def _portfolio_scope_totals(db: Session, as_of_date: date, market: str):
     ).filter(
         FullHoldingSnapshot.as_of_date == as_of_date,
         FullHoldingSnapshot.source_type.in_(("drilled_fund", "direct_stock")),
-    ).group_by(
+    )
+    if user_id is not None:
+        q = q.filter(FullHoldingSnapshot.user_id == user_id)
+    q = q.group_by(
         FullHoldingSnapshot.stock_code,
         FullHoldingSnapshot.swy_l1, FullHoldingSnapshot.swy_l2, FullHoldingSnapshot.swy_l3,
         FullHoldingSnapshot.csi_l1, FullHoldingSnapshot.csi_l2, FullHoldingSnapshot.csi_l3, FullHoldingSnapshot.csi_l4,
     )
 
-    a_snap = {a.stock_code.split(".")[0]: a for a in
-              db.query(AShareFinancialSnapshot).filter_by(as_of_date=as_of_date).all()}
-    h_snap = {h.stock_code.split(".")[0]: h for h in
-              db.query(HKShareFinancialSnapshot).filter_by(as_of_date=as_of_date).all()}
+    a_q = db.query(AShareFinancialSnapshot).filter(
+        AShareFinancialSnapshot.as_of_date == as_of_date,
+    )
+    h_q = db.query(HKShareFinancialSnapshot).filter(
+        HKShareFinancialSnapshot.as_of_date == as_of_date,
+    )
+    # 估值是市场公共数据，不再按 user_id 过滤（2026-06-25）
+    a_snap = {a.stock_code.split(".")[0]: a for a in a_q.all()}
+    h_snap = {h.stock_code.split(".")[0]: h for h in h_q.all()}
     for code, snap in list(a_snap.items()):
         if snap.stock_code.endswith(".SZ"):
             a_snap[code] = snap
@@ -3602,18 +4027,17 @@ def _csi300_scope_totals(db: Session, as_of_date: date):
 @app.get("/api/penetration/portfolio-vs-csi300")
 def get_portfolio_vs_csi300(
     as_of_date: date = Query(...),
+    request: Request = None,
     db: Session = Depends(get_db),
 ):
-    """A+H / A / H / CSI300 四套口径的聚合指标，使用虚拟盈利法。
-
-    portfolio 金额是 CNY；CSI300 是 5/29 weight × price-adjusted（归一化比例）。
-    每个口径：股票数 / 总金额 / weighted PE / PB / PS / EPS_FY1。
-    """
+    """A+H / A / H / CSI300 四套口径的聚合指标（portfolio 部分按 effective user 隔离 — 2026-06-24）。"""
+    from middleware.auth import _resolve_eff_from_request
+    _u, eff_uid = _resolve_eff_from_request(request, db)
     return {
         "as_of_date": as_of_date.isoformat(),
-        "ah": _portfolio_scope_totals(db, as_of_date, "A+H"),
-        "a_only": _portfolio_scope_totals(db, as_of_date, "A"),
-        "h_only": _portfolio_scope_totals(db, as_of_date, "H"),
+        "ah": _portfolio_scope_totals(db, as_of_date, "A+H", user_id=eff_uid),
+        "a_only": _portfolio_scope_totals(db, as_of_date, "A", user_id=eff_uid),
+        "h_only": _portfolio_scope_totals(db, as_of_date, "H", user_id=eff_uid),
         "csi300": _csi300_scope_totals(db, as_of_date),
     }
 
@@ -3621,52 +4045,53 @@ def get_portfolio_vs_csi300(
 @app.get("/api/penetration/full-holding-summary")
 def get_full_holding_summary(
     as_of_date: date = Query(...),
+    request: Request = None,
     db: Session = Depends(get_db),
 ):
-    """全持仓 4 口径估值对比 (虚拟盈利法) — 以最新收盘价计算.
+    """全持仓 4 口径估值对比 — 与下钻卡片完全一致的算法 (2026-06-25 迁移).
 
     4 个口径:
-      - drilled: 全持仓-下钻部分 全部证券 (drill 页面所有指数的聚合)
-      - a:       drilled 中 A 股部分
-      - h:       drilled 中港股部分
+      - drilled: 全持仓-下钻部分 全部证券 (所有可下钻指数的聚合)
+      - a_only:  drilled 中 A 股部分
+      - h_only:  drilled 中港股部分
       - csi300:  CSI 300 指数 (= 与下钻页面的 CSI 300 卡片数值相同, 仅作指标参照系,
                 不含金额 / 占比)
 
-    3 张卡片 (drilled / a / h) 算法 (以最新收盘价为口径):
-      amount = est_market_value_cny          (current price × shares, 原始币种, 前端折算 CNY)
-      price_ratio = current_price / baseline_price
-      pe_per_stock = pe_ttm × price_ratio    (PE at latest closing price)
-      virt_pe = Σ (amount / pe_per_stock)
-      weighted_pe = Σ amount / virt_pe
-      股息率 = Σ (amount × dy_per_stock) / Σ amount   where dy_per_stock = dy / price_ratio
+    3 张卡片 (drilled / a_only / h_only) 算法 (drill_orchestration_service.compute_scope_metrics,
+    与 drill_public_service.get_public_cards 完全一致):
+      weight_basis = shares_equivalent × baseline_price_cny   (基准日 CNY 金额)
+      price_ratio  = current_price_cny / baseline_price_cny
+      pe_dyn = pe_ttm_dynamic if pe_ttm_dynamic else (pe_ttm × price_ratio)
+      virt_pe = Σ (weight_basis / pe_dyn)
+      weighted_pe = Σ weight_basis / virt_pe                   (调和平均)
+      股息率 = Σ (weight_basis × dy_dyn) / Σ weight_basis      (算术平均)
+      dy_dyn = dividend_yield / price_ratio
 
-    CSI 300 直接复用 list_drillable_indices 返回的 000300 卡片 (5/29 amount × current PE),
-    但不返回 金额/占比 字段 (按用户口径: 仅作指标参照系).
+    双币种规则: weight_basis / price_ratio 均用本币(CNY)字段, 不再临时 ×fx_rate 折算,
+    保证 A 股/H 股量纲一致 (修复旧版港股通 8.26% 量纲偏差).
+
+    CSI 300 复用 drill_public_service.get_public_cards 返回的 000300 卡片,
+    与下钻页面 CSI300 卡片数值完全一致.
     """
-    from services.drillable_funds import list_drillable_indices, get_all_drilled_stocks
-    from models import AShareFinancialSnapshot, HKShareFinancialSnapshot, ExchangeRate
+    from services.drill_orchestration_service import get_all_drill_constituents, compute_scope_metrics
+    from services.drill_public_service import get_public_cards
+    from models import AShareFinancialSnapshot, HKShareFinancialSnapshot
+    from middleware.auth import _resolve_eff_from_request
+    _u, eff_uid = _resolve_eff_from_request(request, db)
 
-    indices = list_drillable_indices(db, as_of_date)
-    drilled_resp = get_all_drilled_stocks(db, as_of_date)
-    all_stocks = drilled_resp.get("stocks") or []
+    # 下钻成分股聚合（用新三层 service 架构，双币种算法）
+    drilled_resp = get_all_drill_constituents(db, as_of_date, eff_uid)
+    all_stocks = (drilled_resp or {}).get("stocks") or []
 
-    # 拉最新汇率 (按 from_currency 取最大 rate_date), 用于将 est_market_value_cny 折算 CNY
-    fx_rates = {"CNY": 1.0}
-    for fc in ("USD", "HKD"):
-        rate_row = (
-            db.query(ExchangeRate)
-            .filter(ExchangeRate.from_currency == fc, ExchangeRate.to_currency == "CNY")
-            .order_by(ExchangeRate.rate_date.desc())
-            .first()
-        )
-        if rate_row:
-            fx_rates[fc] = rate_row.rate
-
-    # A / HK 检测: 按主快照判断 (drilled stocks 已含 pe_ttm/pb_mrq 等基础指标)
+    # A / HK 检测（估值是市场公共数据，不按 user 隔离 — 2026-06-25）
     a_snap_keys = {a.stock_code.split(".")[0] for a in
-                   db.query(AShareFinancialSnapshot).filter_by(as_of_date=as_of_date).all()}
+                   db.query(AShareFinancialSnapshot).filter(
+                       AShareFinancialSnapshot.as_of_date == as_of_date,
+                   ).all()}
     h_snap_keys = {h.stock_code.split(".")[0] for h in
-                   db.query(HKShareFinancialSnapshot).filter_by(as_of_date=as_of_date).all()}
+                   db.query(HKShareFinancialSnapshot).filter(
+                       HKShareFinancialSnapshot.as_of_date == as_of_date,
+                   ).all()}
     a_stocks, h_stocks = [], []
     for s in all_stocks:
         code_norm = s["stock_code"].split(".")[0]
@@ -3679,12 +4104,17 @@ def get_full_holding_summary(
         else:
             a_stocks.append(s)
 
-    drilled_card = _compute_drill_virtual_earnings(all_stocks, fx_rates=fx_rates)
-    a_card = _compute_drill_virtual_earnings(a_stocks, fx_rates=fx_rates)
-    h_card = _compute_drill_virtual_earnings(h_stocks, fx_rates=fx_rates)
+    # 4 口径指标：用与下钻卡片完全一致的算法 (compute_scope_metrics)
+    # weight_basis = shares_eq × baseline_price_cny，调和平均 PE/PB/PS，算术平均 DY
+    drilled_card = compute_scope_metrics(all_stocks)
+    a_card = compute_scope_metrics(a_stocks)
+    h_card = compute_scope_metrics(h_stocks)
 
     # CSI 300: 仅指标 (参照系, 不含金额 / 占比)
-    csi300_src = next((c for c in indices if c["index_code"] == "000300"), None)
+    # 2026-06-25：改用 drill_public_service.get_public_cards 返回的 000300 卡片，
+    # 与下钻页面 CSI300 卡片数值完全一致。
+    public_cards = get_public_cards(db, as_of_date)
+    csi300_src = next((c for c in public_cards if c["index_code"] == "000300"), None)
     if csi300_src:
         csi300_card = {
             "stock_count": csi300_src.get("stock_count"),
@@ -3714,11 +4144,14 @@ def get_timeseries(
     scope: str = Query("portfolio", pattern="^(portfolio|csi300|both)$"),
     metric: str = Query("pe_weighted", pattern="^(pe_weighted|pb_weighted|ps_weighted|virtual_earnings|total_amount)$"),
     window: int = Query(90),
+    request: Request = None,
     db: Session = Depends(get_db),
 ):
-    """序时估值时序（spec §4.6）。"""
+    """序时估值时序（portfolio 部分按 effective user 隔离 — 2026-06-24）"""
     from datetime import timedelta
     from models import AggregationTimeseries
+    from middleware.auth import _resolve_eff_from_request
+    _u, eff_uid = _resolve_eff_from_request(request, db)
     if window not in (90, 180, 360):
         raise HTTPException(status_code=422, detail=f"window must be 90, 180, or 360; got {window}")
     today_d = date.today()
@@ -3727,10 +4160,13 @@ def get_timeseries(
     out: list[dict] = []
     seen_dates: set[date] = set()
     for s in scopes:
-        rows = db.query(AggregationTimeseries).filter(
+        q = db.query(AggregationTimeseries).filter(
             AggregationTimeseries.scope == s,
             AggregationTimeseries.calc_date >= start,
-        ).order_by(AggregationTimeseries.calc_date).all()
+        )
+        if s == "portfolio":
+            q = q.filter(AggregationTimeseries.user_id == eff_uid)
+        rows = q.order_by(AggregationTimeseries.calc_date).all()
         for r in rows:
             val = getattr(r, metric, None)
             if val is None:
@@ -3763,6 +4199,7 @@ def get_timeseries(
 @app.get("/api/penetration/kpi")
 def get_kpi(
     as_of_date: date = Query(...),
+    request: Request = None,
     db: Session = Depends(get_db),
 ):
     """顶部 KPI bar 实时数据（替换硬编码）。
@@ -3782,20 +4219,25 @@ def get_kpi(
     """
     from models import FullHoldingSnapshot, AggregationCache, Holding, SecurityMaster, PriceCache, ExchangeRate
     from sqlalchemy import func as _func
+    from middleware.auth import _resolve_eff_from_request
+    _u, eff_uid = _resolve_eff_from_request(request, db)
 
     total_amount = db.query(_func.coalesce(_func.sum(FullHoldingSnapshot.amount_cny), 0)).filter(
         FullHoldingSnapshot.as_of_date == as_of_date,
+        FullHoldingSnapshot.user_id == eff_uid,
     ).scalar() or 0
     drilled_stocks = db.query(_func.count(_func.distinct(FullHoldingSnapshot.stock_code))).filter(
         FullHoldingSnapshot.as_of_date == as_of_date,
+        FullHoldingSnapshot.user_id == eff_uid,
     ).scalar() or 0
 
-    # Read _total row from cache (must be populated first)
+    # Read _total row from cache (must be populated first) — 按 user 过滤
     p_total = db.query(AggregationCache).filter(
         AggregationCache.as_of_date == as_of_date,
         AggregationCache.scope == "portfolio",
         AggregationCache.dimension == "l1",
         AggregationCache.key == "_total",
+        AggregationCache.user_id == eff_uid,
     ).first()
 
     # ----- 0. 共用：当前汇率 + 当前 Holding + PriceCache 最新价 → 实时动态市值映射 -----
@@ -3808,7 +4250,7 @@ def get_kpi(
         if r:
             fx_to_cny[fc] = r.rate
 
-    holdings = db.query(Holding).all()
+    holdings = db.query(Holding).filter(Holding.user_id == eff_uid).all()
     sm_map = {m.security_code: m for m in db.query(SecurityMaster).all()}
     # PriceCache 最新 close_px（按 stock_code）
     latest_px_cache: dict[str, float] = {}
@@ -3838,7 +4280,7 @@ def get_kpi(
     csi300_pe = None
     try:
         from services.drillable_funds import list_drillable_indices
-        indices = list_drillable_indices(db, as_of_date)
+        indices = list_drillable_indices(db, as_of_date, user_id=eff_uid)
         csi300_card = next((c for c in indices if c.get("index_code") == "000300"), None)
         if csi300_card:
             csi300_pe = csi300_card.get("weighted_pe")
@@ -4024,6 +4466,190 @@ def admin_fill_prices_tencent(
     """通过腾讯 API 拉取 current_price，填充 price_cache + 重算 dynamic PE/PB/PS。"""
     from services.price_filler import fill_prices_for_as_of
     return fill_prices_for_as_of(db, as_of_date, max_codes=max_codes)
+
+
+@app.post("/api/admin/fill-prices-all")
+def admin_fill_prices_all(
+    db: Session = Depends(get_db),
+    user: User = Depends(require_admin),
+):
+    """管理员一键增量刷新所有用户持仓的最新价格（公共数据层模式）。
+
+    设计：全用户持仓并集去重 + 增量刷新（走 RealtimePriceCache 15min TTL，
+    缓存命中跳过，过期才调 API；.OF 走 FundDailyNav）。每个唯一 code 只调一次 API，
+    避免多用户持同 code 时 API 请求爆炸。
+
+    流程：
+    1. 取所有 user 持仓的 (code, asset_type, currency) 并集去重
+    2. 对每个唯一 code 调 get_realtime_price（TTL 增量）
+    3. 遍历所有 user 的 Holding 行，用公共缓存价格回填 h.price/h.amount/h.amount_cny
+    """
+    from services.price_cache import get_realtime_price
+    from crawlers.exchange_rates import get_rate, update_rates_today
+    from models import Holding
+
+    update_rates_today(db)
+
+    # 1. 全用户持仓并集去重
+    rows = db.query(
+        Holding.security_code,
+        Holding.asset_type,
+        Holding.currency,
+    ).group_by(
+        Holding.security_code, Holding.asset_type, Holding.currency
+    ).all()
+
+    # 2. 增量刷新公共缓存（TTL 命中跳过，过期才调 API）
+    price_map = {}  # (code, asset_type, currency) -> price
+    cache_hit = 0
+    cache_refreshed = 0
+    cache_miss = 0
+    for code, asset_type, currency in rows:
+        if not code:
+            continue
+        price, source, status = get_realtime_price(db, code, asset_type, currency or 'CNY')
+        if status == "hit":
+            cache_hit += 1
+        elif status in ("refreshed", "nav"):
+            cache_refreshed += 1
+        else:  # stale / miss
+            cache_miss += 1
+        if price and price > 0:
+            price_map[(code, asset_type, currency)] = price
+
+    # 3. 回填所有 user 的 Holding 行
+    all_holdings = db.query(Holding).all()
+    holdings_updated = 0
+    for h in all_holdings:
+        key = (h.security_code, h.asset_type, h.currency)
+        price = price_map.get(key)
+        if price and price > 0:
+            h.price = round(price, 4)
+            h.amount = round(h.quantity * price, 2)
+            rate = get_rate(db, h.currency, 'CNY')
+            if rate and rate > 0:
+                h.amount_cny = round(h.amount * rate, 2)
+            else:
+                h.amount_cny = h.amount
+            holdings_updated += 1
+
+    db.commit()
+
+    return {
+        "status": "ok",
+        "unique_codes": len(rows),
+        "cache_hit": cache_hit,
+        "cache_refreshed": cache_refreshed,
+        "cache_miss": cache_miss,
+        "holdings_updated": holdings_updated,
+        "total_holdings": len(all_holdings),
+    }
+
+
+@app.post("/api/admin/refresh-analysis-prices")
+def admin_refresh_analysis_prices(
+    as_of_date: date = Query(..., description="分析页快照日期 (YYYY-MM-DD)"),
+    days: int = Query(5, ge=1, le=30, description="基金净值回补天数"),
+    max_codes: int = Query(200, ge=1, le=5000, description="单次最大处理股票数（分批触发用，避免单次超时）"),
+    db: Session = Depends(get_db),
+    user: User = Depends(require_admin),
+):
+    """管理员一键增量刷新分析页全持仓的最近收盘价（公共数据层模式）。
+
+    范围：FullHoldingSnapshot 全用户下钻持仓并集（公共表，天然跨用户）。
+    增量策略：
+    - 下钻股票 (drilled_fund + direct_stock)：调 fill_prices_for_as_of，
+      只填 AShare/HKShareFinancialSnapshot 中 current_price IS NULL 的行（不覆盖已有值）
+    - 未下钻基金 (undrilled_fund)：调 fetch_fund_nav_history 拉净值，
+      只插 FundDailyNav 中不存在的 (fund_code, trade_date) 行（ux_fdn_code_date 保证幂等）
+
+    注意：322+ 行 NULL 串行调腾讯 API 可能超 120s，用 max_codes 分批触发。
+    返回 remaining_null，admin 见 >0 则再次触发。
+    """
+    from services.price_filler import fill_prices_for_as_of
+    from services.importer import fetch_fund_nav_history
+    from models import (
+        FullHoldingSnapshot, FundDailyNav,
+        AShareFinancialSnapshot, HKShareFinancialSnapshot,
+    )
+    from datetime import date as _date, timedelta
+
+    biz = as_of_date
+
+    # 1. 下钻股票：增量填 current_price IS NULL 的 snapshot 行（不覆盖已有）
+    stock_result = fill_prices_for_as_of(db, biz, max_codes=max_codes)
+
+    # 2. 未下钻基金：增量补 FundDailyNav 缺失日期
+    funds = db.query(FullHoldingSnapshot.stock_code).filter(
+        FullHoldingSnapshot.as_of_date == biz,
+        FullHoldingSnapshot.source_type == 'undrilled_fund',
+    ).distinct().all()
+
+    funds_attempted = 0
+    funds_nav_written = 0
+    funds_skipped = 0
+    cutoff = _date.today() - timedelta(days=days)
+    for (code,) in funds:
+        if not code or not code.endswith('.OF'):
+            continue
+        funds_attempted += 1
+        # FundDailyNav.fund_code 存带后缀的完整代码（与 holdings.security_code 一致）
+        try:
+            nav_history = fetch_fund_nav_history(code.replace('.OF', ''), days=days)
+            if not nav_history:
+                funds_skipped += 1
+                continue
+            for p in nav_history:
+                try:
+                    d = _date.fromisoformat(p['date']) if isinstance(p['date'], str) else p['date']
+                except (ValueError, TypeError):
+                    continue
+                if d < cutoff:
+                    continue
+                # 增量：只插不存在的行
+                exists = db.query(FundDailyNav).filter(
+                    FundDailyNav.fund_code == code,
+                    FundDailyNav.trade_date == d,
+                ).first()
+                if exists:
+                    continue
+                db.add(FundDailyNav(
+                    fund_code=code,
+                    trade_date=d,
+                    nav=p.get('close'),
+                    source="admin_refresh",
+                ))
+                funds_nav_written += 1
+        except Exception:
+            continue
+    db.commit()
+
+    # 3. 查剩余 NULL 行数（让 admin 知道是否需要再次触发）
+    a_remaining = db.query(AShareFinancialSnapshot).filter(
+        AShareFinancialSnapshot.as_of_date == biz,
+        AShareFinancialSnapshot.current_price.is_(None),
+    ).count()
+    h_remaining = db.query(HKShareFinancialSnapshot).filter(
+        HKShareFinancialSnapshot.as_of_date == biz,
+        HKShareFinancialSnapshot.current_price.is_(None),
+    ).count()
+
+    return {
+        "status": "ok",
+        "as_of_date": biz.isoformat(),
+        "stocks": stock_result,
+        "funds": {
+            "attempted": funds_attempted,
+            "nav_rows_written": funds_nav_written,
+            "skipped_no_data": funds_skipped,
+        },
+        "remaining_null": {
+            "a_share": a_remaining,
+            "hk": h_remaining,
+            "total": a_remaining + h_remaining,
+            "hint": "如 total>0，再次触发本端点继续填充（每次最多 max_codes 只）" if (a_remaining + h_remaining) > 0 else "全部填充完成",
+        },
+    }
 
 
 # ==================== 数据新鲜度 + 数据预览 ====================
@@ -4226,16 +4852,16 @@ def get_hk_concepts(
 @app.get("/api/penetration/drillable-indices")
 def get_drillable_indices(
     as_of_date: date = Query(...),
+    request: Request = None,
     db: Session = Depends(get_db),
 ):
-    """列出所有可下钻的基金（卡片列表）。
-
-    每张卡片: 基金代码/名称/指数/成分股数/静态金额/估算市值/估算偏差%/组合占比/加权 PE PB PS 股息率
-    """
-    from services.drillable_funds import list_drillable_indices
+    """下钻卡片列表 — 调 orchestration service（三层解耦架构）"""
+    from services.drill_orchestration_service import list_drillable_cards
+    from middleware.auth import _resolve_eff_from_request
+    _u, eff_uid = _resolve_eff_from_request(request, db)
     return {
         "as_of_date": as_of_date.isoformat(),
-        "indices": list_drillable_indices(db, as_of_date),
+        "indices": list_drillable_cards(db, as_of_date, eff_uid) if eff_uid else [],
     }
 
 
@@ -4243,24 +4869,32 @@ def get_drillable_indices(
 def get_fund_drill(
     index_code: str = Query(...),
     as_of_date: date = Query(...),
+    request: Request = None,
     db: Session = Depends(get_db),
 ):
-    """单一基金下钻明细：每只成分股的约当数量 + 昨日最新股价 + 估值指标。"""
-    from services.drillable_funds import get_index_drill_detail
-    return get_index_drill_detail(db, index_code, as_of_date)
+    """下钻明细 — 调 orchestration service（三层解耦架构）"""
+    from services.drill_orchestration_service import get_drill_detail
+    from middleware.auth import _resolve_eff_from_request
+    _u, eff_uid = _resolve_eff_from_request(request, db)
+    if not eff_uid:
+        raise HTTPException(401, "请登录")
+    result = get_drill_detail(db, as_of_date, index_code, eff_uid)
+    if result is None:
+        raise HTTPException(404, "无下钻数据（可能无 snapshot 或无持仓）")
+    return result
 
 
 @app.get("/api/penetration/all-drilled-stocks")
-def get_all_drilled_stocks(
+def all_drilled_stocks_endpoint(
     as_of_date: date = Query(...),
+    request: Request = None,
     db: Session = Depends(get_db),
 ):
-    """跨所有可下钻指数聚合成分股 (drill 算法同 index-drill, 同一股票求和).
-
-    全持仓页面用：直接持股 + 此处的成分股 → 拆分「下钻 / 未下钻」两段渲染。
-    """
-    from services.drillable_funds import get_all_drilled_stocks
-    return get_all_drilled_stocks(db, as_of_date)
+    """跨所有可下钻指数聚合成分股 (按 effective user 隔离 — 2026-06-24)。"""
+    from middleware.auth import _resolve_eff_from_request
+    from services.drillable_funds import get_all_drilled_stocks as svc_get_all_drilled_stocks
+    _u, eff_uid = _resolve_eff_from_request(request, db)
+    return svc_get_all_drilled_stocks(db, as_of_date, user_id=eff_uid)
 
 
 # ============================================================================
@@ -4511,26 +5145,849 @@ def admin_analyst_ingest(db: Session = Depends(get_db)):
 @app.get("/api/analyst/core-companies")
 def analyst_core_companies(
     as_of_date: date = Query(...),
+    request: Request = None,
     db: Session = Depends(get_db),
 ):
-    """核心公司卡片：报告 + 组合权重 + PE/PB/PS + 最新收盘价。"""
-    return get_core_companies(db, as_of_date)
+    """核心公司卡片（按 effective user 隔离 — 2026-06-24）。"""
+    from middleware.auth import _resolve_eff_from_request
+    _u, eff_uid = _resolve_eff_from_request(request, db)
+    return get_core_companies(db, as_of_date, user_id=eff_uid)
 
 
 @app.get("/api/analyst/stock/{code}")
 def analyst_stock_detail(
     code: str,
     as_of_date: date = Query(...),
+    request: Request = None,
     db: Session = Depends(get_db),
 ):
-    """单只股票详情：来源基金（约当数量）+ 报告内容。"""
-    return get_stock_detail(db, code, as_of_date)
+    """单只股票详情（按 effective user 隔离 — 2026-06-24）。"""
+    from middleware.auth import _resolve_eff_from_request
+    _u, eff_uid = _resolve_eff_from_request(request, db)
+    return get_stock_detail(db, code, as_of_date, user_id=eff_uid)
 
 
 @app.get("/api/analyst/industry-chains")
 def analyst_industry_chains(
     as_of_date: date = Query(...),
+    request: Request = None,
     db: Session = Depends(get_db),
 ):
-    """产业链卡片：只返回当前 portfolio 持仓中的公司。"""
-    return get_industry_chains(db, as_of_date)
+    """产业链卡片（按 effective user 隔离 — 2026-06-24）。"""
+    from middleware.auth import _resolve_eff_from_request
+    _u, eff_uid = _resolve_eff_from_request(request, db)
+    return get_industry_chains(db, as_of_date, user_id=eff_uid)
+
+
+# ========== Admin: 证券主数据 ==========
+
+@app.get("/api/admin/security-master")
+def admin_list_securities(
+    type: str | None = None,
+    market: str | None = None,
+    drillable: bool | None = None,
+    search: str | None = None,
+    page: int = 1,
+    page_size: int = 50,
+    db: Session = Depends(get_db),
+):
+    """列出证券主数据（分页+筛选）。"""
+    from services.security_master_service import list_securities
+    return list_securities(db, sec_type=type, market=market, drillable=drillable, search=search, page=page, page_size=page_size)
+
+
+@app.post("/api/admin/security-master")
+def admin_create_security(body: dict = Body(...), db: Session = Depends(get_db)):
+    """新增证券主数据。"""
+    from services.security_master_service import create_security
+    return create_security(db, body)
+
+
+@app.put("/api/admin/security-master/{code}")
+def admin_update_security(code: str, body: dict = Body(...), db: Session = Depends(get_db)):
+    """更新证券主数据。"""
+    from services.security_master_service import update_security
+    result = update_security(db, code, body)
+    if not result:
+        raise HTTPException(404, "证券不存在")
+    return result
+
+
+@app.delete("/api/admin/security-master/{code}")
+def admin_delete_security(code: str, db: Session = Depends(get_db)):
+    """删除证券主数据（有持仓时禁止）。"""
+    from services.security_master_service import delete_security
+    try:
+        ok = delete_security(db, code)
+        if not ok:
+            raise HTTPException(404, "证券不存在")
+        return {"status": "ok"}
+    except ValueError as e:
+        raise HTTPException(400, str(e))
+
+
+@app.post("/api/admin/security-master/sync-from-holdings")
+def admin_sync_from_holdings(db: Session = Depends(get_db)):
+    """从持仓同步证券主数据。"""
+    from services.security_master_service import sync_from_holdings
+    count = sync_from_holdings(db)
+    return {"status": "ok", "synced": count}
+
+
+@app.post("/api/admin/security-master/sync-from-drill")
+def admin_sync_from_drill(db: Session = Depends(get_db)):
+    """从下钻 snapshot 同步证券主数据。"""
+    from services.security_master_service import sync_from_drill
+    count = sync_from_drill(db)
+    return {"status": "ok", "synced": count}
+
+
+@app.post("/api/admin/security-master/init")
+def admin_init_security_master(db: Session = Depends(get_db)):
+    """初始化证券主数据（从现有数据批量导入）。"""
+    from services.security_master_service import init_from_existing
+    count = init_from_existing(db)
+    return {"status": "ok", "initialized": count}
+
+
+# ========== Admin: 基金-指数映射 ==========
+
+@app.get("/api/admin/fund-index-map")
+def admin_list_fund_index_map(
+    search: str | None = None,
+    page: int = 1,
+    page_size: int = 50,
+    db: Session = Depends(get_db),
+):
+    """列出基金-指数映射。"""
+    q = db.query(FundIndexMap)
+    if search:
+        like = f"%{search}%"
+        q = q.filter(FundIndexMap.fund_code.like(like) | FundIndexMap.fund_name.like(like) | FundIndexMap.index_code.like(like))
+    total = q.count()
+    rows = q.order_by(FundIndexMap.fund_code).offset((page - 1) * page_size).limit(page_size).all()
+    return {"items": [{"fund_code": r.fund_code, "fund_name": r.fund_name, "index_code": r.index_code, "index_name": r.index_name, "benchmark_formula": r.benchmark_formula, "as_of_date": r.as_of_date.isoformat(), "source": r.source} for r in rows], "total": total, "page": page, "page_size": page_size}
+
+
+@app.post("/api/admin/fund-index-map")
+def admin_create_fund_index_map(body: dict = Body(...), db: Session = Depends(get_db)):
+    """新增基金-指数映射。"""
+    # as_of_date 可能是字符串或 date 对象，统一转为 date
+    raw_date = body.get("as_of_date", date.today())
+    if isinstance(raw_date, str):
+        raw_date = date.fromisoformat(raw_date)
+    fm = FundIndexMap(
+        fund_code=body["fund_code"], fund_name=body.get("fund_name"),
+        index_code=body["index_code"], index_name=body.get("index_name"),
+        benchmark_formula=body.get("benchmark_formula"),
+        as_of_date=raw_date,
+        source=body.get("source", "manual"),
+    )
+    db.add(fm)
+    db.commit()
+    return {"status": "ok", "fund_code": fm.fund_code}
+
+
+@app.put("/api/admin/fund-index-map/{fund_code}/{as_of_date}")
+def admin_update_fund_index_map(fund_code: str, as_of_date: date, body: dict = Body(...), db: Session = Depends(get_db)):
+    """更新基金-指数映射。"""
+    fm = db.query(FundIndexMap).filter(FundIndexMap.fund_code == fund_code, FundIndexMap.as_of_date == as_of_date).first()
+    if not fm:
+        raise HTTPException(404, "映射不存在")
+    for key in ("fund_name", "index_code", "index_name", "benchmark_formula", "source"):
+        if key in body:
+            setattr(fm, key, body[key])
+    db.commit()
+    return {"status": "ok"}
+
+
+@app.delete("/api/admin/fund-index-map/{fund_code}/{as_of_date}")
+def admin_delete_fund_index_map(fund_code: str, as_of_date: date, db: Session = Depends(get_db)):
+    """删除基金-指数映射。"""
+    fm = db.query(FundIndexMap).filter(FundIndexMap.fund_code == fund_code, FundIndexMap.as_of_date == as_of_date).first()
+    if not fm:
+        raise HTTPException(404, "映射不存在")
+    db.delete(fm)
+    db.commit()
+    return {"status": "ok"}
+
+
+# ========== Admin: 数据就绪 + 任务历史 ==========
+
+@app.get("/api/admin/data-readiness")
+def admin_data_readiness(as_of_date: date = Query(...), db: Session = Depends(get_db)):
+    """查询数据就绪状态。"""
+    from services.data_readiness_service import get_data_readiness
+    return {"as_of_date": as_of_date.isoformat(), "items": get_data_readiness(db, as_of_date)}
+
+
+@app.get("/api/admin/data-pull-tasks")
+def admin_list_data_pull_tasks(
+    status: str | None = None,
+    date_from: datetime | None = None,
+    date_to: datetime | None = None,
+    page: int = 1,
+    page_size: int = 50,
+    db: Session = Depends(get_db),
+):
+    """查询数据拉取任务历史。"""
+    from services.data_pull_task_service import list_tasks
+    return list_tasks(db, status=status, date_from=date_from, date_to=date_to, page=page, page_size=page_size)
+
+
+@app.post("/api/admin/data-pull-tasks/trigger/{job_id}")
+def admin_trigger_data_pull_task(job_id: str, request: Request):
+    """手动触发数据拉取任务。"""
+    # 简单实现：返回 job_id，实际触发逻辑在 Task 7 集成 scheduler
+    user_id = getattr(request.state, 'user_id', None) or getattr(request.state, 'user', None)
+    triggered_by = f"manual:{user_id}" if user_id else "manual"
+    return {"status": "ok", "job_id": job_id, "triggered_by": triggered_by, "message": "触发请求已记录，Task 7 将集成 scheduler"}
+
+
+# ========== 内容上传端点（子项目 2）==========
+
+# 解析结果内存缓存：{task_id: {index_code, as_of_date, constituents, parsed_at}}
+_parse_cache: dict[str, dict] = {}
+_PARSE_CACHE_TTL = 3600  # 1 小时
+
+
+def _cleanup_parse_cache():
+    """清理过期的解析缓存。"""
+    now = time.time()
+    expired = [k for k, v in _parse_cache.items() if now - v["parsed_at"] > _PARSE_CACHE_TTL]
+    for k in expired:
+        del _parse_cache[k]
+
+
+@app.post("/api/admin/upload/index-pdf")
+async def admin_upload_index_pdf(
+    index_code: str = Form(...),
+    as_of_date: str = Form(...),
+    file: UploadFile = File(...),
+    db: Session = Depends(get_db),
+):
+    """上传指数构成 PDF，返回解析预览。"""
+    from services.upload_service import save_upload_file
+    from services.pdf_parser_service import parse_index_pdf
+
+    _cleanup_parse_cache()
+
+    # 保存文件
+    relative_path = save_upload_file(file, "pdf")
+
+    # 解析 PDF
+    full_path = os.path.join(os.path.dirname(__file__), relative_path)
+    result = parse_index_pdf(full_path, index_code)
+
+    if not result.success:
+        return {
+            "status": "parse_failed",
+            "method": result.method,
+            "error": result.error,
+            "preview": [],
+        }
+
+    # 暂存解析结果
+    task_id = secrets.token_urlsafe(8)
+    _parse_cache[task_id] = {
+        "index_code": index_code,
+        "as_of_date": as_of_date,
+        "constituents": result.constituents,
+        "parsed_at": time.time(),
+    }
+
+    return {
+        "status": "success",
+        "task_id": task_id,
+        "method": result.method,
+        "preview": result.constituents,
+    }
+
+
+@app.post("/api/admin/upload/index-pdf/confirm")
+def admin_confirm_index_pdf(
+    body: dict = Body(...),
+    db: Session = Depends(get_db),
+):
+    """确认写入指数成分股。"""
+    from models import IndexConstituentSnapshot
+    from datetime import date as _date
+
+    _cleanup_parse_cache()
+
+    task_id = body.get("task_id")
+    if not task_id or task_id not in _parse_cache:
+        raise HTTPException(404, "task_id 不存在或已过期")
+
+    cached = _parse_cache.pop(task_id)
+    as_of = _date.fromisoformat(cached["as_of_date"])
+    index_code = cached["index_code"]
+
+    # 删除旧数据（同 index_code + as_of_date）
+    db.query(IndexConstituentSnapshot).filter(
+        IndexConstituentSnapshot.as_of_date == as_of,
+        IndexConstituentSnapshot.index_code == index_code,
+    ).delete()
+
+    # 写入新数据
+    saved = 0
+    for c in cached["constituents"]:
+        stock_code = c.get("stock_code", "")
+        if not stock_code:
+            continue
+        snap = IndexConstituentSnapshot(
+            as_of_date=as_of,
+            index_code=index_code,
+            stock_code=stock_code,
+            stock_name=c.get("stock_name"),
+            weight=c.get("weight"),
+        )
+        db.add(snap)
+        saved += 1
+
+    db.commit()
+    return {"status": "ok", "saved": saved}
+
+
+@app.post("/api/admin/upload/analyst-report")
+async def admin_upload_analyst_report(
+    files: List[UploadFile] = File(...),
+    db: Session = Depends(get_db),
+):
+    """上传股票分析报告 DOCX（支持多文件）。"""
+    from services.upload_service import save_upload_file
+    from services.analyst_parser import parse_company_report, _parse_stock_code_from_filename
+    from models import AnalystCompanyReport
+
+    results = []
+    for file in files:
+        filename = file.filename or ""
+        try:
+            # 从文件名解析股票代码
+            stock_code, _ = _parse_stock_code_from_filename(filename)
+            if not stock_code:
+                results.append({
+                    "filename": filename,
+                    "stock_code": None,
+                    "status": "error",
+                    "error": "无法解析股票代码（文件名需包含 6 位数字 + .SH/.SZ/.HK）",
+                })
+                continue
+
+            # 保存文件
+            relative_path = save_upload_file(file, "doc")
+            full_path = os.path.join(os.path.dirname(__file__), relative_path)
+
+            # 解析 DOCX
+            parsed = parse_company_report(full_path)
+
+            # Upsert 到 AnalystCompanyReport
+            existing = db.query(AnalystCompanyReport).filter(
+                AnalystCompanyReport.stock_code == stock_code
+            ).first()
+
+            if existing:
+                existing.stock_name = parsed.get("stock_name")
+                existing.section_1_market_focus = parsed.get("section_1_market_focus")
+                existing.section_2_core_competence = parsed.get("section_2_core_competence")
+                existing.section_3_supply_demand = parsed.get("section_3_supply_demand")
+                existing.section_4_marginal_change = parsed.get("section_4_marginal_change")
+                existing.section_5_valuation = parsed.get("section_5_valuation")
+                existing.section_6_risk = parsed.get("section_6_risk")
+                existing.raw_text = parsed.get("raw_text")
+                existing.source_file = relative_path
+            else:
+                report = AnalystCompanyReport(
+                    stock_code=stock_code,
+                    stock_name=parsed.get("stock_name"),
+                    section_1_market_focus=parsed.get("section_1_market_focus"),
+                    section_2_core_competence=parsed.get("section_2_core_competence"),
+                    section_3_supply_demand=parsed.get("section_3_supply_demand"),
+                    section_4_marginal_change=parsed.get("section_4_marginal_change"),
+                    section_5_valuation=parsed.get("section_5_valuation"),
+                    section_6_risk=parsed.get("section_6_risk"),
+                    raw_text=parsed.get("raw_text"),
+                    source_file=relative_path,
+                )
+                db.add(report)
+
+            db.commit()
+            results.append({
+                "filename": filename,
+                "stock_code": stock_code,
+                "status": "success",
+                "error": None,
+            })
+
+        except Exception as e:
+            results.append({
+                "filename": filename,
+                "stock_code": None,
+                "status": "error",
+                "error": str(e),
+            })
+
+    return {"results": results}
+
+
+@app.post("/api/admin/upload/industry-chain")
+async def admin_upload_industry_chain(
+    chain_name: str = Form(...),
+    summary_file: UploadFile = File(...),
+    company_list_file: UploadFile = File(...),
+    db: Session = Depends(get_db),
+):
+    """上传产业链报告（总结 MD + 公司清单 MD）。"""
+    from services.upload_service import save_upload_file
+    from services.analyst_parser import parse_chain_summary, parse_chain_company_list
+    from models import AnalystIndustryChain, AnalystIndustryChainCompany
+
+    # 保存文件
+    summary_path = save_upload_file(summary_file, "md")
+    company_path = save_upload_file(company_list_file, "md")
+
+    summary_full = os.path.join(os.path.dirname(__file__), summary_path)
+    company_full = os.path.join(os.path.dirname(__file__), company_path)
+
+    # 解析
+    summary_parsed = parse_chain_summary(summary_full)
+    company_parsed = parse_chain_company_list(company_full)
+
+    # Upsert 产业链总结
+    existing_chain = db.query(AnalystIndustryChain).filter(
+        AnalystIndustryChain.chain_name == chain_name
+    ).first()
+
+    if existing_chain:
+        existing_chain.narrative_md = summary_parsed.get("narrative_md")
+        existing_chain.source_file = summary_path
+    else:
+        chain = AnalystIndustryChain(
+            chain_name=chain_name,
+            narrative_md=summary_parsed.get("narrative_md"),
+            source_file=summary_path,
+        )
+        db.add(chain)
+
+    # 删除旧公司清单并写入新清单
+    db.query(AnalystIndustryChainCompany).filter(
+        AnalystIndustryChainCompany.chain_name == chain_name
+    ).delete()
+
+    companies_saved = 0
+    for c in company_parsed.get("companies", []):
+        company = AnalystIndustryChainCompany(
+            chain_name=chain_name,
+            chain_position=c.get("chain_position", ""),
+            sub_segment=c.get("sub_segment"),
+            company_name=c.get("company_name", ""),
+            stock_code=c.get("stock_code"),
+            market_cap_range=c.get("market_cap_range"),
+            relevance_stars=c.get("relevance_stars"),
+            relevance_reason=c.get("relevance_reason"),
+            latest_progress=c.get("latest_progress"),
+            order_visibility=c.get("order_visibility"),
+            earnings_elasticity=c.get("earnings_elasticity"),
+            customer_onboarding=c.get("customer_onboarding"),
+            source_file=company_path,
+        )
+        db.add(company)
+        companies_saved += 1
+
+    db.commit()
+    return {
+        "status": "success",
+        "chain_saved": True,
+        "companies_saved": companies_saved,
+    }
+
+
+from services.financial_upload_service import upsert_financial_single, import_excel_batch
+
+
+@app.post("/api/admin/upload/financials/single")
+def admin_upload_financials_single(
+    body: dict = Body(...),
+    db: Session = Depends(get_db),
+):
+    """单条财务数据上传。"""
+    try:
+        result = upsert_financial_single(db, body)
+        return result
+    except ValueError as e:
+        raise HTTPException(400, str(e))
+
+
+@app.post("/api/admin/upload/financials")
+async def admin_upload_financials_excel(
+    market: str = Form(...),
+    as_of_date: str = Form(...),
+    file: UploadFile = File(...),
+    db: Session = Depends(get_db),
+):
+    """Excel 批量上传财务数据。"""
+    from services.upload_service import save_upload_file
+
+    # 保存文件
+    relative_path = save_upload_file(file, "csv")
+    full_path = os.path.join(os.path.dirname(__file__), relative_path)
+
+    # 解析日期
+    as_of = date.fromisoformat(as_of_date)
+
+    # 导入
+    result = import_excel_batch(db, full_path, market, as_of)
+    return result
+
+
+@app.get("/api/admin/overseas-financials")
+def admin_list_overseas_financials(
+    market: str = Query(None),
+    page: int = Query(1, ge=1),
+    page_size: int = Query(50, ge=1, le=200),
+    db: Session = Depends(get_db),
+):
+    """查看海外财务数据快照。"""
+    query = db.query(OverseasShareFinancialSnapshot)
+    if market:
+        query = query.filter(OverseasShareFinancialSnapshot.market == market)
+    total = query.count()
+    items = query.order_by(OverseasShareFinancialSnapshot.as_of_date.desc()) \
+        .offset((page - 1) * page_size).limit(page_size).all()
+    return {
+        "items": [{
+            "stock_code": s.stock_code,
+            "stock_name": s.stock_name,
+            "market": s.market,
+            "as_of_date": str(s.as_of_date),
+            "pe_ttm": s.pe_ttm,
+            "pb_mrq": s.pb_mrq,
+            "ps_ttm": s.ps_ttm,
+            "dividend_yield": s.dividend_yield,
+            "market_cap": s.market_cap,
+            "sector": s.sector,
+            "industry": s.industry,
+            "source": s.source,
+        } for s in items],
+        "total": total,
+    }
+
+
+@app.post("/api/admin/overseas-financials/refresh")
+def admin_refresh_overseas_financials(db: Session = Depends(get_db)):
+    """手动触发海外财务数据更新。"""
+    from services.overseas_financial_service import fetch_and_store_overseas_financials
+    overseas_holdings = db.query(Holding).filter(
+        Holding.asset_type.in_([
+            AssetType.US_STOCK.value,
+            AssetType.US_ETF.value,
+        ])
+    ).all()
+    overseas_codes = list(set(h.security_code for h in overseas_holdings))
+    if not overseas_codes:
+        return {"status": "ok", "fetched": 0, "stored": 0, "errors": ["无海外持仓"]}
+    result = fetch_and_store_overseas_financials(db, overseas_codes, date.today())
+    return result
+
+
+# ==================== 交易记录驱动的持仓重建 (2026-06-26) ====================
+
+@app.post("/api/trades/parse", response_model=TradeParseResponse)
+def parse_trades_endpoint(
+    req: TradeParseRequest,
+    user: User = Depends(require_user),
+    db: Session = Depends(get_db),
+):
+    """解析粘贴的交易记录文本，对新代码自动入库。
+
+    流程：
+    1. 调 parse_trades_with_llm 解析文本
+    2. 对每条交易的 security_code 查 SecurityMaster；不存在则调 onboard_new_security
+    3. 返回解析结果 + 每条交易的证券状态
+    """
+    from models import SecurityMaster
+    write_uid = user.id  # POST 写入用 user.id（不支持 view_as 写入）
+
+    parsed = parse_trades_with_llm(req.text)
+    if parsed is None:
+        return TradeParseResponse(trades=[], parse_error="LLM 解析失败，请检查文本格式或检查 LLM_API_KEY 配置")
+
+    items: list[ParsedTradeItem] = []
+    for t in parsed:
+        code = (t.get("security_code") or "").strip()
+        name = (t.get("security_name") or "").strip()
+        status = "exists"
+        message = None
+
+        # 查 SecurityMaster，不存在则 onboard
+        sm = db.query(SecurityMaster).filter_by(security_code=code).first() if code else None
+        if code and not sm:
+            try:
+                result = onboard_new_security(db, code, name, context="trades/parse")
+                status = "new_verified" if result.get("security_verified") else "new_unverified"
+                message = result.get("message")
+                db.commit()
+            except Exception as e:
+                db.rollback()
+                status = "failed"
+                message = f"入库失败: {e}"
+
+        items.append(ParsedTradeItem(
+            trade_date=t.get("trade_date"),
+            security_code=code,
+            security_name=name,
+            trade_type=t.get("trade_type", "buy"),
+            confirmed_shares=float(t.get("confirmed_shares") or 0.0),
+            confirmed_amount=float(t.get("confirmed_amount") or 0.0),
+            nav_price=t.get("nav_price"),
+            nav_date=t.get("nav_date"),
+            fee=t.get("fee"),
+            remarks=t.get("remarks"),
+            security_status=status,
+            security_message=message,
+        ))
+
+    return TradeParseResponse(trades=items, parse_error=None)
+
+
+@app.post("/api/trades/confirm", response_model=TradeConfirmResponse)
+def confirm_trades_endpoint(
+    req: TradeConfirmRequest,
+    user: User = Depends(require_user),
+    db: Session = Depends(get_db),
+):
+    """用户确认提交交易，写入 Transaction 表并触发重算。
+
+    流程：
+    1. 逐条 upsert 到 Transaction 表（按唯一约束去重）
+    2. 调 rebuild_holdings_to_date 重算到今天
+    3. 返回最新持仓快照
+    """
+    from models import Transaction, SecurityMaster
+    write_uid = user.id  # POST 写入用 user.id
+
+    today = date.today()
+    confirmed_count = 0
+    for item in req.trades:
+        # upsert：按唯一约束 (user_id, trade_date, security_code, trade_type, confirmed_amount) 去重
+        existing = db.query(Transaction).filter(
+            Transaction.user_id == write_uid,
+            Transaction.trade_date == item.trade_date,
+            Transaction.security_code == item.security_code,
+            Transaction.trade_type == item.trade_type,
+            Transaction.confirmed_amount == item.confirmed_amount,
+        ).first()
+        if existing:
+            # 更新可编辑字段
+            existing.security_name = item.security_name
+            existing.confirmed_shares = item.confirmed_shares
+            existing.nav_price = item.nav_price
+            existing.nav_date = item.nav_date
+            existing.fee = item.fee
+            existing.remarks = item.remarks
+        else:
+            sm_exists = db.query(SecurityMaster).filter_by(security_code=item.security_code).first() is not None
+            db.add(Transaction(
+                user_id=write_uid,
+                trade_date=item.trade_date,
+                security_code=item.security_code,
+                security_name=item.security_name,
+                trade_type=item.trade_type,
+                confirmed_shares=item.confirmed_shares,
+                confirmed_amount=item.confirmed_amount,
+                nav_price=item.nav_price,
+                nav_date=item.nav_date,
+                fee=item.fee,
+                remarks=item.remarks,
+                security_verified=sm_exists,
+                security_added_to_master=sm_exists,
+                import_batch=f"confirm_{today.isoformat()}",
+            ))
+            db.flush()  # autoflush=False：确保同批次后续 query 能查到，防止重复 add 触发 UniqueViolation
+            confirmed_count += 1
+    db.commit()
+
+    # 触发重算到今天（增量）
+    rebuild_holdings_to_date(db, write_uid, today, force=False)
+
+    # 返回最新日持仓快照
+    snapshot_rows = get_snapshot_for_date(db, write_uid, today) or []
+    return TradeConfirmResponse(
+        confirmed_count=confirmed_count,
+        latest_snapshot=[HoldingSnapshotOut(**row) for row in snapshot_rows],
+    )
+
+
+@app.get("/api/trades", response_model=list[TradeOut])
+def list_trades(
+    start_date: date | None = None,
+    end_date: date | None = None,
+    request: Request = None,
+    user: User = Depends(require_user),
+    db: Session = Depends(get_db),
+):
+    """查询交易记录列表（支持日期范围过滤）。"""
+    from models import Transaction
+    from middleware.auth import _resolve_eff_from_request
+    _u, eff_uid = _resolve_eff_from_request(request, db)
+    q = db.query(Transaction).filter(Transaction.user_id == eff_uid)
+    if start_date:
+        q = q.filter(Transaction.trade_date >= start_date)
+    if end_date:
+        q = q.filter(Transaction.trade_date <= end_date)
+    rows = q.order_by(Transaction.trade_date.desc()).all()
+    return [TradeOut.model_validate(r) for r in rows]
+
+
+@app.put("/api/trades/{trade_id}", response_model=TradeOut)
+def update_trade(
+    trade_id: int,
+    req: TradeUpdateRequest,
+    user: User = Depends(require_user),
+    db: Session = Depends(get_db),
+):
+    """更新单条历史交易，触发全量重算（编辑历史交易后，从该日期起的快照需刷新）。
+
+    流程：
+    1. 查找交易记录（by id + user_id，不支持 view_as 写入）
+    2. 更新可编辑字段
+    3. force=True 全量重算到今天
+    """
+    from models import Transaction
+    write_uid = user.id
+
+    trade = db.query(Transaction).filter(
+        Transaction.id == trade_id,
+        Transaction.user_id == write_uid,
+    ).first()
+    if not trade:
+        from fastapi import HTTPException
+        raise HTTPException(404, "交易记录不存在")
+
+    # 记录旧日期，用于确定重算起点
+    old_date = trade.trade_date
+
+    # 更新字段
+    trade.trade_date = req.trade_date
+    trade.security_code = req.security_code
+    trade.security_name = req.security_name
+    trade.trade_type = req.trade_type
+    trade.confirmed_shares = req.confirmed_shares
+    trade.confirmed_amount = req.confirmed_amount
+    trade.nav_price = req.nav_price
+    trade.nav_date = req.nav_date
+    trade.fee = req.fee
+    trade.remarks = req.remarks
+    db.commit()
+
+    # 编辑历史交易 → 从该交易日期起增量重算（非全量，性能更优）
+    # 回退 last_rebuild_date，让 rebuild_holdings_to_date(force=False) 覆盖该日期
+    from datetime import timedelta
+    from models import TradingSession as _TS
+    rebuild_from = min(old_date, req.trade_date)
+    sess = db.query(_TS).filter(_TS.user_id == write_uid).first()
+    if sess:
+        new_last = rebuild_from - timedelta(days=1)
+        if not sess.last_rebuild_date or new_last < sess.last_rebuild_date:
+            sess.last_rebuild_date = new_last
+            db.flush()
+    rebuild_holdings_to_date(db, write_uid, date.today(), force=False)
+
+    return TradeOut.model_validate(trade)
+
+
+@app.delete("/api/trades/{trade_id}")
+def delete_trade(
+    trade_id: int,
+    user: User = Depends(require_user),
+    db: Session = Depends(get_db),
+):
+    """删除单条历史交易，触发从该日期起的增量重算。"""
+    from models import Transaction
+    from fastapi import HTTPException
+    write_uid = user.id
+
+    trade = db.query(Transaction).filter(
+        Transaction.id == trade_id,
+        Transaction.user_id == write_uid,
+    ).first()
+    if not trade:
+        raise HTTPException(404, "交易记录不存在")
+
+    # 记录删除前日期，用于确定重算起点
+    rebuild_from = trade.trade_date
+
+    db.delete(trade)
+    db.commit()
+
+    # 删除历史交易 → 从该日期起增量重算（非全量，性能更优）
+    from datetime import timedelta
+    from models import TradingSession as _TS
+    sess = db.query(_TS).filter(_TS.user_id == write_uid).first()
+    if sess:
+        new_last = rebuild_from - timedelta(days=1)
+        if not sess.last_rebuild_date or new_last < sess.last_rebuild_date:
+            sess.last_rebuild_date = new_last
+            db.flush()
+    rebuild_holdings_to_date(db, write_uid, date.today(), force=False)
+
+    return {"ok": True, "deleted_id": trade_id}
+
+
+@app.get("/api/trading-session", response_model=TradingSessionOut | None)
+def get_trading_session_endpoint(
+    request: Request,
+    user: User = Depends(require_user),
+    db: Session = Depends(get_db),
+):
+    """查询当前用户的交易会话（起始日、最近重算日等）。"""
+    from models import TradingSession
+    from middleware.auth import _resolve_eff_from_request
+    _u, eff_uid = _resolve_eff_from_request(request, db)
+    ts = db.query(TradingSession).filter_by(user_id=eff_uid).first()
+    return TradingSessionOut.model_validate(ts) if ts else None
+
+
+@app.get("/api/holdings/snapshot", response_model=list[HoldingSnapshotOut])
+def get_snapshot_endpoint(
+    as_of: date,
+    request: Request,
+    user: User = Depends(require_user),
+    db: Session = Depends(get_db),
+):
+    """查询某日持仓快照（含 CASH 行）。"""
+    from middleware.auth import _resolve_eff_from_request
+    _u, eff_uid = _resolve_eff_from_request(request, db)
+    rows = get_snapshot_for_date(db, eff_uid, as_of)
+    if rows is None:
+        return []
+    return [HoldingSnapshotOut(**row) for row in rows]
+
+
+@app.get("/api/holdings/snapshot-range", response_model=SnapshotRangeOut)
+def get_snapshot_range_endpoint(
+    request: Request,
+    user: User = Depends(require_user),
+    db: Session = Depends(get_db),
+):
+    """查询快照日期范围（用于前端日期控件 min/max）。"""
+    from middleware.auth import _resolve_eff_from_request
+    _u, eff_uid = _resolve_eff_from_request(request, db)
+    rng = get_snapshot_date_range(db, eff_uid)
+    if rng is None:
+        return SnapshotRangeOut(start_date=None, end_date=None)
+    return SnapshotRangeOut(start_date=rng[0], end_date=rng[1])
+
+
+@app.get("/api/holdings/daily-trades", response_model=list[TradeOut])
+def get_daily_trades_endpoint(
+    as_of: date,
+    request: Request,
+    user: User = Depends(require_user),
+    db: Session = Depends(get_db),
+):
+    """查询某日交易记录（用于估值表当日交易可视）。"""
+    from middleware.auth import _resolve_eff_from_request
+    _u, eff_uid = _resolve_eff_from_request(request, db)
+    rows = get_trades_for_date(db, eff_uid, as_of)
+    return [TradeOut(**row) for row in rows]

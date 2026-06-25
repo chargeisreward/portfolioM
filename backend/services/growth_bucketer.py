@@ -51,10 +51,13 @@ class GrowthBucketer:
         return GrowthTier.LOW.value
 
     def compute_portfolio_growth_distribution(
-        self, thresholds: dict
+        self, thresholds: dict, user_id: int | None = None
     ) -> dict[str, float]:
-        """计算组合的增长层级分布"""
-        results = self.db.query(PenetrationResult).all()
+        """计算组合的增长层级分布（user_id=None 表示全部 — 仅供 admin/共享主数据场景；常规调用须传 user_id）"""
+        q = self.db.query(PenetrationResult)
+        if user_id is not None:
+            q = q.filter(PenetrationResult.user_id == user_id)
+        results = q.all()
 
         distribution = {"high": 0.0, "medium": 0.0, "low": 0.0, "unknown": 0.0}
 

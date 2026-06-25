@@ -15,3 +15,9 @@ numpy==1.26.4
 pandas==2.2.2
 psycopg[binary]==3.2.3
 chinese-calendar==1.11.0
+bcrypt==4.1.2
+pdfplumber>=0.11.0
+pytesseract>=0.3.10
+Pillow>=10.0.0
+pdf2image>=1.17.0
+python-multipart

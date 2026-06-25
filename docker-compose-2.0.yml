@@ -1,0 +1,56 @@
+# PortfolioM 2.0 — 独立部署 docker-compose
+# 与原版 portfoliom 完全隔离：独立容器名 + 端口 + PG volume
+# 用法: docker compose -f docker-compose-2.0.yml up -d --build
+
+services:
+  # ─── PostgreSQL（独立 volume，与原版 pg_data 隔离）───
+  pg:
+    image: postgres:16-alpine
+    container_name: portfoliom2-pg
+    restart: unless-stopped
+    environment:
+      POSTGRES_USER: portfoliom
+      POSTGRES_PASSWORD: ${PG_PASSWORD:-portfoliom2_prod}
+      POSTGRES_DB: portfoliom
+    volumes:
+      - pg2_data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U portfoliom"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
+  # ─── Backend (FastAPI) ───
+  backend:
+    build: ./backend
+    container_name: portfoliom2-backend
+    restart: unless-stopped
+    depends_on:
+      pg:
+        condition: service_healthy
+    environment:
+      DATABASE_URL: "postgresql+psycopg://portfoliom:${PG_PASSWORD:-portfoliom2_prod}@pg:5432/portfoliom"
+      LLM_API_KEY: ${LLM_API_KEY}
+      LLM_API_BASE: ${LLM_API_BASE}
+      LLM_MODEL: ${LLM_MODEL}
+    ports:
+      - "127.0.0.1:8011:8000"
+    volumes:
+      - ./backend/data:/app/data
+      - ./sourceData:/app/sourceData
+
+  # ─── Frontend (Vite build → Nginx serve) ───
+  frontend:
+    build:
+      context: ./frontend
+      args:
+        VITE_BASE: "/portfoliom2.0/"
+    container_name: portfoliom2-frontend
+    restart: unless-stopped
+    ports:
+      - "127.0.0.1:3001:80"
+    depends_on:
+      - backend
+
+volumes:
+  pg2_data:

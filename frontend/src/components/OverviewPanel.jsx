@@ -1,4 +1,4 @@
-import React, { useState, useEffect, useRef, useMemo } from 'react'
+import React, { useState, useEffect, useRef, useMemo, useCallback } from 'react'
 import * as echarts from 'echarts'
 import * as api from '../api'
 import { rawApi } from '../api'
@@ -80,18 +80,39 @@ export default function OverviewPanel() {
       ['.HK', 'hk_equity'],
       ['.US', 'us_stock'], ['.OQ', 'us_stock'], ['.NYSE', 'us_stock'], ['.NASDAQ', 'us_stock'],
     ]
-    return _withCurrency.map(h => {
+    const _typed = _withCurrency.map(h => {
       if (h.asset_type) return h
       for (const [suffix, type] of CODE_TYPE_MAP) {
         if (h.security_code?.endsWith(suffix)) return { ...h, asset_type: type }
       }
       return h
     })
+    // 同代码合并（仅显示/统计层，不改底层 holdings 表）
+    // quantity/amount/amount_local/amount_original 累加；price = Σ(amount_original)/Σ(quantity) 加权平均
+    const grouped = {}
+    for (const h of _typed) {
+      const key = h.security_code
+      if (!grouped[key]) {
+        grouped[key] = { ...h, _batch_count: 1 }
+      } else {
+        const g = grouped[key]
+        const newQty = (g.quantity || 0) + (h.quantity || 0)
+        const newAmtOrig = (g.amount_original || 0) + (h.amount_original || 0)
+        g.quantity = newQty
+        g.amount = (g.amount || 0) + (h.amount || 0)
+        g.amount_local = (g.amount_local || 0) + (h.amount_local || 0)
+        g.amount_original = newAmtOrig
+        g.price = (newQty > 0 && newAmtOrig > 0) ? newAmtOrig / newQty : g.price
+        g._batch_count += 1
+      }
+    }
+    return Object.values(grouped)
   }, [holdingsLocal, allHoldings])
 
   // 资产走势（90/180/360 天可切换，曲线=累计收益率%）
-  useEffect(() => {
-    api.getTrend(trendDays, currency).then(d => {
+  // 抽成 fetchTrend 供 trend-healed 事件复用，避免代码重复
+  const fetchTrend = useCallback((days, target) => {
+    return api.getTrend(days, target).then(d => {
       const series = d?.series || []
       setTrendData(series)
       if (series.length >= 1) {
@@ -115,7 +136,18 @@ export default function OverviewPanel() {
         setTrendReturn(null)
       }
     }).catch(() => { setTrendData([]); setTrendTotal(null); setTrendReturn(null) })
-  }, [currency, trendDays])
+  }, [])
+
+  useEffect(() => {
+    fetchTrend(trendDays, currency)
+  }, [fetchTrend, currency, trendDays])
+
+  // 监听右上角刷新触发的 trend 自愈完成事件，重新拉取走势图
+  useEffect(() => {
+    const handler = () => fetchTrend(trendDays, currency)
+    window.addEventListener('trend-healed', handler)
+    return () => window.removeEventListener('trend-healed', handler)
+  }, [fetchTrend, currency, trendDays])
 
   useEffect(() => {
     Promise.all([

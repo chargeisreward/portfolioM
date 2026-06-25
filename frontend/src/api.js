@@ -127,8 +127,8 @@ export const getCodeMapCoverage = (pool = 'all', apiStrategy = null) =>
     params: { pool, ...(apiStrategy ? { api: apiStrategy } : {}) },
   }).then(r => r.data)
 
-// Trend
-export const getTrend = (days = 90, target = 'CNY') => api.get('/trend', { params: { days, target } }).then(r => r.data)
+// Trend (force=true 触发三级回退自愈，补齐 360 天覆盖)
+export const getTrend = (days = 90, target = 'CNY', force = false) => api.get('/trend', { params: { days, target, force } }).then(r => r.data)
 
 // Auth
 export const getAuthStatus = () => api.get('/auth/status').then(r => r.data)

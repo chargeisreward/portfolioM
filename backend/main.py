@@ -1088,10 +1088,15 @@ def holdings_converted(target: str = Query("CNY"), request: Request = None, db: 
 def get_portfolio_trend(
     days: int = Query(90, ge=1, le=365),
     target: str = Query("CNY"),
+    force: bool = Query(False),
     request: Request = None,
     db: Session = Depends(get_db),
 ):
-    """组合 90 天资产走势（按 effective user 隔离 — 2026-06-24）"""
+    """组合 90 天资产走势（按 effective user 隔离 — 2026-06-24）
+
+    force=True 时触发三级回退自愈（cache → fund_daily_nav → 外部 API），补齐 360 天覆盖。
+    取价口径：.OF 用基金净值，非 .OF 用二级市场收盘价；与 drillable 无关。
+    """
     from datetime import date, timedelta
     import logging
     from models import Holding, PriceCache, ExchangeRate
@@ -1121,6 +1126,16 @@ def get_portfolio_trend(
         holding_codes = list({h.security_code for h in rows if h.security_code})
         if not holding_codes:
             return {"series": [], "currency": target, "days": days}
+
+        # force=True 时触发三级回退自愈（cache → fund_daily_nav → 外部 API）
+        heal_stats = None
+        if force:
+            try:
+                from services.trend_heal import heal_trend_data
+                heal_stats = heal_trend_data(db, holding_codes, days=360)
+            except Exception as e:
+                logger.warning("heal_trend_data failed (non-fatal): %s", e)
+
         pc_rows = (
             db.query(PriceCache)
             .filter(
@@ -1240,6 +1255,7 @@ def get_portfolio_trend(
             "days": days,
             "eligible_holdings": len(eligible),
             "skipped_holdings": skipped,
+            "heal_stats": heal_stats,
             "note": "每点 = Σ(quantity × 该日或更早真实价 × 汇率)；无未来编造",
         }
     except Exception as e:

@@ -185,6 +185,11 @@ export default function App() {
       await api.postCrawlAll()
       await api.postPenetration()
       await api.postRecalcCsi300()
+      // 触发 trend 三级回退自愈（force=True，360 天口径），完成后通知 OverviewPanel 刷新走势图
+      try {
+        await api.getTrend(360, 'CNY', true)
+        window.dispatchEvent(new CustomEvent('trend-healed'))
+      } catch (e) { console.error('trend heal failed:', e) }
     } catch (e) { console.error(e) }
     setLoading(false)
   }, [])

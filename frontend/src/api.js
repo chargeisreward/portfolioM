@@ -7,40 +7,55 @@ const baseURL = import.meta.env.VITE_API_URL
   ? `${import.meta.env.VITE_API_URL.replace(/\/$/, '')}/api`
   : `${import.meta.env.BASE_URL.replace(/\/$/, '')}/api`
 
-const api = axios.create({ baseURL, timeout: 30000 })
+// withCredentials=true：跨域请求携带 cookie（HttpOnly session_token）
+// token 不再存 localStorage，由后端 Set-Cookie 管理，JS 不可读，防 XSS 窃取
+const api = axios.create({ baseURL, timeout: 30000, withCredentials: true })
 
-// 自动注入 session token（从 localStorage）
+// view_as 内存变量（不持久化，刷新后重置）
+let _viewAsUserId = null
+
+/**
+ * 设置 view_as 用户 ID（内存中，不持久化到 localStorage）
+ * @param {number|null} userId - 视图代理目标用户 ID，null 表示查看自己
+ */
+export function setViewAs(userId) {
+  _viewAsUserId = userId
+}
+
+// 401 未授权回调（App 注册后，401 时触发跳转登录页）
+let _onUnauthorized = null
+
+/**
+ * 注册 401 未授权回调
+ * @param {() => void} callback - 401 时调用，App 用于重置状态显示 AuthGate
+ */
+export function onUnauthorized(callback) {
+  _onUnauthorized = callback
+}
+
+// 请求拦截：注入 view_as（从内存变量，不再读 localStorage）
 api.interceptors.request.use((config) => {
-  const token = localStorage.getItem('portfoliom_session')
-  if (token) {
-    config.headers['x-session-token'] = token
-  }
-  // admin 端点注入 x-admin-token
-  if (config.url?.includes('/admin/')) {
-    const adminToken = localStorage.getItem('portfoliom_admin_token')
-    if (adminToken) {
-      config.headers['x-admin-token'] = adminToken
-    }
-  }
-  // 注入 view_as（多用户视图代理）
-  const viewAsId = localStorage.getItem('portfoliom_view_as')
-  if (viewAsId) {
-    config.params = { ...(config.params || {}), view_as: viewAsId }
+  if (_viewAsUserId) {
+    config.params = { ...(config.params || {}), view_as: _viewAsUserId }
   }
   return config
 })
 
-// 401 拦截：清掉 token 触发 App 跳到登录页
+// 401 响应拦截：通知 App 重置状态（不再操作 localStorage，不再 reload）
+// 防抖：短时间内多个 401 只触发一次回调
+let _unauthScheduled = false
 api.interceptors.response.use(
   (r) => r,
   (err) => {
     if (err?.response?.status === 401) {
-      // 避免无限递归
+      // 排除 /api/auth/ 路径（登录/登出接口的 401 不触发跳转）
       if (!err.config?.url?.includes('/api/auth/')) {
-        localStorage.removeItem('portfoliom_session')
-        // 触发刷新
-        if (!window.location.hash.includes('auth')) {
-          window.location.reload()
+        if (_onUnauthorized && !_unauthScheduled) {
+          _unauthScheduled = true
+          setTimeout(() => {
+            _unauthScheduled = false
+            _onUnauthorized && _onUnauthorized()
+          }, 100)
         }
       }
     }
@@ -120,7 +135,7 @@ export const getAuthStatus = () => api.get('/auth/status').then(r => r.data)
 export const login = (username, password) => api.post('/auth/login', { username, password }).then(r => r.data)
 // 兼容旧调用（仅密码 → 旧单密码模式）
 export const loginPasswordOnly = (password) => api.post('/auth/login', { password }).then(r => r.data)
-export const getAuthMe = () => api.get('/auth/me').then(r => r.data)
+export const getAuthMe = () => api.get('/auth/me').then(r => r.data.user)
 export const getUsers = () => api.get('/auth/users').then(r => r.data)
 export const logout = () => api.post('/auth/logout').then(r => r.data)
 

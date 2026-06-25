@@ -162,3 +162,72 @@ def test_password_too_short_rejected(client, fresh_db):
     body = r.json()
     assert body["status"] == "error"
     assert "密码长度" in body["message"]
+
+
+# ============================================================================
+# HttpOnly Cookie 认证（生产环境安全要求）
+# token 不再暴露给 JS，防止 XSS 窃取
+# ============================================================================
+
+def test_login_sets_httponly_cookie(client, fresh_db):
+    """登录成功后，响应应通过 Set-Cookie 下发 HttpOnly cookie"""
+    _seed_user(fresh_db, "cookie_user", "pw_cookie_1")
+    r = client.post("/api/auth/login", json={"username": "cookie_user", "password": "pw_cookie_1"})
+    assert r.status_code == 200
+    # Set-Cookie header 应存在
+    set_cookie = r.headers.get("set-cookie", "")
+    assert "session_token=" in set_cookie, f"未找到 session_token cookie: {set_cookie}"
+    # 必须是 HttpOnly（防 XSS 读取）
+    assert "HttpOnly" in set_cookie, f"cookie 缺少 HttpOnly: {set_cookie}"
+    # SameSite 必须设置（防 CSRF）
+    assert "SameSite=" in set_cookie, f"cookie 缺少 SameSite: {set_cookie}"
+    # cookie 值应等于响应体中的 token
+    body = r.json()
+    assert body["token"] in set_cookie, "cookie 值应与 token 一致"
+
+
+def test_auth_me_reads_token_from_cookie(client, fresh_db):
+    """/auth/me 应能从 cookie 读取 token（不需要 x-session-token header）"""
+    _seed_user(fresh_db, "cookie_me", "pw_me_1")
+    r = client.post("/api/auth/login", json={"username": "cookie_me", "password": "pw_me_1"})
+    token = r.json()["token"]
+    # 用 cookie 而非 header 调用 /me
+    r2 = client.get("/api/auth/me", cookies={"session_token": token})
+    assert r2.status_code == 200
+    assert r2.json()["user"]["username"] == "cookie_me"
+
+
+def test_protected_endpoint_reads_token_from_cookie(client, fresh_db):
+    """受保护端点（如 /api/auth/users）应能从 cookie 读 token"""
+    _seed_user(fresh_db, "cookie_admin", "pw_admin_1", is_admin=True)
+    r = client.post("/api/auth/login", json={"username": "cookie_admin", "password": "pw_admin_1"})
+    token = r.json()["token"]
+    # /auth/users 需要 advisor+ 权限，用 cookie 调用
+    r2 = client.get("/api/auth/users", cookies={"session_token": token})
+    assert r2.status_code == 200
+    assert "users" in r2.json()
+
+
+def test_logout_clears_cookie(client, fresh_db):
+    """登出应清除 cookie"""
+    _seed_user(fresh_db, "cookie_logout", "pw_logout_1")
+    r = client.post("/api/auth/login", json={"username": "cookie_logout", "password": "pw_logout_1"})
+    token = r.json()["token"]
+    r2 = client.post("/api/auth/logout", cookies={"session_token": token})
+    assert r2.status_code == 200
+    # Set-Cookie 应包含 session_token=; Max-Age=0 或 expires 过期
+    set_cookie = r2.headers.get("set-cookie", "")
+    assert "session_token=" in set_cookie
+    # cookie 应被清除（Max-Age=0 或 expires 在过去）
+    assert "Max-Age=0" in set_cookie or "expires=" in set_cookie.lower(), \
+        f"登出 cookie 未清除: {set_cookie}"
+
+
+def test_cookie_token_still_works_via_header_too(client, fresh_db):
+    """兼容期：x-session-token header 仍应工作（平滑迁移）"""
+    _seed_user(fresh_db, "compat_header", "pw_compat_1")
+    r = client.post("/api/auth/login", json={"username": "compat_header", "password": "pw_compat_1"})
+    token = r.json()["token"]
+    # 用 header 调用 /me
+    r2 = client.get("/api/auth/me", headers={"x-session-token": token})
+    assert r2.status_code == 200

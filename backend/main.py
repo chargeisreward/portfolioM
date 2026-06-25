@@ -7,7 +7,7 @@ import time
 from datetime import date, datetime, timedelta
 from pathlib import Path
 from typing import List
-from fastapi import FastAPI, Depends, Query, Request, HTTPException, Body, UploadFile, File, Form
+from fastapi import FastAPI, Depends, Query, Request, HTTPException, Body, UploadFile, File, Form, Response
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel
@@ -72,11 +72,11 @@ def _is_allowed_origin(origin: str | None) -> bool:
 
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=_ALLOWED_ORIGINS,   # 显式列表, 不再 "*"
+    allow_origins=_ALLOWED_ORIGINS,   # 显式列表（allow_credentials=True 时不能用 "*"）
     allow_origin_regex=r"^https://[a-z0-9-]+\.zeabur\.app$",
     allow_methods=["GET", "POST", "PUT", "DELETE", "OPTIONS", "PATCH"],
     allow_headers=["*"],
-    allow_credentials=False,           # 前端 axios 不发 cookie, 显式 False 避免 wildcard 冲突
+    allow_credentials=True,            # 生产环境：cookie 认证需要 credentials=True
     max_age=600,
 )
 
@@ -200,6 +200,28 @@ def _verify_token(db: Session, token: str):
     return sess
 
 
+def _extract_token(request: Request) -> str | None:
+    """统一从 cookie / header / query 读取 session token。
+    优先级：x-session-token header（显式传递，兼容旧前端 + 内部脚本）
+          > cookie（HttpOnly，生产环境主路径）
+          > query session（极端兼容，如 SSE/EventSource 不能带 header）。
+    设计理由：header 是显式传递的，应优先；生产环境前端不再设 header，cookie 自动生效。
+    """
+    # 1. header（显式传递，优先）
+    header_token = request.headers.get("x-session-token")
+    if header_token:
+        return header_token
+    # 2. cookie（生产环境主路径）
+    cookie_token = request.cookies.get("session_token")
+    if cookie_token:
+        return cookie_token
+    # 3. query（极端兼容，如 SSE/EventSource 不能带 header）
+    query_token = request.query_params.get("session")
+    if query_token:
+        return query_token
+    return None
+
+
 def require_auth(request: Request, db: Session = Depends(get_db)):
     """FastAPI 依赖：要求有效 session。失败抛 401。"""
     # 跳过 auth 端点本身
@@ -210,7 +232,7 @@ def require_auth(request: Request, db: Session = Depends(get_db)):
         return True
     # 跳过 admin 端点（用于本地同步脚本）— 需额外 token
     # 跳过 static 资源
-    token = request.headers.get("x-session-token") or request.query_params.get("session")
+    token = _extract_token(request)
     if not _verify_token(db, token):
         raise HTTPException(status_code=401, detail="需要登录")
 
@@ -247,9 +269,10 @@ def auth_status(request: Request, db: Session = Depends(get_db)):
 
 
 @app.post("/api/auth/login")
-def auth_login(req: LoginRequest, request: Request, db: Session = Depends(get_db)):
+def auth_login(req: LoginRequest, request: Request, response: Response, db: Session = Depends(get_db)):
     """多用户登录：username + password (bcrypt)。
     兼容：username 缺省 + 走单密码模式 (APP_PASSWORD) → 找任意 admin 用户。
+    成功后通过 HttpOnly cookie 下发 session_token（生产环境安全要求）。
     """
     ip = _client_ip(request)
     # 先检查是否被锁
@@ -313,6 +336,19 @@ def auth_login(req: LoginRequest, request: Request, db: Session = Depends(get_db
     token = _create_session(db, ip, user_id=user.id)
     user.last_login_at = datetime.utcnow()
     db.commit()
+    # 通过 HttpOnly cookie 下发 token（JS 不可读，防 XSS 窃取）
+    # Secure 在本地 http 测试环境会阻止 cookie 发送，生产环境通过 nginx 代理是 https 时自动启用
+    # 这里通过环境变量控制，本地 dev 默认不启用 Secure
+    cookie_secure = os.environ.get("COOKIE_SECURE", "").lower() in ("1", "true", "yes")
+    response.set_cookie(
+        key="session_token",
+        value=token,
+        max_age=86400,
+        httponly=True,
+        secure=cookie_secure,
+        samesite="lax",
+        path="/",
+    )
     return {
         "status": "ok",
         "token": token,
@@ -322,13 +358,15 @@ def auth_login(req: LoginRequest, request: Request, db: Session = Depends(get_db
 
 
 @app.post("/api/auth/logout")
-def auth_logout(request: Request, db: Session = Depends(get_db)):
-    """登出（删除当前 session）"""
+def auth_logout(request: Request, response: Response, db: Session = Depends(get_db)):
+    """登出（删除当前 session + 清除 cookie）"""
     from models import AccessSession
-    token = request.headers.get("x-session-token") or request.query_params.get("session")
+    token = _extract_token(request)
     if token:
         db.query(AccessSession).filter(AccessSession.token == token).delete()
         db.commit()
+    # 清除 cookie
+    response.delete_cookie(key="session_token", path="/")
     return {"status": "ok"}
 
 
@@ -603,13 +641,7 @@ async def auth_middleware(request: Request, call_next):
     # CORS 预检：直接放行（让 CORSMiddleware 响应 OPTIONS）
     if method == "OPTIONS":
         return await call_next(request)
-    # admin 端点（需 X-Admin-Token，独立于用户密码）
-    if path.startswith("/api/admin/"):
-        admin_token = os.environ.get("ADMIN_TOKEN", APP_PASSWORD)
-        provided = request.headers.get("x-admin-token")
-        if provided != admin_token:
-            return _json_error(401, "admin token required", request)
-        return await call_next(request)
+    # admin 端点权限验证由 require_admin 依赖项完成（检查 session token + is_admin）
     # 公开路径
     PUBLIC_PATHS = (
         "/api/auth/", "/api/strategies",
@@ -617,7 +649,7 @@ async def auth_middleware(request: Request, call_next):
     )
     is_public = any(path.startswith(p) for p in PUBLIC_PATHS)
     # 始终尝试注入 user（即使公开路径，也要让 /me、/auth/users 等能用 request.state.user）
-    token = request.headers.get("x-session-token") or request.query_params.get("session")
+    token = _extract_token(request)
     db = next(get_db())
     try:
         sess = _verify_token(db, token) if token else None
@@ -666,6 +698,7 @@ def _json_error(status: int, msg: str, request: Request | None = None):
         content={"detail": msg},
         headers={
             "Access-Control-Allow-Origin": allowed_origin,
+            "Access-Control-Allow-Credentials": "true",
             "Vary": "Origin",
             "Access-Control-Allow-Methods": "GET, POST, PUT, DELETE, OPTIONS, PATCH",
             "Access-Control-Allow-Headers": "*",

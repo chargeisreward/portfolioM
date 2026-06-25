@@ -119,7 +119,9 @@ export default function OverviewPanel() {
     ]).then(() => {
       setTimeout(() => {
         if (pieRef.current) {
-          const c = echarts.init(pieRef.current)
+          // 复用已有 instance，避免重复 init 警告
+          let c = echarts.getInstanceByDom(pieRef.current)
+          if (!c) c = echarts.init(pieRef.current)
           // 用 displayHoldings 按 asset_type 聚合，标签与「类型」过滤保持一致（CAT_SHORT）
           const buckets = {}
           displayHoldings.forEach(h => {
@@ -140,7 +142,8 @@ export default function OverviewPanel() {
         }
         if (radarRef.current) {
           // 雷达图替换为主题（type2）构成环形图
-          const c = echarts.init(radarRef.current)
+          let c = echarts.getInstanceByDom(radarRef.current)
+          if (!c) c = echarts.init(radarRef.current)
           const buckets = {}
           displayHoldings.forEach(h => {
             const lbl = h.type2 ? (TYPE2_LABELS[h.type2] || h.type2) : '其他'

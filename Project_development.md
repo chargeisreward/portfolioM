@@ -335,3 +335,51 @@ RUNNING → SKIPPED  (跳过执行)
 | admin view_as=advisor | advisor 的卡片 | 12 卡片 | ✅ |
 
 **Commit**：`e5add81`
+
+### 2026-06-25 认证架构改造：localStorage → HttpOnly Cookie
+
+**影响范围**：大（前后端认证架构全面改造，安全级别提升）
+
+**问题**：生产环境部署在即，但前端使用 localStorage 存储 session token + 用户信息。XSS 攻击可直接 `localStorage.getItem('portfoliom_session')` 窃取 token，在过期前以受害者身份调用所有 API。token 一旦泄露无法撤销。
+
+**改造方案**（用户确认三项推荐方案）：
+1. token → HttpOnly + Secure + SameSite=Lax cookie（JS 不可读）
+2. 用户信息 → 不持久化，每次刷新调 `/auth/me` 实时获取
+3. UI 状态（activeRole / viewAs）→ React state，不持久化
+
+**TDD 流程**：
+
+| 阶段 | 测试 | 实现 |
+|------|------|------|
+| RED | 5 个后端 cookie 测试失败 | - |
+| GREEN | 15 个后端测试全部通过 | 登录 Set-Cookie + 中间件读 cookie + 登出清 cookie |
+| RED | 前端测试依赖 localStorage | - |
+| GREEN | 13 个前端测试全部通过 | api.js withCredentials + App.jsx 移除 localStorage |
+
+**后端改动**（`backend/main.py`）：
+1. 新增 `_extract_token(request)` — 统一从 header > cookie > query 读取 token（header 优先兼容旧前端）
+2. `auth_login` — 成功后 `response.set_cookie(session_token, httponly=True, samesite="lax")`
+3. `auth_logout` — `response.delete_cookie(session_token)`
+4. `auth_middleware` + `require_auth` — 改用 `_extract_token`
+5. CORS — `allow_credentials=True`，`_json_error` 添加 `Access-Control-Allow-Credentials: true`
+6. `COOKIE_SECURE` 环境变量控制 Secure 标志（本地 http 不启用，生产 https 启用）
+
+**前端改动**：
+1. `frontend/src/api.js` — `withCredentials: true`，移除 localStorage token 注入，view_as 改内存变量，401 改回调通知
+2. `frontend/src/App.jsx` — 移除 sessionToken state + 所有 localStorage 持久化，启动时总是调 `/auth/me`，onLogout 调 `api.logout()`
+3. `frontend/src/components/AuthGate.jsx` — 移除 `localStorage.removeItem('portfoliom_admin_token')`
+
+**安全性提升**：
+- token：XSS 无法读取（HttpOnly）
+- 用户信息：不暴露到 JS 可读存储
+- CSRF 防护：SameSite=Lax
+- 生产环境：Secure 标志确保 cookie 只通过 HTTPS 传输
+
+**兼容性**：
+- `x-session-token` header 仍工作（平滑迁移期，内部脚本可用）
+- 后端登录接口仍返回 token（前端仅用于判断登录成功，不持久化）
+
+**测试结果**：
+- 后端：29 个测试全部通过（15 auth_login + 14 user_relations/isolation）
+- 前端：13 个测试全部通过（10 viewAsCandidates 纯函数 + 3 App 组件）
+- E2E 验证：curl 登录 → Set-Cookie 正确 → cookie 调 /auth/me 成功 → cookie 调 /auth/users 成功

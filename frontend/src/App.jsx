@@ -1,5 +1,6 @@
 import React, { useState, useCallback, useEffect, useMemo } from 'react'
 import * as api from './api'
+import { calcViewAsCandidates, calcDataRole } from './lib/viewAsCandidates'
 import OverviewPanel from './components/OverviewPanel'
 import AnalysisPanel from './components/AnalysisPanel'
 import AnalystPanel from './components/AnalystPanel'
@@ -45,41 +46,68 @@ function userRoleOf(u) {
   return 'user'
 }
 
-const TOKEN_KEY = 'portfoliom_session'
-const USER_KEY = 'portfoliom_session_user'
-
 export default function App() {
-  const [sessionToken, setSessionToken] = useState(() => localStorage.getItem(TOKEN_KEY) || '')
-  const [currentUser, setCurrentUser] = useState(() => {
-    try { return JSON.parse(localStorage.getItem(USER_KEY) || 'null') } catch { return null }
-  })
-  const [activeRole, setActiveRole] = useState(() => localStorage.getItem('portfoliom_active_role') || null)
+  // 认证状态：currentUser 存在即已登录（token 由 HttpOnly cookie 管理，JS 不可读）
+  const [currentUser, setCurrentUser] = useState(null)
+  // UI 状态：不持久化到 localStorage，刷新后重置为默认值
+  const [activeRole, setActiveRole] = useState(null)
   const [viewAsUser, setViewAsUser] = useState(null)
   const [allUsers, setAllUsers] = useState([])
   const [relations, setRelations] = useState({ as_advisor: [], as_client: [] })
   const [activeTab, setActiveTab] = useState('overview')
   const [loading, setLoading] = useState(false)
+  // 启动时总是验证 cookie（不再读 localStorage 判断是否需要验证）
+  const [validating, setValidating] = useState(true)
 
   // 用户最高权限角色（badge 是否有权限的依据）
   const userRole = userRoleOf(currentUser)
   // 当前激活角色（用于菜单 + 数据权限），未登录或无保存值时取最高权限角色
-  const effectiveRole = activeRole && ['user','advisor','admin'].includes(activeRole) ? activeRole : userRole
-
-  // 持久化 activeRole
-  useEffect(() => {
-    if (activeRole) {
-      localStorage.setItem('portfoliom_active_role', activeRole)
-    } else {
-      localStorage.removeItem('portfoliom_active_role')
+  // 管理员选择了 viewAsUser 时，菜单降级为 user（等同顾问查看客户的菜单权限）
+  const effectiveRole = useMemo(() => {
+    if (activeRole && ['user','advisor','admin'].includes(activeRole)) {
+      if (activeRole === 'admin' && viewAsUser) return 'user'
+      return activeRole
     }
-  }, [activeRole])
+    return userRole
+  }, [activeRole, viewAsUser, userRole])
+  // 数据角色（用于 viewAsCandidates，不因 viewAsUser 降级）
+  const dataRole = calcDataRole(activeRole, userRole)
 
-  // 登录后初始化 activeRole 为最高权限角色
+  // 启动时验证 cookie 有效性（HttpOnly cookie 由浏览器自动携带，JS 不可读）
+  // 总是调用 /auth/me：有有效 cookie → 登录态；无 → 显示 AuthGate
   useEffect(() => {
-    if (currentUser && !activeRole) {
-      setActiveRole(userRole)
-    }
-  }, [currentUser, activeRole, userRole])
+    setValidating(true)
+    api.getAuthMe()
+      .then(user => {
+        if (user && user.id) {
+          setCurrentUser(user)
+          setActiveRole(userRoleOf(user))
+        } else {
+          setCurrentUser(null)
+          setActiveRole(null)
+        }
+      })
+      .catch(() => {
+        // cookie 无效或不存在 — 显示 AuthGate
+        setCurrentUser(null)
+        setActiveRole(null)
+      })
+      .finally(() => setValidating(false))
+  }, []) // 仅挂载时执行一次
+
+  // 注册 401 回调：API 返回 401 时重置状态显示 AuthGate
+  useEffect(() => {
+    api.onUnauthorized(() => {
+      setCurrentUser(null)
+      setActiveRole(null)
+      setViewAsUser(null)
+    })
+  }, [])
+
+  // viewAsUser 变化时同步到 api 模块（内存变量，不持久化）
+  useEffect(() => {
+    api.setViewAs(viewAsUser?.id || null)
+  }, [viewAsUser])
 
   // 角色 + 菜单过滤（基于 effectiveRole）
   const visibleTabs = useMemo(
@@ -111,23 +139,11 @@ export default function App() {
     }
   }, [currentUser])
 
-  // view_as 候选用户列表（基于 effectiveRole）
-  const viewAsCandidates = useMemo(() => {
-    if (effectiveRole === 'admin') {
-      return allUsers.filter(u => u.id !== currentUser?.id)
-    }
-    if (effectiveRole === 'advisor') {
-      // 从 as_advisor 关联中提取 client 用户（other_user 即 client）
-      return relations.as_advisor
-        .filter(r => r.status === 'ACTIVE')
-        .map(r => ({
-          id: r.other_user_id,
-          username: r.other_username,
-          display_name: r.other_display_name,
-        }))
-    }
-    return []
-  }, [effectiveRole, allUsers, relations, currentUser])
+  // view_as 候选用户列表（基于 dataRole，不受 viewAsUser 影响）
+  const viewAsCandidates = useMemo(
+    () => calcViewAsCandidates(dataRole, allUsers, relations, currentUser),
+    [dataRole, allUsers, relations, currentUser]
+  )
 
   // 当 viewAs = 自己时清空
   useEffect(() => {
@@ -136,45 +152,27 @@ export default function App() {
     }
   }, [viewAsUser, currentUser])
 
-  // 持久化 viewAs 到 localStorage
+  // viewAsUser 变化导致 effectiveRole 变化时，检查当前 tab 是否仍有效
   useEffect(() => {
-    if (viewAsUser) {
-      localStorage.setItem('portfoliom_view_as', String(viewAsUser.id))
-    } else {
-      localStorage.removeItem('portfoliom_view_as')
+    const allowed = TABS.filter(t => t.visibility.includes(effectiveRole)).map(t => t.id)
+    if (!allowed.includes(activeTab)) {
+      setActiveTab('overview')
     }
-  }, [viewAsUser])
+  }, [effectiveRole, activeTab])
 
-  // token 注入 axios
-  useEffect(() => {
-    if (sessionToken) {
-      localStorage.setItem(TOKEN_KEY, sessionToken)
-    } else {
-      localStorage.removeItem(TOKEN_KEY)
-    }
-  }, [sessionToken])
-
-  // 持久化 currentUser
-  useEffect(() => {
-    if (currentUser) {
-      localStorage.setItem(USER_KEY, JSON.stringify(currentUser))
-    } else {
-      localStorage.removeItem(USER_KEY)
-    }
-  }, [currentUser])
-
+  // 登录成功回调：token 由后端 Set-Cookie 管理，前端只更新用户状态
   const onLoggedIn = (token, user) => {
-    setSessionToken(token)
     setCurrentUser(user)
     setActiveRole(userRoleOf(user))
     setViewAsUser(null)
   }
-  const onLogout = () => {
-    setSessionToken('')
+
+  // 登出：调后端清除 cookie + 重置前端状态
+  const onLogout = async () => {
+    try { await api.logout() } catch { /* ignore */ }
     setCurrentUser(null)
     setActiveRole(null)
     setViewAsUser(null)
-    localStorage.removeItem('portfoliom_admin_token')
   }
 
   const refreshAll = useCallback(async () => {
@@ -189,7 +187,16 @@ export default function App() {
     setLoading(false)
   }, [])
 
-  if (!sessionToken) {
+  if (validating) {
+    return (
+      <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'center', height: '100vh' }}>
+        <div style={{ color: 'var(--text-muted, #888)', fontSize: 14 }}>验证登录状态...</div>
+      </div>
+    )
+  }
+
+  // currentUser 存在即已登录（cookie 由浏览器管理）；不存在则显示登录门
+  if (!currentUser) {
     return <AuthGate onLoggedIn={onLoggedIn} />
   }
 
@@ -245,7 +252,7 @@ export default function App() {
             )
           })}
         </div>
-        {(effectiveRole === 'advisor' || effectiveRole === 'admin') && viewAsCandidates.length > 0 && (
+        {(dataRole === 'advisor' || dataRole === 'admin') && viewAsCandidates.length > 0 && (
           <div style={{ padding: '0 12px 8px' }}>
             <select
               value={viewAsUser?.id || ''}
@@ -259,9 +266,9 @@ export default function App() {
                 border: '1px solid var(--border)', borderRadius: 3,
                 cursor: 'pointer',
               }}
-              title={effectiveRole === 'admin' ? '选择用户查看数据（管理员）' : '选择客户查看数据（顾问）'}
+              title={dataRole === 'admin' ? '选择用户查看数据（管理员）' : '选择客户查看数据（顾问）'}
             >
-              <option value="">{effectiveRole === 'admin' ? '查看自己（全部）' : '查看自己'}</option>
+              <option value="">{dataRole === 'admin' ? '查看自己（管理员）' : '查看自己'}</option>
               {viewAsCandidates.map(u => (
                 <option key={u.id} value={u.id}>
                   {u.display_name || u.username}

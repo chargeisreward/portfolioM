@@ -15,7 +15,7 @@ from sqlalchemy import func
 from sqlalchemy.orm import Session
 
 from database import get_db, init_db
-from models import FundIndexMap, Holding, AssetType, OverseasShareFinancialSnapshot
+from models import FundIndexMap, Holding, AssetType, OverseasShareFinancialSnapshot, User
 from schemas import (
     HoldingOut, HoldingSummary, PenetrationRow, PenetrationSummary,
     IndustryChainAnalysis, GrowthAnalysis, ValuationMetrics,

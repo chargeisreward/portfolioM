@@ -252,6 +252,25 @@ class StockInfoCache(Base):
     updated_at = Column(DateTime, default=datetime.utcnow)
 
 
+class RealtimePriceCache(Base):
+    """实时价格公共缓冲层 — 多用户共享，TTL 15分钟 + 智能续期。
+
+    设计要点：
+    - 公共表（不带 user_id），所有用户共享同一份价格缓存
+    - expires_at = last_updated + 15min；查询时 expires_at > now 则命中
+    - 价格不变（容差 0.0001）→ 推迟 expires_at 15min（避免收盘后反复调 API）
+    - API 失败 → 返回过期缓存 + 推迟 expires_at 5min（避免短时间反复重试）
+    """
+    __tablename__ = "realtime_price_cache"
+
+    code = Column(String(30), primary_key=True)       # 证券代码（持仓写法，如 007339.OF / NVDA / 159326.SZ）
+    price = Column(Float, nullable=False)              # 最新价格
+    prev_price = Column(Float, nullable=True)          # 上次价格（判断"价格不变"）
+    source = Column(String(20), nullable=True)         # tencent / akshare / yfinance
+    last_updated = Column(DateTime, nullable=False, default=datetime.utcnow)
+    expires_at = Column(DateTime, nullable=False, index=True)  # 过期时间戳（带索引，加速命中查询）
+
+
 # ---------- 穿透结果 ----------
 
 class PenetrationResult(Base):
@@ -259,7 +278,7 @@ class PenetrationResult(Base):
     __tablename__ = "penetration_results"
 
     id = Column(Integer, primary_key=True, autoincrement=True)
-    user_id = Column(Integer, nullable=False, index=True)  # 多用户隔离
+    user_id = Column(BigInteger, nullable=False, index=True)  # 多用户隔离
     stock_code = Column(String(20), nullable=False, index=True)
     stock_name = Column(String(100))
     penetration_weight = Column(Float, default=0.0)    # 穿透后权重 %
@@ -386,16 +405,20 @@ class IndexConstituentSnapshot(Base):
 class FundDrillSnapshot(Base):
     """公共下钻截面快照（按 fund × as_of_date 批量生成 — 2026-06-24 引入）。
 
-    算法（spec §3.2 weight-invariant + 用户 2026-06-24 补丁）：
+    算法（spec §3.2 weight-invariant + 用户 2026-06-24 补丁 + 2026-06-25 双币种修正）：
       1. 读取 index_constituents[最近月份] 的成分股 + 权重 weight + baseline_price
       2. 取每只成分股 T 日 current_price；缺失用 T-1 价（视为停牌）
       3. 校验：当日获得收盘价的成分股占比 >= 95% 才生成
       4. 权重和 = Σ(weight)，若 < 100%，差额 × 95% 加入「下钻-现金」(weight_deficit_cash 列)
-      5. shares_equivalent = fund_price × 0.95 × (weight/100) / current_price
-         其中 fund_price = Holding.price（fund 当日基金价格）
-         5% 现金部分：cash_per_unit = fund_price × 0.05（不需要存股票级记录）
-      6. QDII 港股：current_price 是原币（HKD），shares_eq 用原币价算
-         current_price_cny = current_price × fx_rate（5% 现金也用 CNY）
+      5. shares_equivalent = fund_price × 0.95 × (weight/100) / current_price_cny
+         其中 fund_price = Holding.price（fund 当日基金价格，CNY）
+         用 CNY 价算 shares_eq，保证下游 shares_eq × current_price_cny = fund_price × 0.95 × weight/100 (CNY)
+         5% 现金部分：cash_per_unit = fund_price × 0.05（CASH 行 current_price=1.0）
+      6. 双币种规则（2026-06-25）：所有单价都同时存「原币」和「本币(CNY)」两个值，
+         本币值在公共数据层（drill_snapshot.py）一次性算好存入表，下游层直接取，不临时计算。
+         - current_price (原币) + current_price_cny (本币) = current_price × fx_rate
+         - baseline_price (原币) + baseline_price_cny (本币) = baseline_price × fx_rate
+         港股通(HKD)/美股(USD) 经 fx_rate 折算；A 股(CNY) fx_rate=1.0，原币=本币。
       7. user 层：user_drill[s] = Holding.quantity × shares_equivalent[s]
          user_cash = Holding.quantity × fund_price × 0.05
 
@@ -415,17 +438,35 @@ class FundDrillSnapshot(Base):
     weight_pct = Column(Float, nullable=False)            # 指数权重 %（来自 index_constituents）
     baseline_price = Column(Float)                          # 成分股基准日收盘价（原币）
     current_price = Column(Float, nullable=False)           # 成分股当日收盘价（原币，缺失时用 T-1）
-    shares_equivalent = Column(Float, nullable=False)       # 1 份基金对应股数（基于原币价）
+    shares_equivalent = Column(Float, nullable=False)       # 1 份基金对应股数（基于本币 CNY 价算）
     is_stale_price = Column(Boolean, default=False)          # True=current_price 是 T-1 替补
     updated_at = Column(DateTime, default=datetime.utcnow, onupdate=datetime.utcnow)
 
-    # === 2026-06-24 双币种补丁 ===
+    # === 2026-06-24/25 双币种补丁：单价同时存原币 + 本币(CNY)，本币在公共层算好，下游取公共数据 ===
     currency = Column(String(8))                             # 原币 (HKD / CNY / USD)
-    current_price_cny = Column(Float)                        # 本币 (CNY) 收盘价
+    current_price_cny = Column(Float)                        # 本币 (CNY) 当日收盘价 = current_price × fx_rate
+    baseline_price_cny = Column(Float)                       # 本币 (CNY) 基准日收盘价 = baseline_price × fx_rate
     cny_currency = Column(String(8), default='CNY')           # 本币币种
     fx_rate = Column(Float)                                  # 当日汇率 (to_cny)
     fx_date = Column(Date)                                   # 汇率日期
     weight_deficit_cash = Column(Float, default=0)            # 权重和 < 100% 时的差额×95% 划入下钻-现金
+
+    # === 2026-06-25 估值字段补全（来自 A/H 估值表）===
+    # drill_snapshot.py 生成时 join AShareFinancialSnapshot / HKShareFinancialSnapshot 写入。
+    # 两套字段：
+    #   1. pe_ttm/pb_mrq/ps_ttm/dividend_yield — 基准日值（静态，来自估值表基准日批次）
+    #   2. pe_ttm_dynamic/pb_mrq_dynamic/ps_ttm_dynamic — 动态值（基于最新收盘价相对 baseline 的调整，
+    #      来自估值表的 pe_ttm_dynamic 字段，已由导入流程每日持久化保存）
+    # drill_public_service 加权时直接用动态值（无需实时算 price_ratio）；
+    # 股息率无 dynamic 字段，仍用 dividend_yield × (baseline_price / current_price) 实时算。
+    # 基准日可变：_load_valuation_snapshots 取 ≤ as_of_date 的最新估值批次，未来导入新基准日自动切换。
+    pe_ttm = Column(Float)                                   # 基准日 PE_TTM
+    pb_mrq = Column(Float)                                   # 基准日 PB_MRQ
+    ps_ttm = Column(Float)                                   # 基准日 PS_TTM
+    dividend_yield = Column(Float)                           # 基准日股息率 %
+    pe_ttm_dynamic = Column(Float)                           # 动态 PE_TTM（基于最新收盘价调整）
+    pb_mrq_dynamic = Column(Float)                           # 动态 PB_MRQ
+    ps_ttm_dynamic = Column(Float)                           # 动态 PS_TTM
 
 
 class FundDailyNav(Base):
@@ -451,8 +492,6 @@ class FundDailyNav(Base):
     source = Column(String(40), default="akshare")
     created_at = Column(DateTime, default=datetime.utcnow)
     weight = Column(Float)                             # 权重 %
-    source = Column(String(40))
-    created_at = Column(DateTime, default=datetime.utcnow)
 
 
 class AShareFinancialSnapshot(Base):
@@ -464,7 +503,7 @@ class AShareFinancialSnapshot(Base):
     )
 
     id = Column(Integer, primary_key=True, autoincrement=True)
-    user_id = Column(Integer, nullable=False, index=True)  # 多用户隔离
+    user_id = Column(BigInteger, nullable=True, index=True)  # 已废弃：估值是市场公共数据，不再按 user 过滤
     as_of_date = Column(Date, nullable=False, index=True)
     stock_code = Column(String(20), nullable=False, index=True)
     stock_name = Column(String(80))
@@ -511,7 +550,7 @@ class HKShareFinancialSnapshot(Base):
     )
 
     id = Column(Integer, primary_key=True, autoincrement=True)
-    user_id = Column(Integer, nullable=False, index=True)  # 多用户隔离
+    user_id = Column(BigInteger, nullable=True, index=True)  # 已废弃：估值是市场公共数据，不再按 user 过滤
     as_of_date = Column(Date, nullable=False, index=True)
     stock_code = Column(String(20), nullable=False, index=True)
     stock_name = Column(String(80))
@@ -542,11 +581,6 @@ class HKShareFinancialSnapshot(Base):
     industry_l2 = Column(String(60))
     industry_l3 = Column(String(60))
     industry_l4 = Column(String(60))
-    # 战略新兴产业 (L1-L4) — HK 4 级
-    se_l1 = Column(String(60))
-    se_l2 = Column(String(60))
-    se_l3 = Column(String(60))
-    se_l4 = Column(String(60))
     baseline_price = Column(Float)
     current_price = Column(Float)
     current_price_date = Column(Date)
@@ -566,7 +600,7 @@ class OverseasShareFinancialSnapshot(Base):
     )
 
     id = Column(Integer, primary_key=True, autoincrement=True)
-    user_id = Column(Integer, nullable=False, index=True)
+    user_id = Column(BigInteger, nullable=True, index=True)  # 已废弃：估值是市场公共数据，不再按 user 过滤
     as_of_date = Column(Date, nullable=False, index=True)
     stock_code = Column(String(20), nullable=False, index=True)
     stock_name = Column(String(80))
@@ -594,11 +628,12 @@ class PenetrationSnapshot(Base):
     """基金下钻结果（按持仓单只下钻）。"""
     __tablename__ = "penetration_snapshot"
     __table_args__ = (
-        UniqueConstraint("as_of_date", "holding_code", "stock_code",
+        UniqueConstraint("as_of_date", "user_id", "holding_code", "stock_code",
                          name="ux_pnsnap"),
     )
 
     id = Column(Integer, primary_key=True, autoincrement=True)
+    user_id = Column(BigInteger, nullable=False, default=1, index=True)  # 多用户隔离
     as_of_date = Column(Date, nullable=False, index=True)
     holding_code = Column(String(20), nullable=False, index=True)
     holding_name = Column(String(80))
@@ -633,7 +668,7 @@ class FullHoldingSnapshot(Base):
     )
 
     id = Column(Integer, primary_key=True, autoincrement=True)
-    user_id = Column(Integer, nullable=False, index=True)  # 多用户隔离
+    user_id = Column(BigInteger, nullable=False, index=True)  # 多用户隔离
     as_of_date = Column(Date, nullable=False, index=True)
     stock_code = Column(String(20), nullable=False, index=True)
     stock_name = Column(String(80))
@@ -675,7 +710,7 @@ class AggregationCache(Base):
     )
 
     id = Column(Integer, primary_key=True, autoincrement=True)
-    user_id = Column(Integer, nullable=False, index=True, default=2)  # 多用户隔离（2026-06-24）
+    user_id = Column(BigInteger, nullable=False, index=True, default=None)  # 多用户隔离
     as_of_date = Column(Date, nullable=False, index=True)
     scope = Column(String(20))                            # portfolio | csi300
     dimension = Column(String(20))                        # l1 | l2 | chain | growth_tier | competition | all
@@ -700,7 +735,7 @@ class Csi300ConstituentSnapshot(Base):
     )
 
     id = Column(Integer, primary_key=True, autoincrement=True)
-    user_id = Column(Integer, nullable=False, index=True)  # 多用户隔离
+    user_id = Column(BigInteger, nullable=False, index=True)  # 多用户隔离
     as_of_date = Column(Date, nullable=False, index=True)
     stock_code = Column(String(20), nullable=False, index=True)
     stock_name = Column(String(80))
@@ -740,7 +775,7 @@ class AggregationTimeseries(Base):
     )
 
     id = Column(Integer, primary_key=True, autoincrement=True)
-    user_id = Column(Integer, nullable=False, index=True, default=2)  # 多用户隔离（2026-06-24）
+    user_id = Column(BigInteger, nullable=False, index=True, default=None)  # 多用户隔离
     calc_date = Column(Date, nullable=False, index=True)
     business_date = Column(Date, nullable=False)          # 该 calc_date 使用的业务日期
     scope = Column(String(20))                            # portfolio | csi300
@@ -983,3 +1018,99 @@ class HoldingImportLog(Base):
     file_name = Column(String(255), nullable=True)
     row_count = Column(Integer, nullable=False, default=0)
     imported_at = Column(DateTime, default=datetime.utcnow, index=True)
+
+
+# ============================================================================
+# 交易记录驱动的持仓重建 (2026-06-26)
+# ============================================================================
+
+
+class Transaction(Base):
+    """交易记录（用户粘贴 → LLM 解析 → 用户确认 → 持久化）。
+
+    日期规则：确认日期优先 > 净值日期；仅一个日期时视为确认日期。
+    交易方向：buy(申购) shares+ / amount-；sell(赎回) shares- / amount+。
+    """
+    __tablename__ = "transaction_record"
+    __table_args__ = (
+        UniqueConstraint("user_id", "trade_date", "security_code", "trade_type", "confirmed_amount",
+                         name="ux_tx_user_date_code_type_amt"),
+    )
+
+    id = Column(Integer, primary_key=True, autoincrement=True)
+    user_id = Column(BigInteger, nullable=False, index=True)  # 写入者 user_id（不支持 view_as）
+    trade_date = Column(Date, nullable=False, index=True)     # 交易日期（确认日期优先 > 净值日期）
+    security_code = Column(String(20), nullable=False, index=True)
+    security_name = Column(String(100), nullable=True)        # 用户/LLM 提供，待验证
+    trade_type = Column(String(20), nullable=False)           # buy(申购) / sell(赎回) / dividend(分红) / others
+    confirmed_shares = Column(Float, default=0.0)             # 确认份额（申购+，赎回-）
+    confirmed_amount = Column(Float, default=0.0)             # 确认金额（申购-，赎回+）
+    nav_price = Column(Float, nullable=True)                  # 净值/单价（可选）
+    nav_date = Column(Date, nullable=True)                    # 净值日期（用于 trade_date fallback）
+    fee = Column(Float, nullable=True)                        # 手续费（可选）
+    remarks = Column(String(200), nullable=True)              # 备注
+    raw_text = Column(Text, nullable=True)                    # LLM 解析的原文片段（审计用）
+
+    # 新代码入库状态
+    security_verified = Column(Boolean, default=False)        # LLM 名称验证是否通过
+    security_added_to_master = Column(Boolean, default=False) # 是否已写入 SecurityMaster
+
+    # 审计
+    created_at = Column(DateTime, default=datetime.utcnow)
+    updated_at = Column(DateTime, default=datetime.utcnow, onupdate=datetime.utcnow)
+    import_batch = Column(String(40), nullable=True)          # 解析批次 ID（UUID）
+
+
+class HoldingDailySnapshot(Base):
+    """每日持仓快照（含现金行）。从起始日到今天每个日历日一行 × 每持仓一行。
+
+    起始日 = 用户首次提交交易时记录的起始日期（默认 2025-07-19）。
+    起始日数据 = 当时 Holding 表的快照。
+    后续日 = 前一日 + 当日交易调整。
+    最新日数据同步覆盖到 Holding 表，供 OverviewPanel/下钻使用。
+    """
+    __tablename__ = "holding_daily_snapshot"
+    __table_args__ = (
+        # holding_uid 加入约束：同代码不同批次（不同 Holding.id）可共存
+        # PostgreSQL NULL 语义：多行 holding_uid=NULL 不冲突（交易新建行/CASH 行）
+        UniqueConstraint("user_id", "as_of_date", "security_code", "holding_uid", name="ux_holding_daily_user_date_code"),
+    )
+
+    id = Column(Integer, primary_key=True, autoincrement=True)
+    user_id = Column(BigInteger, nullable=False, index=True)
+    as_of_date = Column(Date, nullable=False, index=True)
+    security_code = Column(String(20), nullable=False, index=True)  # 'CASH' 表示现金行
+    security_name = Column(String(100), nullable=True)
+    quantity = Column(Float, default=0.0)                  # 持仓数量（现金行 = 现金余额）
+    price = Column(Float, nullable=True)                   # 当日单价（原币，现金行 = 1.0）
+    price_cny = Column(Float, nullable=True)               # 当日单价（本币 CNY，现金行 = 1.0）
+    currency = Column(String(10), default="CNY")
+    fx_rate = Column(Float, default=1.0)                   # 原币→CNY 汇率
+    amount_cny = Column(Float, default=0.0)                # 当日市值（本币 CNY）
+    asset_type = Column(String(20), nullable=True)
+    is_cash = Column(Boolean, default=False)               # 现金行标记
+    is_initial = Column(Boolean, default=False)            # 起始日快照标记
+    holding_uid = Column(Integer, nullable=True)           # 关联 Holding.id，区分同代码不同批次；NULL=交易新建/CASH
+    created_at = Column(DateTime, default=datetime.utcnow)
+
+
+class TradingSession(Base):
+    """交易会话：记录某用户的起始日 + 起始持仓快照状态。
+
+    用户首次提交交易时创建：把当时 Holding 表数据标记为起始持仓，
+    写入 holding_daily_snapshot 的 as_of_date=起始日 行（is_initial=True）。
+    后续提交交易时复用同一 session（若起始日不变）。
+    """
+    __tablename__ = "trading_session"
+    __table_args__ = (
+        UniqueConstraint("user_id", name="ux_trading_session_user"),
+    )
+
+    id = Column(Integer, primary_key=True, autoincrement=True)
+    user_id = Column(BigInteger, nullable=False)
+    start_date = Column(Date, nullable=False)               # 起始日（默认 2025-07-19）
+    initial_cash = Column(Float, default=0.0)               # 起始现金（默认 0）
+    initial_snapshot_built = Column(Boolean, default=False) # 起始持仓快照是否已建立
+    last_rebuild_date = Column(Date, nullable=True)         # 最后重算到的日期
+    created_at = Column(DateTime, default=datetime.utcnow)
+    updated_at = Column(DateTime, default=datetime.utcnow, onupdate=datetime.utcnow)

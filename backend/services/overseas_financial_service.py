@@ -57,7 +57,8 @@ def upsert_overseas_financial(db: Session, data: dict) -> dict:
         if "ps_ttm" in data:
             existing.ps_ttm_dynamic = data["ps_ttm"]
     else:
-        kwargs = {"stock_code": stock_code, "as_of_date": as_of, "user_id": 1, "market": market}
+        # 估值是市场公共数据，不传 user_id（DB nullable 后 NULL 落库 — 2026-06-25）
+        kwargs = {"stock_code": stock_code, "as_of_date": as_of, "market": market}
         for f in fields:
             if f in data:
                 kwargs[f] = data[f]

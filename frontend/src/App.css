@@ -145,6 +145,53 @@
 .cur-btn:hover { color: var(--text); }
 .cur-btn.on { background: var(--text); color: var(--bg); border-color: var(--text); }
 
+/* ─── Role badge (角色切换三连按钮 — monochrome brutalist) ─── */
+.role-badge {
+  flex: 1; text-align: center; padding: 5px 0;
+  font-family: "GeistMono", monospace; font-size: 10px;
+  letter-spacing: 0.5px; text-transform: uppercase;
+  background: transparent; color: var(--text-secondary);
+  border: 1px solid var(--border); border-radius: 0;
+  cursor: pointer; transition: all 0.15s;
+}
+.role-badge:hover { color: var(--text); border-color: var(--border-strong); }
+.role-badge.on { background: var(--text); color: var(--bg); border-color: var(--text); }
+.role-badge.on:hover { color: var(--bg); }
+.role-badge.is-disabled {
+  color: var(--text-muted); opacity: 0.35;
+  cursor: not-allowed; border-style: dashed;
+}
+.role-badge.is-disabled:hover { color: var(--text-muted); border-color: var(--border); opacity: 0.35; }
+
+/* ─── ViewAs select (视角切换下拉框 — 深色主题美化) ─── */
+.viewas-select {
+  width: 100%; padding: 6px 28px 6px 10px;
+  font-family: "GeistMono", monospace; font-size: 11px; letter-spacing: 0.3px;
+  background-color: var(--bg-raised);
+  color: var(--text);
+  border: 1px solid var(--border); border-radius: 0;
+  cursor: pointer; transition: border-color 0.15s, background-color 0.15s;
+  /* 移除原生 select 箭头，用自定义 SVG 替代 */
+  appearance: none; -webkit-appearance: none; -moz-appearance: none;
+  background-image: url("data:image/svg+xml;utf8,<svg xmlns='http://www.w3.org/2000/svg' width='10' height='6' viewBox='0 0 10 6'><path d='M0 0l5 6 5-6z' fill='%23ffffff' fill-opacity='0.5'/></svg>");
+  background-repeat: no-repeat;
+  background-position: right 10px center;
+}
+.viewas-select:hover { border-color: var(--border-strong); background-color: var(--bg-raised-hover); }
+.viewas-select:focus { outline: none; border-color: var(--text); }
+.viewas-select option { background: #1f2228; color: #ffffff; }
+.viewas-select option:first-child { color: rgba(255,255,255,0.5); }
+
+/* ─── ViewAs banner (正在查看视角提示条 — 替代浅紫底) ─── */
+.viewas-banner {
+  padding: 8px 16px;
+  background: var(--bg-raised);
+  border-bottom: 1px solid var(--border-strong);
+  display: flex; justify-content: space-between; align-items: center;
+  font-size: 12px; color: var(--text-secondary);
+}
+.viewas-banner strong { color: var(--text); font-weight: 400; }
+
 /* ─── Responsive ─── */
 @media (max-width: 1100px) { .kpi-grid { grid-template-columns: repeat(3,1fr); } }
 @media (max-width: 768px) { .chart-grid { grid-template-columns: 1fr; } .kpi-grid { grid-template-columns: repeat(2,1fr); } }

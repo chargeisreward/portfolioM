@@ -190,9 +190,10 @@ def fetch_fund_nav_history(fund_code: str, days: int = 90) -> list[dict]:
 
 def fill_prices(db: Session, user_id: int | None = None):
     """Fetch latest prices for holdings and calculate amount = quantity × price.
-    US stocks → Tencent API | Chinese funds → akshare NAV | ETFs → Tencent API
-    多用户隔离：user_id=None 时处理全部；否则只处理该 user 的 holdings（2026-06-24）。"""
-    from crawlers.price_data import fetch_tencent_quote
+
+    多用户隔离：user_id=None 时处理全部；否则只处理该 user 的 holdings（2026-06-24）。
+    价格获取走公共缓冲层（services.price_cache），TTL 15min，多用户共享（2026-06-25）。"""
+    from services.price_cache import get_realtime_price
     q = db.query(Holding)
     if user_id is not None:
         q = q.filter(Holding.user_id == user_id)
@@ -201,28 +202,9 @@ def fill_prices(db: Session, user_id: int | None = None):
 
     for h in holdings:
         try:
-            price = None
-            code = h.security_code
-
-            # US stocks/ETFs via Tencent
-            if h.asset_type in (AssetType.US_STOCK.value, AssetType.US_ETF.value):
-                info = fetch_tencent_quote(code)
-                if info:
-                    price = info.get("price")
-
-            # Chinese OTC funds via akshare NAV
-            if not price and code.endswith(".OF"):
-                fund_code = code.replace(".OF", "")
-                nav = _fetch_fund_nav(fund_code)
-                if nav and nav > 0:
-                    price = nav
-
-            # Chinese exchange-traded ETFs via Tencent
-            if not price and (code.endswith(".SZ") or code.endswith(".SH") or code.endswith(".OF")):
-                info = fetch_tencent_quote(code)
-                if info:
-                    price = info.get("price")
-
+            price, source, status = get_realtime_price(
+                db, h.security_code, h.asset_type, h.currency
+            )
             if price and price > 0:
                 h.price = round(price, 4)
                 h.amount = round(h.quantity * price, 2)
@@ -232,15 +214,25 @@ def fill_prices(db: Session, user_id: int | None = None):
                     h.amount_cny = round(h.amount * rate, 2)
                 else:
                     h.amount_cny = h.amount
-                updated += 1
+                if status in ("refreshed", "hit", "nav"):
+                    updated += 1
         except Exception:
             pass
 
-    # For holdings still without price: amount = quantity (unit price ≈ 1)
+    # For holdings still without price or amount_cny: amount = quantity (unit price ≈ 1)
     for h in holdings:
-        if (h.amount is None or h.amount == 0) and h.quantity > 0:
+        needs_amount = (h.amount is None or h.amount == 0) and h.quantity > 0
+        needs_amount_cny = (h.amount_cny is None or h.amount_cny == 0) and h.quantity > 0
+        if needs_amount or needs_amount_cny:
             h.price = h.price or 1.0
-            h.amount = round(h.quantity * h.price, 2)
+            if needs_amount:
+                h.amount = round(h.quantity * h.price, 2)
+            # 始终重新计算 amount_cny（修复历史 amt_cny=0 的行）
+            rate = get_rate(db, h.currency, 'CNY')
+            if rate > 0:
+                h.amount_cny = round(h.amount * rate, 2)
+            else:
+                h.amount_cny = h.amount
 
     db.commit()
     return updated
@@ -279,9 +271,21 @@ def get_holdings_summary(db: Session, user_id: int | None = None) -> dict:
         Holding.asset_type == AssetType.US_STOCK.value
     ).count()
 
+    # 查询最新日 CASH 行（交易形成的现金）。Holding 表不含 CASH，需从 HoldingDailySnapshot 取。
+    # 取该用户最新一天的 CASH 行（as_of_date 倒序第一行），用 amount_cny。
+    from models import HoldingDailySnapshot
+    cash_q = db.query(HoldingDailySnapshot).filter(
+        HoldingDailySnapshot.is_cash == True,
+    )
+    if user_id is not None:
+        cash_q = cash_q.filter(HoldingDailySnapshot.user_id == user_id)
+    latest_cash = cash_q.order_by(HoldingDailySnapshot.as_of_date.desc()).first()
+    cash_cny = float(latest_cash.amount_cny or latest_cash.quantity or 0.0) if latest_cash else 0.0
+
     return {
         "total_value": round(total, 2),
         "categories": {k: round(v, 2) for k, v in categories.items()},
         "fund_count": fund_count,
         "stock_count": stock_count,
+        "cash_cny": round(cash_cny, 2),
     }

@@ -5,6 +5,7 @@ import OverviewPanel from './components/OverviewPanel'
 import AnalysisPanel from './components/AnalysisPanel'
 import AnalystPanel from './components/AnalystPanel'
 import TradingPanel from './components/TradingPanel'
+import ValuationPanel from './components/ValuationPanel'
 import WatchPanel from './components/WatchPanel'
 import SettingsPanel from './components/SettingsPanel'
 import AuthGate from './components/AuthGate'
@@ -31,6 +32,7 @@ const TABS = [
   { id: 'analyst',   label: '分析师',  icon: ICONS.analyst,  visibility: ['user','advisor','admin'] },
   { id: 'watch',     label: '关注',    icon: ICONS.watch,    visibility: ['user','advisor','admin'] },
   { id: 'trading',   label: '交易',    icon: ICONS.trading,  visibility: ['user'] },
+  { id: 'valuation', label: '估值表',  icon: 'M9 17v-2m3 2v-4m3 4v-6m2 10H7a2 2 0 01-2-2V5a2 2 0 012-2h5.586a1 1 0 01.707.293l5.414 5.414a1 1 0 01.293.707V19a2 2 0 01-2 2z', visibility: ['user'] },
   { id: 'relation',  label: '关联',    icon: 'M17 20h5v-2a4 4 0 00-3-3.87M9 20H4v-2a3 3 0 015.36-1.87M15 7a3 3 0 11-6 0 3 3 0 016 0zm6 7a2 2 0 11-4 0 2 2 0 014 0z', visibility: ['user','advisor'] },
   { id: 'settings',  label: '设置',    icon: ICONS.settings, visibility: ['user','advisor','admin'] },
   // --- 分割线（仅 admin 可见） ---
@@ -206,6 +208,7 @@ export default function App() {
       case 'analysis': return <AnalysisPanel />
       case 'analyst': return <AnalystPanel />
       case 'trading': return <TradingPanel />
+      case 'valuation': return <ValuationPanel />
       case 'watch': return <WatchPanel />
       case 'relation': return <RelationPanel currentUser={currentUser} />
       case 'settings': return <SettingsPanel />
@@ -223,6 +226,7 @@ export default function App() {
           <span className="brand-icon">◆</span>
           <span className="brand-text">PortfolioM</span>
         </div>
+        {/* 角色切换三连 badge — monochrome brutalist 风格 */}
         <div style={{ display: 'flex', gap: 4, padding: '0 12px 8px' }}>
           {[
             { id: 'user', label: '用户', hasPermission: !!currentUser },
@@ -231,21 +235,14 @@ export default function App() {
           ].map(b => {
             const isActive = effectiveRole === b.id
             const clickable = b.hasPermission
+            const cls = `role-badge${isActive ? ' on' : ''}${!clickable ? ' is-disabled' : ''}`
             return (
               <button
                 key={b.id}
                 disabled={!clickable}
                 onClick={() => clickable && switchRole(b.id)}
-                style={{
-                  flex: 1, textAlign: 'center', padding: '3px 0', borderRadius: 3,
-                  fontSize: 9, fontFamily: '"GeistMono", monospace', letterSpacing: 0.3,
-                  cursor: clickable ? 'pointer' : 'default',
-                  transition: 'all 0.15s',
-                  background: isActive ? 'var(--up)' : (clickable ? 'transparent' : 'var(--bg-raised)'),
-                  color: isActive ? '#fff' : (clickable ? 'var(--up)' : 'var(--text-muted)'),
-                  border: `1px solid ${isActive ? 'var(--up)' : (clickable ? 'var(--up)' : 'var(--border)')}`,
-                  opacity: clickable && !isActive ? 0.7 : 1,
-                }}
+                className={cls}
+                title={clickable ? `切换到${b.label}视角` : `无${b.label}权限`}
               >
                 {b.label}
               </button>
@@ -254,21 +251,24 @@ export default function App() {
         </div>
         {(dataRole === 'advisor' || dataRole === 'admin') && viewAsCandidates.length > 0 && (
           <div style={{ padding: '0 12px 8px' }}>
+            <div style={{
+              fontSize: 9, color: 'var(--text-muted)', fontFamily: '"GeistMono", monospace',
+              letterSpacing: 0.8, textTransform: 'uppercase', marginBottom: 3, paddingLeft: 2,
+            }}>
+              {dataRole === 'admin' ? '视角 · 用户' : '视角 · 客户'}
+            </div>
             <select
+              className="viewas-select"
               value={viewAsUser?.id || ''}
               onChange={e => {
                 const id = e.target.value ? Number(e.target.value) : null
                 setViewAsUser(id ? viewAsCandidates.find(u => u.id === id) : null)
               }}
-              style={{
-                width: '100%', padding: '4px 6px', fontSize: 10,
-                background: 'var(--bg-raised)', color: 'var(--text)',
-                border: '1px solid var(--border)', borderRadius: 3,
-                cursor: 'pointer',
-              }}
               title={dataRole === 'admin' ? '选择用户查看数据（管理员）' : '选择客户查看数据（顾问）'}
             >
-              <option value="">{dataRole === 'admin' ? '查看自己（管理员）' : '查看自己'}</option>
+              <option value="">
+                {dataRole === 'admin' ? '选择用户…' : '选择客户…'}
+              </option>
               {viewAsCandidates.map(u => (
                 <option key={u.id} value={u.id}>
                   {u.display_name || u.username}
@@ -318,15 +318,12 @@ export default function App() {
           </button>
         </header>
         {viewAsUser && (
-          <div style={{
-            padding: '8px 16px', background: 'var(--accent-soft, #e0e7ff)',
-            borderBottom: '1px solid var(--border)', display: 'flex',
-            justifyContent: 'space-between', alignItems: 'center', fontSize: 12,
-          }}>
+          <div className="viewas-banner">
             <span>
-              👀 正在查看 <strong>{viewAsUser.display_name || viewAsUser.username}</strong> 的视图
+              <span style={{ color: 'var(--text-muted)', marginRight: 6 }}>↗</span>
+              正在查看 <strong>{viewAsUser.display_name || viewAsUser.username}</strong> 的视图
               <span style={{ marginLeft: 8, color: 'var(--text-muted)', fontSize: 10 }}>
-                (只读模式 — 写入仍只对 {currentUser?.display_name || currentUser?.username} 生效)
+                (只读 — 写入仍对 {currentUser?.display_name || currentUser?.username} 生效)
               </span>
             </span>
             <button onClick={() => setViewAsUser(null)} className="btn-ghost" style={{ fontSize: 10, padding: '2px 8px' }}>
@@ -334,7 +331,8 @@ export default function App() {
             </button>
           </div>
         )}
-        <div className="page-container">
+        {/* key 绑定 viewAsUser：切换视角时强制重新挂载子组件，触发所有 useEffect 重新获取数据 */}
+        <div className="page-container" key={viewAsUser?.id || 'self'}>
           {renderPage()}
         </div>
       </main>

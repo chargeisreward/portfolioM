@@ -80,6 +80,21 @@ def init_db():
         ("holdings", "user_id", "BIGINT NOT NULL DEFAULT 1"),
         ("watchlist", "user_id", "BIGINT NOT NULL DEFAULT 1"),
         ("access_sessions", "user_id", "BIGINT"),
+        ("penetration_snapshot", "user_id", "BIGINT NOT NULL DEFAULT 2"),
+        ("csi300_constituent_snapshot", "user_id", "BIGINT NOT NULL DEFAULT 2"),
+        # === 2026-06-25 FundDrillSnapshot 估值字段补全 ===
+        ("fund_drill_snapshot", "pe_ttm", "FLOAT"),
+        ("fund_drill_snapshot", "pb_mrq", "FLOAT"),
+        ("fund_drill_snapshot", "ps_ttm", "FLOAT"),
+        ("fund_drill_snapshot", "dividend_yield", "FLOAT"),
+        # === 2026-06-25 FundDrillSnapshot 动态估值字段（来自 A/H 估值表的 *_dynamic 字段）===
+        ("fund_drill_snapshot", "pe_ttm_dynamic", "FLOAT"),
+        ("fund_drill_snapshot", "pb_mrq_dynamic", "FLOAT"),
+        ("fund_drill_snapshot", "ps_ttm_dynamic", "FLOAT"),
+        # === 2026-06-25 FundDrillSnapshot 双币种：baseline_price_cny（本币基准价，公共层算好）===
+        ("fund_drill_snapshot", "baseline_price_cny", "FLOAT"),
+        # === 2026-06-26 HoldingDailySnapshot holding_uid：区分同代码不同批次 ===
+        ("holding_daily_snapshot", "holding_uid", "INTEGER"),
     ]
     from sqlalchemy import inspect
     insp = inspect(engine)
@@ -132,12 +147,42 @@ def init_db():
 
         # === 索引 ===
         for ix_table, ix_col in [("holdings", "user_id"), ("watchlist", "user_id"),
-                                  ("access_sessions", "user_id")]:
+                                  ("access_sessions", "user_id"),
+                                  # 2026-06-26 交易记录驱动的持仓重建
+                                  ("transaction_record", "user_id"),
+                                  ("transaction_record", "trade_date"),
+                                  ("holding_daily_snapshot", "user_id"),
+                                  ("holding_daily_snapshot", "as_of_date"),
+                                  ("trading_session", "user_id")]:
             try:
                 ix_name = f"ix_{ix_table}_{ix_col}"
                 conn.execute(text(f"CREATE INDEX IF NOT EXISTS {ix_name} ON {ix_table} ({ix_col})"))
             except Exception:
                 pass
+
+        # === 2026-06-26 holding_daily_snapshot 唯一约束变更（加入 holding_uid）===
+        # 同代码不同批次（不同 Holding.id）需可共存，NULL=交易新建/CASH 不受约束
+        try:
+            ucs = insp.get_unique_constraints("holding_daily_snapshot") or []
+            need_update = True
+            for uc in ucs:
+                if uc.get("name") == "ux_holding_daily_user_date_code":
+                    if "holding_uid" in (uc.get("column_names") or []):
+                        need_update = False
+                    break
+            if need_update:
+                conn.execute(text(
+                    "ALTER TABLE holding_daily_snapshot "
+                    "DROP CONSTRAINT IF EXISTS ux_holding_daily_user_date_code"
+                ))
+                conn.execute(text(
+                    "ALTER TABLE holding_daily_snapshot "
+                    "ADD CONSTRAINT ux_holding_daily_user_date_code "
+                    "UNIQUE (user_id, as_of_date, security_code, holding_uid)"
+                ))
+                print("[init_db] holding_daily_snapshot UC 已更新（含 holding_uid）")
+        except Exception as e:
+            print(f"[init_db] holding_daily_snapshot UC migration: {e}")
 
 
 def _ensure_seed_admin():

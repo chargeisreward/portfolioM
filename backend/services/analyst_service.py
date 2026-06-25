@@ -62,11 +62,12 @@ def _total_drilled_amount(db: Session, as_of_date: date, user_id: int | None = N
 
 
 def _get_snapshot_price(db: Session, stock_code: str, as_of_date: date, user_id: int | None = None) -> tuple[float | None, date | None]:
-    """优先 A/H 财务快照的 current_price/current_price_date，缺失回退 PriceCache。"""
+    """优先 A/H 财务快照的 current_price/current_price_date，缺失回退 PriceCache。
+
+    估值是市场公共数据，不按 user_id 过滤（2026-06-25）。user_id 参数保留以兼容旧调用方。
+    """
     for Model in (AShareFinancialSnapshot, HKShareFinancialSnapshot):
         q = db.query(Model).filter(Model.stock_code == stock_code, Model.as_of_date == as_of_date)
-        if user_id is not None:
-            q = q.filter(Model.user_id == user_id)
         row = q.first()
         if row and row.current_price:
             return row.current_price, row.current_price_date
@@ -77,8 +78,6 @@ def _get_snapshot_price(db: Session, stock_code: str, as_of_date: date, user_id:
             Model.as_of_date == as_of_date,
             (Model.stock_code == code_no_suffix) | (Model.stock_code == stock_code),
         )
-        if user_id is not None:
-            q = q.filter(Model.user_id == user_id)
         row = q.order_by(func.coalesce(Model.current_price_date, Model.as_of_date).desc()).first()
         if row and row.current_price:
             return row.current_price, row.current_price_date
@@ -95,11 +94,10 @@ def _get_snapshot_price(db: Session, stock_code: str, as_of_date: date, user_id:
 
 
 def _get_snapshot_metrics(db: Session, stock_code: str, as_of_date: date, user_id: int | None = None) -> dict[str, float | None]:
+    """估值是市场公共数据，不按 user_id 过滤（2026-06-25）。user_id 参数保留以兼容旧调用方。"""
     pe = pb = ps = None
     for Model in (AShareFinancialSnapshot, HKShareFinancialSnapshot):
         q = db.query(Model).filter(Model.stock_code == stock_code, Model.as_of_date == as_of_date)
-        if user_id is not None:
-            q = q.filter(Model.user_id == user_id)
         row = q.first()
         if row:
             pe = row.pe_ttm_dynamic if row.pe_ttm_dynamic is not None else row.pe_ttm

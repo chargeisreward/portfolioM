@@ -4,9 +4,10 @@ import TaskHistoryTab from './TaskHistoryTab'
 import ApiStrategyTab from './ApiStrategyTab'
 import TradingCalendarView from './TradingCalendarView'
 import DataBrowser from './DataBrowser'
+import PriceRefreshTab from './PriceRefreshTab'
 
 /**
- * 数据源页 — 数据就绪 + 任务历史 + API策略 + 交易日历 + 数据浏览。
+ * 数据源页 — 数据就绪 + 任务历史 + API策略 + 交易日历 + 数据浏览 + 价格刷新。
  * 复用现有 .subtab-bar / .subtab 样式实现 tab 切换（与 MasterDataPanel 一致）。
  */
 export default function DataSourcePanel() {
@@ -18,6 +19,7 @@ export default function DataSourcePanel() {
     { id: 'apiStrategy', label: 'API策略' },
     { id: 'calendar', label: '交易日历' },
     { id: 'browser', label: '数据浏览' },
+    { id: 'priceRefresh', label: '价格刷新' },
   ]
 
   return (
@@ -38,6 +40,7 @@ export default function DataSourcePanel() {
       {tab === 'apiStrategy' && <ApiStrategyTab />}
       {tab === 'calendar' && <TradingCalendarView />}
       {tab === 'browser' && <DataBrowser />}
+      {tab === 'priceRefresh' && <PriceRefreshTab />}
     </div>
   )
 }

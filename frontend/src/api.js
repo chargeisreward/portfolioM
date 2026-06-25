@@ -178,3 +178,43 @@ export const getFullHoldingTable = (asOfDate) => api.get('/penetration/full-hold
 export const getTop10Holdings = (asOfDate, limit = 10) => api.get('/penetration/top10-holdings', { params: { as_of_date: asOfDate, limit } }).then(r => r.data)
 export const getDimensionDrilled = (dim, asOfDate, market = 'A+H') => api.get('/penetration/dimension-drilled', { params: { dim, as_of_date: asOfDate, market } }).then(r => r.data)
 export const getLatestExchangeRates = () => api.get('/exchange-rates/latest').then(r => r.data)
+
+// ---------- 交易记录驱动的持仓重建 (2026-06-26) ----------
+export const parseTrades = (text) =>
+  api.post('/trades/parse', { text }).then(r => r.data)
+
+export const confirmTrades = (trades) =>
+  api.post('/trades/confirm', { trades }).then(r => r.data)
+
+export const getTrades = (params) =>
+  api.get('/trades', { params }).then(r => r.data)
+
+export const updateTrade = (tradeId, trade) =>
+  api.put(`/trades/${tradeId}`, trade, { timeout: 120000 }).then(r => r.data)
+
+export const deleteTrade = (tradeId) =>
+  api.delete(`/trades/${tradeId}`, { timeout: 120000 }).then(r => r.data)
+
+export const getTradingSession = () =>
+  api.get('/trading-session').then(r => r.data)
+
+export const getSnapshot = (params) =>
+  api.get('/holdings/snapshot', { params }).then(r => r.data)
+
+export const getSnapshotRange = () =>
+  api.get('/holdings/snapshot-range').then(r => r.data)
+
+export const getDailyTrades = (params) =>
+  api.get('/holdings/daily-trades', { params }).then(r => r.data)
+
+// ---------- 管理员价格刷新（2026-06-26）----------
+// 全用户持仓并集 + 增量（TTL），公共数据层模式
+export const adminFillPricesAll = () =>
+  api.post('/admin/fill-prices-all', null, { timeout: 120000 }).then(r => r.data)
+
+// 分析页全持仓收盘价增量刷新（下钻股票 NULL 填充 + 未下钻基金净值补缺）
+export const adminRefreshAnalysisPrices = (asOfDate, days = 5, maxCodes = 200) =>
+  api.post('/admin/refresh-analysis-prices', null, {
+    params: { as_of_date: asOfDate, days, max_codes: maxCodes },
+    timeout: 120000,
+  }).then(r => r.data)

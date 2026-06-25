@@ -214,7 +214,14 @@ class TestDrillIsolation:
         card = body["indices"][0]
         assert card["index_code"] == "000300"
         assert "est_market_value_cny" in card
-        assert card["est_market_value_cny"] == 45000.0
+        # 2026-06-25 新公式：card_est = user_quantity × per_fund_est[f]
+        # per_fund_est["510300.SH"] = 0.001×1600 + 0.002×210 = 1.6 + 0.42 = 2.02
+        # card_est = 10000 × 2.02 = 20200.0
+        assert card["est_market_value_cny"] == 20200.0
+        # 用户层金额字段
+        assert "static_amount_cny" in card
+        assert "est_deviation_pct" in card
+        assert "weight_pct" in card
 
     def test_advisor_direct_login_returns_own_cards(self, client, fresh_db):
         """advisor 直接登录 → 返回自己的卡片。"""

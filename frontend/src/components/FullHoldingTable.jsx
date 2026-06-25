@@ -106,6 +106,7 @@ export default function FullHoldingTable({ bizDate, onTotalEstChange }) {
           dividend_yield: null,
           est_market_value_cny: 0,
           is_drill: false,
+          is_cash: false,
         }
       }
       return byCode[code]
@@ -139,26 +140,40 @@ export default function FullHoldingTable({ bizDate, onTotalEstChange }) {
       if (r.dividend_yield != null && acc.dividend_yield == null) acc.dividend_yield = r.dividend_yield
     }
 
-    // 可下钻成分股 (drill 算法同上钻页面)
+    // 可下钻成分股 (drill 算法同下钻页面) + 下钻-现金（5% 现金部分）
     for (const code of Object.keys(drilledStocks)) {
       const s = drilledStocks[code]
+      const isCash = s.is_cash === true || code === 'CASH'
       const acc = ensure(code)
       acc.source_type = 'drilled'
       acc.is_drill = true
+      acc.is_cash = isCash
       acc.stock_name = acc.stock_name || s.stock_name
-      acc.shares = (acc.shares || 0) + (s.shares_equivalent || 0)
+      // 现金行无约当数量，不累加 shares
+      if (!isCash) {
+        acc.shares = (acc.shares || 0) + (s.shares_equivalent || 0)
+      }
 
       const cur = inferCurrency(code)
+      // 双币种规则 (2026-06-25)：后端 drilled 段已返回本币(CNY)字段：
+      //   est_market_value_cny = shares × current_price_cny（本币 CNY，不再 toCNY 双重折算）
+      //   current_price_cny    = 原币价 × fx_rate（本币 CNY）
+      // 优先用本币字段，fallback 到原币 × toCNY 折算（兼容旧后端）
       if (s.est_market_value_cny != null) {
-        const ev = toCNY(s.est_market_value_cny, cur)
-        if (ev != null) acc.est_market_value_cny += ev
+        acc.est_market_value_cny += s.est_market_value_cny
       }
-      if (s.current_price != null && acc.current_price == null) {
-        acc.current_price = toCNY(s.current_price, cur)
+      if (acc.current_price == null) {
+        acc.current_price = (s.current_price_cny != null)
+          ? s.current_price_cny
+          : toCNY(s.current_price, cur)
       }
-      if (s.pe_ttm != null && acc.pe_ttm == null) acc.pe_ttm = s.pe_ttm
-      if (s.pb_mrq != null && acc.pb_mrq == null) acc.pb_mrq = s.pb_mrq
-      if (s.ps_ttm != null && acc.ps_ttm == null) acc.ps_ttm = s.ps_ttm
+      // 估值字段：优先用动态值（基于最新收盘价调整），fallback 到基准日值
+      const peV = s.pe_ttm_dynamic ?? s.pe_ttm
+      const pbV = s.pb_mrq_dynamic ?? s.pb_mrq
+      const psV = s.ps_ttm_dynamic ?? s.ps_ttm
+      if (peV != null && acc.pe_ttm == null) acc.pe_ttm = peV
+      if (pbV != null && acc.pb_mrq == null) acc.pb_mrq = pbV
+      if (psV != null && acc.ps_ttm == null) acc.ps_ttm = psV
       if (s.dividend_yield != null && acc.dividend_yield == null) acc.dividend_yield = s.dividend_yield
     }
 
@@ -269,12 +284,12 @@ export default function FullHoldingTable({ bizDate, onTotalEstChange }) {
             )}
 
             {showDrilled && drilled.map(r => (
-              <tr key={`d-${r.stock_code}`}>
+              <tr key={`d-${r.stock_code}`} style={r.is_cash ? { background: 'var(--bg-raised)', fontStyle: 'italic' } : undefined}>
                 <td style={{ fontFamily: '"GeistMono",monospace', overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>{r.stock_code}</td>
                 <td style={{ overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>{r.stock_name || '-'}</td>
-                <td style={{ textAlign: 'center', color: '#69f0ae', fontWeight: 600 }}>✓</td>
+                <td style={{ textAlign: 'center', color: r.is_cash ? 'var(--text-muted)' : '#69f0ae', fontWeight: 600 }}>{r.is_cash ? '💵' : '✓'}</td>
                 <td style={{ textAlign: 'right', fontFamily: '"GeistMono",monospace' }}>{fmtPct(r.weight_pct)}</td>
-                <td style={{ textAlign: 'right', fontFamily: '"GeistMono",monospace' }}>{fmtShares(r.shares)}</td>
+                <td style={{ textAlign: 'right', fontFamily: '"GeistMono",monospace' }}>{r.is_cash ? '-' : fmtShares(r.shares)}</td>
                 <td style={{ textAlign: 'right', fontFamily: '"GeistMono",monospace' }}>{fmtNum(r.current_price)}</td>
                 <td style={{ textAlign: 'right', fontFamily: '"GeistMono",monospace' }}>{fmtNum(r.pe_ttm)}</td>
                 <td style={{ textAlign: 'right', fontFamily: '"GeistMono",monospace' }}>{fmtNum(r.pb_mrq)}</td>

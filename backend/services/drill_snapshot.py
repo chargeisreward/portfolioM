@@ -7,10 +7,13 @@
   4. 校验：获得收盘价的成分股占比 >= 95% 才生成截面
   5. 算 shares_equivalent = fund_price × 0.95 × (weight/100) / current_price
      其中 fund_price 从 Holding.price 取（fund 当日基金价格，所有 user 的均价也行）
-  6. 写入 fund_drill_snapshot（公共数据）
+  6. 追加"现金-下钻"行（stock_code="CASH"）：基金 95% 配指数 + 5% 配现金，
+     指数中股票权重合计 100% 但基金中股票合计 95%，其余 5% = 现金-下钻。
+     shares_equivalent = fund_price × 0.05, current_price = 1.0
+  7. 写入 fund_drill_snapshot（公共数据）
 
 user 层：user_drill[s] = Holding.quantity × shares_equivalent[s]
-        user_cash    = Holding.quantity × fund_price × 0.05
+        user_cash    = Holding.quantity × (fund_price × 0.05)  # 来自 CASH 行
 
 注意：fund_price 的来源 — Holding 表每个 user 都有该 fund 的 price，
   为保证一致性，取该 fund 在 Holding 表里的「所有 user 价格均值」作为公共 fund_price。
@@ -24,13 +27,16 @@ from datetime import date, timedelta
 from sqlalchemy.orm import Session
 
 from models import (
+    AShareFinancialSnapshot,
     ExchangeRate,
     FundDrillSnapshot,
     FundIndexMap,
+    HKShareFinancialSnapshot,
     Holding,
     IndexConstituentSnapshot,
     PriceCache,
 )
+from sqlalchemy import func as sa_func
 
 logger = logging.getLogger(__name__)
 
@@ -38,6 +44,78 @@ STOCK_PRICE_FRESHNESS_RATIO = 0.95   # 至少 95% 成分股有当日价才生成
 STALE_PRICE_FALLBACK_DAYS = 7        # 缺失可用 T-1..T-7 任意一天的价作为替补
 CASH_RATIO = 0.05                    # 5% 现金
 STOCK_RATIO = 1 - CASH_RATIO         # 95% 成分股
+
+
+def _load_valuation_snapshots(db: Session, as_of_date: date) -> dict[str, dict]:
+    """预加载 ≤ as_of_date 的最新 A/H 估值批次（不按 user_id 过滤）。
+
+    基准日可变：取 ≤ as_of_date 的最新批次（非硬编码 5/29），未来导入新基准日数据时自动切换。
+    估值是市场公共数据，与持仓交易无关，故不按 user_id 过滤。
+
+    返回结构：
+        {
+            "600519.SH": {
+                "pe_ttm": 30.5, "pb_mrq": 10.2, "ps_ttm": 15.0, "dividend_yield": 1.2,
+                "pe_ttm_dynamic": 32.1, "pb_mrq_dynamic": 10.8, "ps_ttm_dynamic": 15.7,
+            },
+            "600519": <同上>,  # 同时存无后缀 norm key 作 fallback
+            ...
+        }
+
+    动态字段（pe_ttm_dynamic 等）来自估值表的 *_dynamic 列，
+    已由导入流程基于最新收盘价相对 baseline 的调整每日持久化保存。
+    """
+    # 找 A 股估值表的最新批次日期（≤ as_of_date）
+    a_latest = db.query(sa_func.max(AShareFinancialSnapshot.as_of_date)).filter(
+        AShareFinancialSnapshot.as_of_date <= as_of_date
+    ).scalar()
+    # 找 H 股估值表的最新批次日期
+    h_latest = db.query(sa_func.max(HKShareFinancialSnapshot.as_of_date)).filter(
+        HKShareFinancialSnapshot.as_of_date <= as_of_date
+    ).scalar()
+
+    out: dict[str, dict] = {}
+    if a_latest is not None:
+        for r in db.query(AShareFinancialSnapshot).filter(
+            AShareFinancialSnapshot.as_of_date == a_latest
+        ).all():
+            v = {
+                "pe_ttm": r.pe_ttm,
+                "pb_mrq": r.pb_mrq,
+                "ps_ttm": r.ps_ttm,
+                "dividend_yield": r.dividend_yield,
+                "pe_ttm_dynamic": r.pe_ttm_dynamic,
+                "pb_mrq_dynamic": r.pb_mrq_dynamic,
+                "ps_ttm_dynamic": r.ps_ttm_dynamic,
+            }
+            out[r.stock_code] = v
+            # 同时存无后缀 norm key
+            norm = r.stock_code.split(".")[0]
+            if norm != r.stock_code:
+                out.setdefault(norm, v)
+    if h_latest is not None:
+        for r in db.query(HKShareFinancialSnapshot).filter(
+            HKShareFinancialSnapshot.as_of_date == h_latest
+        ).all():
+            v = {
+                "pe_ttm": r.pe_ttm,
+                "pb_mrq": r.pb_mrq,
+                "ps_ttm": r.ps_ttm,
+                "dividend_yield": r.dividend_yield,
+                "pe_ttm_dynamic": r.pe_ttm_dynamic,
+                "pb_mrq_dynamic": r.pb_mrq_dynamic,
+                "ps_ttm_dynamic": r.ps_ttm_dynamic,
+            }
+            out[r.stock_code] = v
+            norm = r.stock_code.split(".")[0]
+            if norm != r.stock_code:
+                out.setdefault(norm, v)
+
+    logger.info(
+        "valuation snapshots loaded: a_latest=%s, h_latest=%s, total_codes=%d",
+        a_latest, h_latest, len(out),
+    )
+    return out
 
 
 def _latest_index_constituents(db: Session, idx_code: str, on_or_before: date) -> list[IndexConstituentSnapshot]:
@@ -165,6 +243,10 @@ def generate_drill_snapshot_for_date(db: Session, as_of_date: date) -> dict:
     db.query(FundDrillSnapshot).filter(FundDrillSnapshot.as_of_date == as_of_date).delete()
     db.commit()
 
+    # 预加载估值快照（A/H 估值表，≤ as_of_date 的最新批次，不按 user_id 过滤）
+    # 用于内层循环 join 写入 pe_ttm / pb_mrq / ps_ttm / dividend_yield 字段
+    valuation_snaps = _load_valuation_snapshots(db, as_of_date)
+
     for fund_map in fund_maps:
         fund_code = fund_map.fund_code
         idx_code = fund_map.index_code.split(".")[0]
@@ -224,9 +306,18 @@ def generate_drill_snapshot_for_date(db: Session, as_of_date: date) -> dict:
             fx_rate = _get_fx_rate(db, currency, "CNY", as_of_date)
             fx_date = as_of_date if fx_rate else None
             price_cny = float(price) * fx_rate if fx_rate else float(price)
+            # 双币种规则 (2026-06-25): baseline_price_cny 在公共层算好，下游取公共数据不临时算
+            # fx_rate 缺失时 fallback 到原币价（与 price_cny 同逻辑）
+            bp_orig = getattr(s, "baseline_price", None)
+            if bp_orig is not None:
+                baseline_price_cny = float(bp_orig) * fx_rate if fx_rate else float(bp_orig)
+            else:
+                baseline_price_cny = None
             # shares_eq 用 CNY 价算: shares = (fund_price_CNY × 0.95 × weight) / price_CNY
             # 这样: shares_eq × current_price_cny = fund_price × 0.95 × weight / 100
             shares_eq = fund_price * STOCK_RATIO * (weight_pct / 100.0) / price_cny
+            # 2026-06-25: join A/H 估值表写入 4 字段（基准日值，公共层加权时再做动态调整）
+            v = valuation_snaps.get(s.stock_code) or valuation_snaps.get(s.stock_code.split(".")[0])
             fund_rows.append(FundDrillSnapshot(
                 fund_code=fund_code,
                 as_of_date=as_of_date,
@@ -239,16 +330,57 @@ def generate_drill_snapshot_for_date(db: Session, as_of_date: date) -> dict:
                 is_stale_price=bool(stale),
                 currency=currency,
                 current_price_cny=price_cny,
+                baseline_price_cny=baseline_price_cny,
                 cny_currency="CNY" if price_cny is not None else None,
                 fx_rate=fx_rate,
                 fx_date=fx_date,
                 weight_deficit_cash=0.0,  # 仅在首行写入
+                pe_ttm=(v.get("pe_ttm") if v else None),
+                pb_mrq=(v.get("pb_mrq") if v else None),
+                ps_ttm=(v.get("ps_ttm") if v else None),
+                dividend_yield=(v.get("dividend_yield") if v else None),
+                pe_ttm_dynamic=(v.get("pe_ttm_dynamic") if v else None),
+                pb_mrq_dynamic=(v.get("pb_mrq_dynamic") if v else None),
+                ps_ttm_dynamic=(v.get("ps_ttm_dynamic") if v else None),
             ))
         # 把 weight_deficit_cash 标在第一行 (代表「该 fund 整批」)
         if fund_rows:
             fund_rows[0].weight_deficit_cash = weight_deficit_cash
 
-        # 用 INSERT ... ON CONFLICT DO NOTHING 幂等写入
+        # 现金-下钻行：基金 5% 现金部分（公共数据分解 — 2026-06-25）
+        # 基金 = 95% 指数 + 5% 现金。指数中股票权重合计 100%，但基金中股票合计 95%，
+        # 其余 5% 分配给现金-下钻。现金也是资产，需计入合计。
+        # shares_equivalent = fund_price × CASH_RATIO（每份基金含现金金额）
+        # current_price = 1.0 → 估算市值 = shares_eq × price = fund_price × 0.05
+        fund_rows.append(FundDrillSnapshot(
+            fund_code=fund_code,
+            as_of_date=as_of_date,
+            stock_code="CASH",
+            stock_name="下钻-现金",
+            weight_pct=CASH_RATIO * 100.0,  # 5.0
+            baseline_price=1.0,
+            current_price=1.0,
+            shares_equivalent=float(fund_price * CASH_RATIO),
+            is_stale_price=False,
+            currency="CNY",
+            current_price_cny=1.0,
+            baseline_price_cny=1.0,
+            cny_currency="CNY",
+            fx_rate=1.0,
+            fx_date=as_of_date,
+            weight_deficit_cash=0.0,
+            pe_ttm=None,
+            pb_mrq=None,
+            ps_ttm=None,
+            dividend_yield=None,
+            pe_ttm_dynamic=None,
+            pb_mrq_dynamic=None,
+            ps_ttm_dynamic=None,
+        ))
+
+        # 用 INSERT ... ON CONFLICT DO UPDATE 幂等写入（2026-06-25 修正）
+        # 原 on_conflict_do_nothing 会导致补字段重跑时已存在行被跳过，
+        # pe_ttm/pb_mrq/ps_ttm/dividend_yield 永远是 NULL。改为 DO UPDATE 全量刷新。
         from sqlalchemy.dialects.postgresql import insert as pg_insert
         from datetime import datetime as _dt
         stmt = pg_insert(FundDrillSnapshot.__table__).values([
@@ -264,15 +396,49 @@ def generate_drill_snapshot_for_date(db: Session, as_of_date: date) -> dict:
                 "is_stale_price": r.is_stale_price,
                 "currency": r.currency,
                 "current_price_cny": r.current_price_cny,
+                "baseline_price_cny": r.baseline_price_cny,
                 "cny_currency": r.cny_currency,
                 "fx_rate": r.fx_rate,
                 "fx_date": r.fx_date,
                 "weight_deficit_cash": r.weight_deficit_cash,
+                "pe_ttm": r.pe_ttm,
+                "pb_mrq": r.pb_mrq,
+                "ps_ttm": r.ps_ttm,
+                "dividend_yield": r.dividend_yield,
+                "pe_ttm_dynamic": r.pe_ttm_dynamic,
+                "pb_mrq_dynamic": r.pb_mrq_dynamic,
+                "ps_ttm_dynamic": r.ps_ttm_dynamic,
                 "updated_at": _dt.utcnow(),
             }
             for r in fund_rows
         ])
-        stmt = stmt.on_conflict_do_nothing(index_elements=["fund_code", "as_of_date", "stock_code"])
+        # 冲突时全量更新（同一 as_of_date 重跑应刷新所有字段，保证估值字段等能补齐）
+        stmt = stmt.on_conflict_do_update(
+            index_elements=["fund_code", "as_of_date", "stock_code"],
+            set_={
+                "stock_name": stmt.excluded.stock_name,
+                "weight_pct": stmt.excluded.weight_pct,
+                "baseline_price": stmt.excluded.baseline_price,
+                "current_price": stmt.excluded.current_price,
+                "shares_equivalent": stmt.excluded.shares_equivalent,
+                "is_stale_price": stmt.excluded.is_stale_price,
+                "currency": stmt.excluded.currency,
+                "current_price_cny": stmt.excluded.current_price_cny,
+                "baseline_price_cny": stmt.excluded.baseline_price_cny,
+                "cny_currency": stmt.excluded.cny_currency,
+                "fx_rate": stmt.excluded.fx_rate,
+                "fx_date": stmt.excluded.fx_date,
+                "weight_deficit_cash": stmt.excluded.weight_deficit_cash,
+                "pe_ttm": stmt.excluded.pe_ttm,
+                "pb_mrq": stmt.excluded.pb_mrq,
+                "ps_ttm": stmt.excluded.ps_ttm,
+                "dividend_yield": stmt.excluded.dividend_yield,
+                "pe_ttm_dynamic": stmt.excluded.pe_ttm_dynamic,
+                "pb_mrq_dynamic": stmt.excluded.pb_mrq_dynamic,
+                "ps_ttm_dynamic": stmt.excluded.ps_ttm_dynamic,
+                "updated_at": _dt.utcnow(),
+            },
+        )
         result = db.execute(stmt)
         funds_processed += 1
         rows_inserted += result.rowcount or 0

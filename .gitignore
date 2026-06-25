@@ -48,3 +48,11 @@ Thumbs.db
 *.swo
 frontend/.env*
 .worktrees/
+
+# Temp/debug scripts (one-off, not core code)
+backend/_*.py
+backend/backup_*.sql
+backend/scripts/verify_*.py
+backend/scripts/check_fund_nav.py
+backend/scripts/pull_all_of_nav.py
+backend/scripts/regenerate_*.py

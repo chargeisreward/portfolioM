@@ -49,7 +49,7 @@ export default function AnalysisPanel() {
       {/* Dimension body */}
       {active === 'drill' ? (
         <div className="raised" style={{ padding: 12, marginTop: 10 }}>
-          <DrillableFundsPage bizDate={bizDate} />
+          <DrillableFundsPage />
         </div>
       ) : active === 'full' ? (
         <div className="raised" style={{ padding: 12, marginTop: 10 }}>

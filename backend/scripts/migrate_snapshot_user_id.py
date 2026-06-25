@@ -26,6 +26,10 @@ TABLES = [
     "penetration_snapshot",
     "a_share_financial_snapshot",
     "hk_share_financial_snapshot",
+    "overseas_share_financial_snapshot",
+    "csi300_constituent_snapshot",
+    "aggregation_cache",
+    "aggregation_timeseries",
 ]
 
 
@@ -58,7 +62,7 @@ def run(dry_run: bool = False):
             else:
                 # 1. 加列（默认 DEFAULT_USER_ID）
                 c.execute(
-                    text(f"ALTER TABLE {t} ADD COLUMN user_id INTEGER DEFAULT {DEFAULT_USER_ID}")
+                    text(f"ALTER TABLE {t} ADD COLUMN user_id BIGINT DEFAULT {DEFAULT_USER_ID}")
                 )
                 # 2. 把所有 NULL 改成 advisor.id
                 c.execute(

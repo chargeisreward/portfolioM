@@ -17,7 +17,7 @@ const fmtAmount = (v) => (v == null ? '-' : Math.round(v).toLocaleString('en-US'
  *
  * 点击卡片 → 展开下钻明细（来自所有跟踪该指数的基金底层股票合并）。
  */
-export default function DrillableFundsPage({ bizDate }) {
+export default function DrillableFundsPage() {
   const [indices, setIndices] = useState([])
   const [loading, setLoading] = useState(true)
   const [err, setErr] = useState(null)
@@ -26,19 +26,23 @@ export default function DrillableFundsPage({ bizDate }) {
   const [detailLoading, setDetailLoading] = useState(false)
   const [dataVer, setDataVer] = useState(null)
 
+  // 下钻用当日日期：fund_drill_snapshot 由 scheduler 每日生成，
+  // service 层会自动回退到 ≤ today 的最新 snapshot。
+  // 不使用 current_business_date（那是指数权重的月度更新日期，与下钻无关）。
+  const today = new Date().toLocaleDateString('sv-SE')  // "YYYY-MM-DD" 本地时区
+
   useEffect(() => {
     getDataVersion().then(setDataVer).catch(() => setDataVer(null))
   }, [])
 
   useEffect(() => {
-    if (!bizDate) return
     setLoading(true)
     import('../api').then(api => {
-      api.getDrillableIndices(bizDate)
+      api.getDrillableIndices(today)
         .then(d => { setIndices(d?.indices || []); setLoading(false); })
         .catch(e => { setErr(e?.message || 'load failed'); setLoading(false); })
     })
-  }, [bizDate])
+  }, [today])
 
   const toggle = (idxCode) => {
     if (expanded === idxCode) {
@@ -50,13 +54,12 @@ export default function DrillableFundsPage({ bizDate }) {
     setDetail(null)
     setDetailLoading(true)
     import('../api').then(api => {
-      api.getIndexDrill(idxCode, bizDate)
+      api.getIndexDrill(idxCode, today)
         .then(d => { setDetail(d); setDetailLoading(false); })
         .catch(e => { setErr(e?.message); setDetailLoading(false); })
     })
   }
 
-  if (!bizDate) return <div className="empty">业务日期未就绪</div>
   if (loading) return <div className="empty">加载可下钻指数…</div>
   if (err) return <div className="empty">加载失败: {err}</div>
   if (!indices.length) return <div className="empty">无可下钻指数</div>
@@ -186,7 +189,7 @@ export default function DrillableFundsPage({ bizDate }) {
                   ) : detail?.constituents ? (
                     <>
                       <div style={{ fontSize: 11, color: 'var(--text-muted)', marginBottom: 6 }}>
-                        下钻明细：共 {detail.constituents.length} 只股票
+                        下钻明细：共 {detail.constituents.filter(r => !r.is_cash).length} 只股票 + 现金
                       </div>
                       <table className="data-table">
                         <thead>
@@ -195,7 +198,8 @@ export default function DrillableFundsPage({ bizDate }) {
                             <th>名称</th>
                             <th style={{ textAlign: 'right' }}>权重%</th>
                             <th style={{ textAlign: 'right' }}>约当数量</th>
-                            <th style={{ textAlign: 'right' }}>昨日收盘</th>
+                            <th style={{ textAlign: 'right' }}>昨日收盘·原币</th>
+                            <th style={{ textAlign: 'right' }}>昨日收盘·本币</th>
                             <th style={{ textAlign: 'right' }}>PE</th>
                             <th style={{ textAlign: 'right' }}>PB</th>
                             <th style={{ textAlign: 'right' }}>PS</th>
@@ -205,19 +209,22 @@ export default function DrillableFundsPage({ bizDate }) {
                         </thead>
                         <tbody>
                           {detail.constituents.map((r, i) => (
-                            <tr key={r.stock_code + i}>
+                            <tr key={r.stock_code + i} style={r.is_cash ? { background: 'var(--bg-raised)', fontStyle: 'italic' } : undefined}>
                               <td>{r.stock_code}</td>
                               <td>{r.stock_name}</td>
                               <td style={{ textAlign: 'right', fontFamily: '"GeistMono",monospace' }}>{fmtPct(r.weight_at_baseline_pct)}</td>
                               <td style={{ textAlign: 'right', fontFamily: '"GeistMono",monospace' }}>
-                                {r.shares_equivalent != null ? r.shares_equivalent.toLocaleString() : '-'}
+                                {r.shares_equivalent != null ? Math.round(r.shares_equivalent).toLocaleString() : '-'}
                               </td>
                               <td style={{ textAlign: 'right', fontFamily: '"GeistMono",monospace' }}>
                                 {r.current_price != null ? r.current_price.toFixed(2) : '-'}
                               </td>
-                              <td style={{ textAlign: 'right', fontFamily: '"GeistMono",monospace' }}>{fmtNum(r.pe_ttm)}</td>
-                              <td style={{ textAlign: 'right', fontFamily: '"GeistMono",monospace' }}>{fmtNum(r.pb_mrq)}</td>
-                              <td style={{ textAlign: 'right', fontFamily: '"GeistMono",monospace' }}>{fmtNum(r.ps_ttm)}</td>
+                              <td style={{ textAlign: 'right', fontFamily: '"GeistMono",monospace' }}>
+                                {r.current_price_cny != null ? r.current_price_cny.toFixed(2) : '-'}
+                              </td>
+                              <td style={{ textAlign: 'right', fontFamily: '"GeistMono",monospace' }}>{fmtNum(r.pe_ttm_dynamic ?? r.pe_ttm)}</td>
+                              <td style={{ textAlign: 'right', fontFamily: '"GeistMono",monospace' }}>{fmtNum(r.pb_mrq_dynamic ?? r.pb_mrq)}</td>
+                              <td style={{ textAlign: 'right', fontFamily: '"GeistMono",monospace' }}>{fmtNum(r.ps_ttm_dynamic ?? r.ps_ttm)}</td>
                               <td style={{ textAlign: 'right', fontFamily: '"GeistMono",monospace' }}>{fmtNum(r.dividend_yield)}</td>
                               <td style={{ textAlign: 'right', fontFamily: '"GeistMono",monospace' }}>{fmtAmount(r.est_market_value_cny)}</td>
                             </tr>
@@ -225,9 +232,9 @@ export default function DrillableFundsPage({ bizDate }) {
                         </tbody>
                         <tfoot>
                           <tr style={{ fontWeight: 600, borderTop: '1px solid var(--border-strong)' }}>
-                            <td colSpan={2} style={{ color: 'var(--text-muted)', fontSize: 11 }}>合计 · {detail.constituents.length} 只</td>
+                            <td colSpan={2} style={{ color: 'var(--text-muted)', fontSize: 11 }}>合计 · {detail.constituents.filter(r => !r.is_cash).length} 只股票 + 现金</td>
                             <td style={{ textAlign: 'right', fontFamily: '"GeistMono",monospace' }}>100.00</td>
-                            <td colSpan={6}></td>
+                            <td colSpan={7}></td>
                             <td style={{ textAlign: 'right', fontFamily: '"GeistMono",monospace' }}>
                               {fmtAmount(detail.constituents.reduce((s, r) => s + (r.est_market_value_cny || 0), 0))}
                             </td>

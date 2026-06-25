@@ -128,9 +128,7 @@ def list_drillable_indices(db: Session, as_of_date: _date, user_id: int | None =
 
     a_q = db.query(AShareFinancialSnapshot).filter(AShareFinancialSnapshot.as_of_date == as_of_date)
     h_q = db.query(HKShareFinancialSnapshot).filter(HKShareFinancialSnapshot.as_of_date == as_of_date)
-    if user_id is not None:
-        a_q = a_q.filter(AShareFinancialSnapshot.user_id == user_id)
-        h_q = h_q.filter(HKShareFinancialSnapshot.user_id == user_id)
+    # 估值是市场公共数据，不按 user_id 过滤（2026-06-25）
     a_snap = {a.stock_code.split(".")[0]: a for a in a_q.all()}
     h_snap = {h.stock_code.split(".")[0]: h for h in h_q.all()}
 
@@ -175,16 +173,19 @@ def list_drillable_indices(db: Session, as_of_date: _date, user_id: int | None =
         bucket["fund_codes"].append(fund_code)
         bucket["prev_fund_value_total"] += fund_amount
 
-        # 5% 现金
-        if fund_price and fund_price > 0:
-            bucket["cash_value_cny"] += fund_shares * fund_price * 0.05
-
+        # 现金-下钻来自 FundDrillSnapshot 的 CASH 行（公共数据分解，非此层临时计算）
         for d in drill_rows:
+            is_cash_row = (d.stock_code == "CASH")
             user_drill_shares = fund_shares * (d.shares_equivalent or 0.0)
             baseline_price = d.baseline_price or 0.0
             current_price = d.current_price or 0.0
             static_amt = user_drill_shares * baseline_price
             est_amt = user_drill_shares * current_price
+
+            if is_cash_row:
+                # 现金行：计入 cash_value_cny，不计入 stock_set / PE 聚合
+                bucket["cash_value_cny"] += est_amt
+                continue
 
             bucket["static_amount_cny"] += static_amt
             bucket["est_market_value_cny"] += est_amt
@@ -277,13 +278,10 @@ def get_index_drill_detail(
         holdings_agg = _aggregate_holdings_by_fund(db, user_id=user_id)
     if a_snap is None:
         a_q = db.query(AShareFinancialSnapshot).filter(AShareFinancialSnapshot.as_of_date == as_of_date)
-        if user_id is not None:
-            a_q = a_q.filter(AShareFinancialSnapshot.user_id == user_id)
+        # 估值是市场公共数据，不按 user_id 过滤（2026-06-25）
         a_snap = {a.stock_code.split(".")[0]: a for a in a_q.all()}
     if h_snap is None:
         h_q = db.query(HKShareFinancialSnapshot).filter(HKShareFinancialSnapshot.as_of_date == as_of_date)
-        if user_id is not None:
-            h_q = h_q.filter(HKShareFinancialSnapshot.user_id == user_id)
         h_snap = {h.stock_code.split(".")[0]: h for h in h_q.all()}
 
     drill_cache = _load_drill_snapshots(db, fund_codes, as_of_date)
@@ -301,18 +299,21 @@ def get_index_drill_detail(
             continue
         for d in drill_rows:
             code = d.stock_code
+            is_cash_row = (code == "CASH")
             user_drill_shares = f_shares * (d.shares_equivalent or 0.0)
             current_price = d.current_price or 0.0
             baseline_price = d.baseline_price
             est_market_value = user_drill_shares * current_price
 
-            snap = _resolve_snap_for_code(db, code, as_of_date, a_snap, h_snap)
+            # 现金行无估值数据（CASH 不在 A/H 估值表中）
             pe_v = ps_v = pb_v = dy_v = None
-            if snap:
-                pe_v = snap.pe_ttm_dynamic if snap.pe_ttm_dynamic is not None else snap.pe_ttm
-                pb_v = snap.pb_mrq_dynamic if snap.pb_mrq_dynamic is not None else snap.pb_mrq
-                ps_v = snap.ps_ttm_dynamic if snap.ps_ttm_dynamic is not None else snap.ps_ttm
-                dy_v = snap.dividend_yield
+            if not is_cash_row:
+                snap = _resolve_snap_for_code(db, code, as_of_date, a_snap, h_snap)
+                if snap:
+                    pe_v = snap.pe_ttm_dynamic if snap.pe_ttm_dynamic is not None else snap.pe_ttm
+                    pb_v = snap.pb_mrq_dynamic if snap.pb_mrq_dynamic is not None else snap.pb_mrq
+                    ps_v = snap.ps_ttm_dynamic if snap.ps_ttm_dynamic is not None else snap.ps_ttm
+                    dy_v = snap.dividend_yield
 
             if code not in by_stock:
                 by_stock[code] = {
@@ -329,6 +330,7 @@ def get_index_drill_detail(
                     "ps_ttm": ps_v,
                     "dividend_yield": dy_v,
                     "from_funds": set(),
+                    "is_cash": is_cash_row,
                 }
             acc = by_stock[code]
             acc["shares_equivalent"] += user_drill_shares
@@ -342,11 +344,14 @@ def get_index_drill_detail(
     rows = []
     for s in by_stock.values():
         s["from_funds"] = sorted(s["from_funds"])
-        s["shares_equivalent_int_disp"] = int(round(s["shares_equivalent"]))
+        # 现金行 shares_equivalent 是金额（非股数），不取整显示
+        if not s.get("is_cash"):
+            s["shares_equivalent_int_disp"] = int(round(s["shares_equivalent"]))
         s["shares_equivalent"] = round(s["shares_equivalent"], 4)
         s["est_market_value_cny"] = round(s["est_market_value_cny"], 4)
         rows.append(s)
-    rows.sort(key=lambda r: r["est_market_value_cny"], reverse=True)
+    # 按估算市值降序，现金-下钻行排末尾
+    rows.sort(key=lambda r: (r.get("is_cash", False), -r["est_market_value_cny"]))
 
     return {
         "as_of_date": as_of_date.isoformat(),
@@ -409,6 +414,7 @@ def get_all_drilled_stocks(
                     "ps_ttm": c.get("ps_ttm"),
                     "dividend_yield": c.get("dividend_yield"),
                     "indices": set(),
+                    "is_cash": c.get("is_cash", False),
                 }
             acc = by_stock[code]
             acc["shares_equivalent"] += (c.get("shares_equivalent") or 0.0)
@@ -422,11 +428,13 @@ def get_all_drilled_stocks(
     stocks = []
     for s in by_stock.values():
         s["indices"] = sorted(s["indices"])
-        s["shares_equivalent_int_disp"] = int(round(s["shares_equivalent"]))
+        if not s.get("is_cash"):
+            s["shares_equivalent_int_disp"] = int(round(s["shares_equivalent"]))
         s["shares_equivalent"] = round(s["shares_equivalent"], 4)
         s["est_market_value_cny"] = round(s["est_market_value_cny"], 4)
         stocks.append(s)
-    stocks.sort(key=lambda r: r["est_market_value_cny"], reverse=True)
+    # 按估算市值降序，现金-下钻行排末尾
+    stocks.sort(key=lambda r: (r.get("is_cash", False), -r["est_market_value_cny"]))
 
     return {
         "as_of_date": as_of_date.isoformat(),

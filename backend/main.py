@@ -22,8 +22,17 @@ from schemas import (
     PriceSeries, PricePoint, ImportRequest, CrawlResponse,
     SecurityMasterOut, SecurityMasterUpsert,
     SecurityTypeConfigOut, SecurityTypeConfigUpsert,
+    TradeParseRequest, TradeParseResponse, ParsedTradeItem,
+    TradeConfirmRequest, TradeConfirmResponse, TradeUpdateRequest,
+    TradeOut, HoldingSnapshotOut, TradingSessionOut, SnapshotRangeOut,
 )
 from services.importer import import_excel, get_holdings_summary
+from services.trading_rebuild_service import (
+    ensure_initial_snapshot, rebuild_holdings_to_date,
+    get_snapshot_for_date, get_snapshot_date_range, get_trades_for_date,
+)
+from services.llm_service import parse_trades_with_llm
+from services.security_onboarding_service import onboard_new_security
 from middleware.auth import require_user, require_advisor, require_admin
 from services.penetration import PenetrationEngine
 from services.growth_bucketer import GrowthBucketer, IndustryChainAnalyzer
@@ -1506,7 +1515,12 @@ def code_map_coverage(
 
 
 @app.post("/api/admin/backfill-prices")
-def admin_backfill_prices(days: int = 90, db: Session = Depends(get_db)):
+def admin_backfill_prices(
+    request: Request,
+    days: int = 90,
+    db: Session = Depends(get_db),
+    user: User = Depends(require_admin),
+):
     """拉所有 holding 过去 N 天 daily price，写入 price_cache。
     来源：腾讯 K 线（A 股/港股/美股 ETF）+ akshare 净值走势（OF 基金）。
     只插真实数据；不编造。"""
@@ -2772,15 +2786,13 @@ def get_full_holding(
     _u, eff_uid = _resolve_eff_from_request(request, db)
     from services.drillable_funds import list_drillable_indices, get_index_drill_detail
 
-    # 1) 拉取快照数据 (用于 PE/PB/PS) — 按 user 隔离
+    # 1) 拉取快照数据 (用于 PE/PB/PS) — 估值是市场公共数据，不按 user 隔离（2026-06-25）
     a_snap = {a.stock_code.split(".")[0]: a for a in
               db.query(AShareFinancialSnapshot).filter(
-                  AShareFinancialSnapshot.user_id == eff_uid,
                   AShareFinancialSnapshot.as_of_date == as_of_date,
               ).all()}
     h_snap = {h.stock_code.split(".")[0]: h for h in
               db.query(HKShareFinancialSnapshot).filter(
-                  HKShareFinancialSnapshot.user_id == eff_uid,
                   HKShareFinancialSnapshot.as_of_date == as_of_date,
               ).all()}
     # 同样索引 suffix-stripped
@@ -2908,24 +2920,26 @@ def get_full_holding_table(
     request: Request = None,
     db: Session = Depends(get_db),
 ):
-    """全持仓表格专用接口（按 effective user 隔离 — 2026-06-24）"""
+    """全持仓表格专用接口（按 effective user 隔离 — 2026-06-24）
+
+    2026-06-25 迁移：drilled 段从旧模块 drillable_funds 切换到三层 service 架构
+    (drill_orchestration_service.get_all_drill_constituents)，用双币种算法，
+    保证与下钻页面 / 4 口径卡片算法一致。undrilled 段保持不变。
+    """
     from models import (
         AShareFinancialSnapshot, HKShareFinancialSnapshot, Holding, FundIndexMap,
-        FundDailyNav,
     )
-    from services.drillable_funds import list_drillable_indices, get_index_drill_detail
+    from services.drill_orchestration_service import get_all_drill_constituents
     from middleware.auth import _resolve_eff_from_request
     _u, eff_uid = _resolve_eff_from_request(request, db)
 
-    # 1) 快照一次性加载（按 user）
+    # 1) 快照一次性加载（估值是市场公共数据，不按 user 隔离 — 2026-06-25）
     a_snap_raw = {a.stock_code.split(".")[0]: a for a in
                   db.query(AShareFinancialSnapshot).filter(
-                      AShareFinancialSnapshot.user_id == eff_uid,
                       AShareFinancialSnapshot.as_of_date == as_of_date,
                   ).all()}
     h_snap_raw = {h.stock_code.split(".")[0]: h for h in
                   db.query(HKShareFinancialSnapshot).filter(
-                      HKShareFinancialSnapshot.user_id == eff_uid,
                       HKShareFinancialSnapshot.as_of_date == as_of_date,
                   ).all()}
 
@@ -2957,10 +2971,9 @@ def get_full_holding_table(
         acc["amount"] += (h.amount or 0.0)
         acc["amount_cny"] += (h.amount_cny or 0.0)
 
-    # 3) 可下钻基金
+    # 3) 可下钻基金 — FundIndexMap 是静态映射表（fund_code → index_code），不按日期过滤
     drillable_codes = {
-        m.fund_code for m in
-        db.query(FundIndexMap).filter(FundIndexMap.as_of_date == as_of_date).all()
+        m.fund_code for m in db.query(FundIndexMap).all()
     }
 
     # 4) 构建 undrilled 行（直接持股 + 未下钻基金 + 现金）
@@ -2997,71 +3010,40 @@ def get_full_holding_table(
             "fund_currency": acc["currency"],
         })
 
-    # 5) 一次性加载所有相关 fund NAVs
-    all_fund_codes = sorted(drillable_codes)
-    fund_navs_map: dict[str, dict] = {}
-    if all_fund_codes:
-        nav_rows = (
-            db.query(FundDailyNav)
-            .filter(
-                FundDailyNav.fund_code.in_(all_fund_codes),
-                FundDailyNav.trade_date.in_([as_of_date, date(2026, 6, 18)]),
-            )
-            .all()
-        )
-        for fc in all_fund_codes:
-            fund_navs_map[fc] = {"nav_529": None, "cumnav_529": None, "nav_618": None, "cumnav_618": None}
-        for r in nav_rows:
-            fc = r.fund_code
-            if r.trade_date == as_of_date:
-                fund_navs_map[fc]["nav_529"] = r.nav
-                fund_navs_map[fc]["cumnav_529"] = r.accumulated_nav
-            elif r.trade_date == date(2026, 6, 18):
-                fund_navs_map[fc]["nav_618"] = r.nav
-                fund_navs_map[fc]["cumnav_618"] = r.accumulated_nav
-
-    # 6) 下钻所有指数一次，并按 stock_code 聚合（按 user）
-    holdings_agg = {code: info for code, info in by_code.items() if info["quantity"] > 0}
+    # 5) 下钻：跨所有可下钻指数聚合成分股（按 user，含 CASH 行）
+    #    2026-06-25 迁移到三层 service 架构 (drill_orchestration_service.get_all_drill_constituents)，
+    #    双币种算法（est_market_value_cny = shares × current_price_cny，本币 CNY），
+    #    保证与下钻页面 / 4 口径卡片算法一致。
+    #    现金-下钻行（CASH）由 FundDrillSnapshot 公共数据分解生成，service 自动返回。
+    drilled_resp = get_all_drill_constituents(db, as_of_date, eff_uid)
     drilled_map: dict[str, dict] = {}
-    indices = list_drillable_indices(db, as_of_date, user_id=eff_uid)
-    for idx in indices:
-        detail = get_index_drill_detail(
-            db, idx["index_code"], as_of_date, user_id=eff_uid,
-            holdings_agg=holdings_agg,
-            fund_navs=fund_navs_map,
-            a_snap=a_snap,
-            h_snap=h_snap,
-        )
-        if "constituents" not in detail:
-            continue
-        idx_code = idx["index_code"]
-        for c in detail["constituents"]:
-            code = c["stock_code"]
-            if code not in drilled_map:
-                drilled_map[code] = {
-                    "stock_code": code,
-                    "stock_name": c.get("stock_name"),
-                    "shares_equivalent": 0,
-                    "current_price": c.get("current_price"),
-                    "baseline_price": c.get("baseline_price"),
-                    "est_market_value_cny": 0.0,
-                    "pe_ttm": c.get("pe_ttm"),
-                    "pb_mrq": c.get("pb_mrq"),
-                    "ps_ttm": c.get("ps_ttm"),
-                    "dividend_yield": c.get("dividend_yield"),
-                    "indices": set(),
-                }
-            acc = drilled_map[code]
-            acc["shares_equivalent"] += (c.get("shares_equivalent") or 0)
-            acc["est_market_value_cny"] += (c.get("est_market_value_cny") or 0)
-            acc["indices"].add(idx_code)
-            for k in ("current_price", "baseline_price", "pe_ttm", "pb_mrq", "ps_ttm", "dividend_yield"):
-                if acc.get(k) is None and c.get(k) is not None:
-                    acc[k] = c.get(k)
-
-    for s in drilled_map.values():
-        s["indices"] = sorted(s["indices"])
-        s["est_market_value_cny"] = round(s["est_market_value_cny"], 4)
+    if drilled_resp:
+        for s in drilled_resp.get("stocks", []):
+            code = s["stock_code"]
+            drilled_map[code] = {
+                "stock_code": code,
+                "stock_name": s.get("stock_name"),
+                "shares_equivalent": s.get("shares_equivalent", 0.0),
+                "baseline_price": s.get("baseline_price"),
+                "current_price": s.get("current_price"),
+                # 双币种字段 (2026-06-25)：本币(CNY)价，公共层算好存表
+                "baseline_price_cny": s.get("baseline_price_cny"),
+                "current_price_cny": s.get("current_price_cny"),
+                "est_market_value_cny": s.get("est_market_value_cny", 0.0),  # 本币 CNY（= shares × current_price_cny）
+                # 基准日估值（fallback 用）
+                "pe_ttm": s.get("pe_ttm"),
+                "pb_mrq": s.get("pb_mrq"),
+                "ps_ttm": s.get("ps_ttm"),
+                "dividend_yield": s.get("dividend_yield"),
+                # 动态估值（优先用，基于最新收盘价调整）
+                "pe_ttm_dynamic": s.get("pe_ttm_dynamic"),
+                "pb_mrq_dynamic": s.get("pb_mrq_dynamic"),
+                "ps_ttm_dynamic": s.get("ps_ttm_dynamic"),
+                "currency": s.get("currency"),
+                "fx_rate": s.get("fx_rate"),
+                "indices": s.get("indices", []),
+                "is_cash": s.get("is_cash", False),
+            }
 
     return {
         "as_of_date": as_of_date.isoformat(),
@@ -3101,9 +3083,9 @@ def get_top10_holdings(
     from middleware.auth import _resolve_eff_from_request
     _u, eff_uid = _resolve_eff_from_request(request, db)
     a_snap_raw = {a.stock_code.split(".")[0]: a for a in
-                  db.query(AShareFinancialSnapshot).filter_by(as_of_date=as_of_date, user_id=eff_uid).all()}
+                  db.query(AShareFinancialSnapshot).filter_by(as_of_date=as_of_date).all()}
     h_snap_raw = {h.stock_code.split(".")[0]: h for h in
-                  db.query(HKShareFinancialSnapshot).filter_by(as_of_date=as_of_date, user_id=eff_uid).all()}
+                  db.query(HKShareFinancialSnapshot).filter_by(as_of_date=as_of_date).all()}
     for k, v in list(a_snap_raw.items()):
         a_snap_raw.setdefault(v.stock_code, v)
     for k, v in list(h_snap_raw.items()):
@@ -3314,15 +3296,13 @@ def get_dimension_drilled(
         raise HTTPException(status_code=400, detail=f"Unsupported dim: {dim}")
     col = DIM_COL_DRILLED[dim]
 
-    # 1) 快照（按 user 隔离）
+    # 1) 快照（估值是市场公共数据，不按 user 隔离 — 2026-06-25）
     a_snap = {a.stock_code.split(".")[0]: a for a in
               db.query(AShareFinancialSnapshot).filter(
-                  AShareFinancialSnapshot.user_id == eff_uid,
                   AShareFinancialSnapshot.as_of_date == as_of_date,
               ).all()}
     h_snap = {h.stock_code.split(".")[0]: h for h in
               db.query(HKShareFinancialSnapshot).filter(
-                  HKShareFinancialSnapshot.user_id == eff_uid,
                   HKShareFinancialSnapshot.as_of_date == as_of_date,
               ).all()}
 
@@ -3888,9 +3868,7 @@ def _portfolio_scope_totals(db: Session, as_of_date: date, market: str,
     h_q = db.query(HKShareFinancialSnapshot).filter(
         HKShareFinancialSnapshot.as_of_date == as_of_date,
     )
-    if user_id is not None:
-        a_q = a_q.filter(AShareFinancialSnapshot.user_id == user_id)
-        h_q = h_q.filter(HKShareFinancialSnapshot.user_id == user_id)
+    # 估值是市场公共数据，不再按 user_id 过滤（2026-06-25）
     a_snap = {a.stock_code.split(".")[0]: a for a in a_q.all()}
     h_snap = {h.stock_code.split(".")[0]: h for h in h_q.all()}
     for code, snap in list(a_snap.items()):
@@ -4070,56 +4048,48 @@ def get_full_holding_summary(
     request: Request = None,
     db: Session = Depends(get_db),
 ):
-    """全持仓 4 口径估值对比 (虚拟盈利法) — 以最新收盘价计算.
+    """全持仓 4 口径估值对比 — 与下钻卡片完全一致的算法 (2026-06-25 迁移).
 
     4 个口径:
-      - drilled: 全持仓-下钻部分 全部证券 (drill 页面所有指数的聚合)
-      - a:       drilled 中 A 股部分
-      - h:       drilled 中港股部分
+      - drilled: 全持仓-下钻部分 全部证券 (所有可下钻指数的聚合)
+      - a_only:  drilled 中 A 股部分
+      - h_only:  drilled 中港股部分
       - csi300:  CSI 300 指数 (= 与下钻页面的 CSI 300 卡片数值相同, 仅作指标参照系,
                 不含金额 / 占比)
 
-    3 张卡片 (drilled / a / h) 算法 (以最新收盘价为口径):
-      amount = est_market_value_cny          (current price × shares, 原始币种, 前端折算 CNY)
-      price_ratio = current_price / baseline_price
-      pe_per_stock = pe_ttm × price_ratio    (PE at latest closing price)
-      virt_pe = Σ (amount / pe_per_stock)
-      weighted_pe = Σ amount / virt_pe
-      股息率 = Σ (amount × dy_per_stock) / Σ amount   where dy_per_stock = dy / price_ratio
+    3 张卡片 (drilled / a_only / h_only) 算法 (drill_orchestration_service.compute_scope_metrics,
+    与 drill_public_service.get_public_cards 完全一致):
+      weight_basis = shares_equivalent × baseline_price_cny   (基准日 CNY 金额)
+      price_ratio  = current_price_cny / baseline_price_cny
+      pe_dyn = pe_ttm_dynamic if pe_ttm_dynamic else (pe_ttm × price_ratio)
+      virt_pe = Σ (weight_basis / pe_dyn)
+      weighted_pe = Σ weight_basis / virt_pe                   (调和平均)
+      股息率 = Σ (weight_basis × dy_dyn) / Σ weight_basis      (算术平均)
+      dy_dyn = dividend_yield / price_ratio
 
-    CSI 300 直接复用 list_drillable_indices 返回的 000300 卡片 (5/29 amount × current PE),
-    但不返回 金额/占比 字段 (按用户口径: 仅作指标参照系).
+    双币种规则: weight_basis / price_ratio 均用本币(CNY)字段, 不再临时 ×fx_rate 折算,
+    保证 A 股/H 股量纲一致 (修复旧版港股通 8.26% 量纲偏差).
+
+    CSI 300 复用 drill_public_service.get_public_cards 返回的 000300 卡片,
+    与下钻页面 CSI300 卡片数值完全一致.
     """
-    from services.drillable_funds import list_drillable_indices, get_all_drilled_stocks
-    from models import AShareFinancialSnapshot, HKShareFinancialSnapshot, ExchangeRate
+    from services.drill_orchestration_service import get_all_drill_constituents, compute_scope_metrics
+    from services.drill_public_service import get_public_cards
+    from models import AShareFinancialSnapshot, HKShareFinancialSnapshot
     from middleware.auth import _resolve_eff_from_request
     _u, eff_uid = _resolve_eff_from_request(request, db)
 
-    indices = list_drillable_indices(db, as_of_date, user_id=eff_uid)
-    drilled_resp = get_all_drilled_stocks(db, as_of_date, user_id=eff_uid)
-    all_stocks = drilled_resp.get("stocks") or []
+    # 下钻成分股聚合（用新三层 service 架构，双币种算法）
+    drilled_resp = get_all_drill_constituents(db, as_of_date, eff_uid)
+    all_stocks = (drilled_resp or {}).get("stocks") or []
 
-    # 拉最新汇率 (按 from_currency 取最大 rate_date), 用于将 est_market_value_cny 折算 CNY
-    fx_rates = {"CNY": 1.0}
-    for fc in ("USD", "HKD"):
-        rate_row = (
-            db.query(ExchangeRate)
-            .filter(ExchangeRate.from_currency == fc, ExchangeRate.to_currency == "CNY")
-            .order_by(ExchangeRate.rate_date.desc())
-            .first()
-        )
-        if rate_row:
-            fx_rates[fc] = rate_row.rate
-
-    # A / HK 检测（按 user 隔离）
+    # A / HK 检测（估值是市场公共数据，不按 user 隔离 — 2026-06-25）
     a_snap_keys = {a.stock_code.split(".")[0] for a in
                    db.query(AShareFinancialSnapshot).filter(
-                       AShareFinancialSnapshot.user_id == eff_uid,
                        AShareFinancialSnapshot.as_of_date == as_of_date,
                    ).all()}
     h_snap_keys = {h.stock_code.split(".")[0] for h in
                    db.query(HKShareFinancialSnapshot).filter(
-                       HKShareFinancialSnapshot.user_id == eff_uid,
                        HKShareFinancialSnapshot.as_of_date == as_of_date,
                    ).all()}
     a_stocks, h_stocks = [], []
@@ -4134,12 +4104,17 @@ def get_full_holding_summary(
         else:
             a_stocks.append(s)
 
-    drilled_card = _compute_drill_virtual_earnings(all_stocks, fx_rates=fx_rates)
-    a_card = _compute_drill_virtual_earnings(a_stocks, fx_rates=fx_rates)
-    h_card = _compute_drill_virtual_earnings(h_stocks, fx_rates=fx_rates)
+    # 4 口径指标：用与下钻卡片完全一致的算法 (compute_scope_metrics)
+    # weight_basis = shares_eq × baseline_price_cny，调和平均 PE/PB/PS，算术平均 DY
+    drilled_card = compute_scope_metrics(all_stocks)
+    a_card = compute_scope_metrics(a_stocks)
+    h_card = compute_scope_metrics(h_stocks)
 
     # CSI 300: 仅指标 (参照系, 不含金额 / 占比)
-    csi300_src = next((c for c in indices if c["index_code"] == "000300"), None)
+    # 2026-06-25：改用 drill_public_service.get_public_cards 返回的 000300 卡片，
+    # 与下钻页面 CSI300 卡片数值完全一致。
+    public_cards = get_public_cards(db, as_of_date)
+    csi300_src = next((c for c in public_cards if c["index_code"] == "000300"), None)
     if csi300_src:
         csi300_card = {
             "stock_count": csi300_src.get("stock_count"),
@@ -4491,6 +4466,190 @@ def admin_fill_prices_tencent(
     """通过腾讯 API 拉取 current_price，填充 price_cache + 重算 dynamic PE/PB/PS。"""
     from services.price_filler import fill_prices_for_as_of
     return fill_prices_for_as_of(db, as_of_date, max_codes=max_codes)
+
+
+@app.post("/api/admin/fill-prices-all")
+def admin_fill_prices_all(
+    db: Session = Depends(get_db),
+    user: User = Depends(require_admin),
+):
+    """管理员一键增量刷新所有用户持仓的最新价格（公共数据层模式）。
+
+    设计：全用户持仓并集去重 + 增量刷新（走 RealtimePriceCache 15min TTL，
+    缓存命中跳过，过期才调 API；.OF 走 FundDailyNav）。每个唯一 code 只调一次 API，
+    避免多用户持同 code 时 API 请求爆炸。
+
+    流程：
+    1. 取所有 user 持仓的 (code, asset_type, currency) 并集去重
+    2. 对每个唯一 code 调 get_realtime_price（TTL 增量）
+    3. 遍历所有 user 的 Holding 行，用公共缓存价格回填 h.price/h.amount/h.amount_cny
+    """
+    from services.price_cache import get_realtime_price
+    from crawlers.exchange_rates import get_rate, update_rates_today
+    from models import Holding
+
+    update_rates_today(db)
+
+    # 1. 全用户持仓并集去重
+    rows = db.query(
+        Holding.security_code,
+        Holding.asset_type,
+        Holding.currency,
+    ).group_by(
+        Holding.security_code, Holding.asset_type, Holding.currency
+    ).all()
+
+    # 2. 增量刷新公共缓存（TTL 命中跳过，过期才调 API）
+    price_map = {}  # (code, asset_type, currency) -> price
+    cache_hit = 0
+    cache_refreshed = 0
+    cache_miss = 0
+    for code, asset_type, currency in rows:
+        if not code:
+            continue
+        price, source, status = get_realtime_price(db, code, asset_type, currency or 'CNY')
+        if status == "hit":
+            cache_hit += 1
+        elif status in ("refreshed", "nav"):
+            cache_refreshed += 1
+        else:  # stale / miss
+            cache_miss += 1
+        if price and price > 0:
+            price_map[(code, asset_type, currency)] = price
+
+    # 3. 回填所有 user 的 Holding 行
+    all_holdings = db.query(Holding).all()
+    holdings_updated = 0
+    for h in all_holdings:
+        key = (h.security_code, h.asset_type, h.currency)
+        price = price_map.get(key)
+        if price and price > 0:
+            h.price = round(price, 4)
+            h.amount = round(h.quantity * price, 2)
+            rate = get_rate(db, h.currency, 'CNY')
+            if rate and rate > 0:
+                h.amount_cny = round(h.amount * rate, 2)
+            else:
+                h.amount_cny = h.amount
+            holdings_updated += 1
+
+    db.commit()
+
+    return {
+        "status": "ok",
+        "unique_codes": len(rows),
+        "cache_hit": cache_hit,
+        "cache_refreshed": cache_refreshed,
+        "cache_miss": cache_miss,
+        "holdings_updated": holdings_updated,
+        "total_holdings": len(all_holdings),
+    }
+
+
+@app.post("/api/admin/refresh-analysis-prices")
+def admin_refresh_analysis_prices(
+    as_of_date: date = Query(..., description="分析页快照日期 (YYYY-MM-DD)"),
+    days: int = Query(5, ge=1, le=30, description="基金净值回补天数"),
+    max_codes: int = Query(200, ge=1, le=5000, description="单次最大处理股票数（分批触发用，避免单次超时）"),
+    db: Session = Depends(get_db),
+    user: User = Depends(require_admin),
+):
+    """管理员一键增量刷新分析页全持仓的最近收盘价（公共数据层模式）。
+
+    范围：FullHoldingSnapshot 全用户下钻持仓并集（公共表，天然跨用户）。
+    增量策略：
+    - 下钻股票 (drilled_fund + direct_stock)：调 fill_prices_for_as_of，
+      只填 AShare/HKShareFinancialSnapshot 中 current_price IS NULL 的行（不覆盖已有值）
+    - 未下钻基金 (undrilled_fund)：调 fetch_fund_nav_history 拉净值，
+      只插 FundDailyNav 中不存在的 (fund_code, trade_date) 行（ux_fdn_code_date 保证幂等）
+
+    注意：322+ 行 NULL 串行调腾讯 API 可能超 120s，用 max_codes 分批触发。
+    返回 remaining_null，admin 见 >0 则再次触发。
+    """
+    from services.price_filler import fill_prices_for_as_of
+    from services.importer import fetch_fund_nav_history
+    from models import (
+        FullHoldingSnapshot, FundDailyNav,
+        AShareFinancialSnapshot, HKShareFinancialSnapshot,
+    )
+    from datetime import date as _date, timedelta
+
+    biz = as_of_date
+
+    # 1. 下钻股票：增量填 current_price IS NULL 的 snapshot 行（不覆盖已有）
+    stock_result = fill_prices_for_as_of(db, biz, max_codes=max_codes)
+
+    # 2. 未下钻基金：增量补 FundDailyNav 缺失日期
+    funds = db.query(FullHoldingSnapshot.stock_code).filter(
+        FullHoldingSnapshot.as_of_date == biz,
+        FullHoldingSnapshot.source_type == 'undrilled_fund',
+    ).distinct().all()
+
+    funds_attempted = 0
+    funds_nav_written = 0
+    funds_skipped = 0
+    cutoff = _date.today() - timedelta(days=days)
+    for (code,) in funds:
+        if not code or not code.endswith('.OF'):
+            continue
+        funds_attempted += 1
+        # FundDailyNav.fund_code 存带后缀的完整代码（与 holdings.security_code 一致）
+        try:
+            nav_history = fetch_fund_nav_history(code.replace('.OF', ''), days=days)
+            if not nav_history:
+                funds_skipped += 1
+                continue
+            for p in nav_history:
+                try:
+                    d = _date.fromisoformat(p['date']) if isinstance(p['date'], str) else p['date']
+                except (ValueError, TypeError):
+                    continue
+                if d < cutoff:
+                    continue
+                # 增量：只插不存在的行
+                exists = db.query(FundDailyNav).filter(
+                    FundDailyNav.fund_code == code,
+                    FundDailyNav.trade_date == d,
+                ).first()
+                if exists:
+                    continue
+                db.add(FundDailyNav(
+                    fund_code=code,
+                    trade_date=d,
+                    nav=p.get('close'),
+                    source="admin_refresh",
+                ))
+                funds_nav_written += 1
+        except Exception:
+            continue
+    db.commit()
+
+    # 3. 查剩余 NULL 行数（让 admin 知道是否需要再次触发）
+    a_remaining = db.query(AShareFinancialSnapshot).filter(
+        AShareFinancialSnapshot.as_of_date == biz,
+        AShareFinancialSnapshot.current_price.is_(None),
+    ).count()
+    h_remaining = db.query(HKShareFinancialSnapshot).filter(
+        HKShareFinancialSnapshot.as_of_date == biz,
+        HKShareFinancialSnapshot.current_price.is_(None),
+    ).count()
+
+    return {
+        "status": "ok",
+        "as_of_date": biz.isoformat(),
+        "stocks": stock_result,
+        "funds": {
+            "attempted": funds_attempted,
+            "nav_rows_written": funds_nav_written,
+            "skipped_no_data": funds_skipped,
+        },
+        "remaining_null": {
+            "a_share": a_remaining,
+            "hk": h_remaining,
+            "total": a_remaining + h_remaining,
+            "hint": "如 total>0，再次触发本端点继续填充（每次最多 max_codes 只）" if (a_remaining + h_remaining) > 0 else "全部填充完成",
+        },
+    }
 
 
 # ==================== 数据新鲜度 + 数据预览 ====================
@@ -5529,3 +5688,306 @@ def admin_refresh_overseas_financials(db: Session = Depends(get_db)):
         return {"status": "ok", "fetched": 0, "stored": 0, "errors": ["无海外持仓"]}
     result = fetch_and_store_overseas_financials(db, overseas_codes, date.today())
     return result
+
+
+# ==================== 交易记录驱动的持仓重建 (2026-06-26) ====================
+
+@app.post("/api/trades/parse", response_model=TradeParseResponse)
+def parse_trades_endpoint(
+    req: TradeParseRequest,
+    user: User = Depends(require_user),
+    db: Session = Depends(get_db),
+):
+    """解析粘贴的交易记录文本，对新代码自动入库。
+
+    流程：
+    1. 调 parse_trades_with_llm 解析文本
+    2. 对每条交易的 security_code 查 SecurityMaster；不存在则调 onboard_new_security
+    3. 返回解析结果 + 每条交易的证券状态
+    """
+    from models import SecurityMaster
+    write_uid = user.id  # POST 写入用 user.id（不支持 view_as 写入）
+
+    parsed = parse_trades_with_llm(req.text)
+    if parsed is None:
+        return TradeParseResponse(trades=[], parse_error="LLM 解析失败，请检查文本格式或检查 LLM_API_KEY 配置")
+
+    items: list[ParsedTradeItem] = []
+    for t in parsed:
+        code = (t.get("security_code") or "").strip()
+        name = (t.get("security_name") or "").strip()
+        status = "exists"
+        message = None
+
+        # 查 SecurityMaster，不存在则 onboard
+        sm = db.query(SecurityMaster).filter_by(security_code=code).first() if code else None
+        if code and not sm:
+            try:
+                result = onboard_new_security(db, code, name, context="trades/parse")
+                status = "new_verified" if result.get("security_verified") else "new_unverified"
+                message = result.get("message")
+                db.commit()
+            except Exception as e:
+                db.rollback()
+                status = "failed"
+                message = f"入库失败: {e}"
+
+        items.append(ParsedTradeItem(
+            trade_date=t.get("trade_date"),
+            security_code=code,
+            security_name=name,
+            trade_type=t.get("trade_type", "buy"),
+            confirmed_shares=float(t.get("confirmed_shares") or 0.0),
+            confirmed_amount=float(t.get("confirmed_amount") or 0.0),
+            nav_price=t.get("nav_price"),
+            nav_date=t.get("nav_date"),
+            fee=t.get("fee"),
+            remarks=t.get("remarks"),
+            security_status=status,
+            security_message=message,
+        ))
+
+    return TradeParseResponse(trades=items, parse_error=None)
+
+
+@app.post("/api/trades/confirm", response_model=TradeConfirmResponse)
+def confirm_trades_endpoint(
+    req: TradeConfirmRequest,
+    user: User = Depends(require_user),
+    db: Session = Depends(get_db),
+):
+    """用户确认提交交易，写入 Transaction 表并触发重算。
+
+    流程：
+    1. 逐条 upsert 到 Transaction 表（按唯一约束去重）
+    2. 调 rebuild_holdings_to_date 重算到今天
+    3. 返回最新持仓快照
+    """
+    from models import Transaction, SecurityMaster
+    write_uid = user.id  # POST 写入用 user.id
+
+    today = date.today()
+    confirmed_count = 0
+    for item in req.trades:
+        # upsert：按唯一约束 (user_id, trade_date, security_code, trade_type, confirmed_amount) 去重
+        existing = db.query(Transaction).filter(
+            Transaction.user_id == write_uid,
+            Transaction.trade_date == item.trade_date,
+            Transaction.security_code == item.security_code,
+            Transaction.trade_type == item.trade_type,
+            Transaction.confirmed_amount == item.confirmed_amount,
+        ).first()
+        if existing:
+            # 更新可编辑字段
+            existing.security_name = item.security_name
+            existing.confirmed_shares = item.confirmed_shares
+            existing.nav_price = item.nav_price
+            existing.nav_date = item.nav_date
+            existing.fee = item.fee
+            existing.remarks = item.remarks
+        else:
+            sm_exists = db.query(SecurityMaster).filter_by(security_code=item.security_code).first() is not None
+            db.add(Transaction(
+                user_id=write_uid,
+                trade_date=item.trade_date,
+                security_code=item.security_code,
+                security_name=item.security_name,
+                trade_type=item.trade_type,
+                confirmed_shares=item.confirmed_shares,
+                confirmed_amount=item.confirmed_amount,
+                nav_price=item.nav_price,
+                nav_date=item.nav_date,
+                fee=item.fee,
+                remarks=item.remarks,
+                security_verified=sm_exists,
+                security_added_to_master=sm_exists,
+                import_batch=f"confirm_{today.isoformat()}",
+            ))
+            db.flush()  # autoflush=False：确保同批次后续 query 能查到，防止重复 add 触发 UniqueViolation
+            confirmed_count += 1
+    db.commit()
+
+    # 触发重算到今天（增量）
+    rebuild_holdings_to_date(db, write_uid, today, force=False)
+
+    # 返回最新日持仓快照
+    snapshot_rows = get_snapshot_for_date(db, write_uid, today) or []
+    return TradeConfirmResponse(
+        confirmed_count=confirmed_count,
+        latest_snapshot=[HoldingSnapshotOut(**row) for row in snapshot_rows],
+    )
+
+
+@app.get("/api/trades", response_model=list[TradeOut])
+def list_trades(
+    start_date: date | None = None,
+    end_date: date | None = None,
+    request: Request = None,
+    user: User = Depends(require_user),
+    db: Session = Depends(get_db),
+):
+    """查询交易记录列表（支持日期范围过滤）。"""
+    from models import Transaction
+    from middleware.auth import _resolve_eff_from_request
+    _u, eff_uid = _resolve_eff_from_request(request, db)
+    q = db.query(Transaction).filter(Transaction.user_id == eff_uid)
+    if start_date:
+        q = q.filter(Transaction.trade_date >= start_date)
+    if end_date:
+        q = q.filter(Transaction.trade_date <= end_date)
+    rows = q.order_by(Transaction.trade_date.desc()).all()
+    return [TradeOut.model_validate(r) for r in rows]
+
+
+@app.put("/api/trades/{trade_id}", response_model=TradeOut)
+def update_trade(
+    trade_id: int,
+    req: TradeUpdateRequest,
+    user: User = Depends(require_user),
+    db: Session = Depends(get_db),
+):
+    """更新单条历史交易，触发全量重算（编辑历史交易后，从该日期起的快照需刷新）。
+
+    流程：
+    1. 查找交易记录（by id + user_id，不支持 view_as 写入）
+    2. 更新可编辑字段
+    3. force=True 全量重算到今天
+    """
+    from models import Transaction
+    write_uid = user.id
+
+    trade = db.query(Transaction).filter(
+        Transaction.id == trade_id,
+        Transaction.user_id == write_uid,
+    ).first()
+    if not trade:
+        from fastapi import HTTPException
+        raise HTTPException(404, "交易记录不存在")
+
+    # 记录旧日期，用于确定重算起点
+    old_date = trade.trade_date
+
+    # 更新字段
+    trade.trade_date = req.trade_date
+    trade.security_code = req.security_code
+    trade.security_name = req.security_name
+    trade.trade_type = req.trade_type
+    trade.confirmed_shares = req.confirmed_shares
+    trade.confirmed_amount = req.confirmed_amount
+    trade.nav_price = req.nav_price
+    trade.nav_date = req.nav_date
+    trade.fee = req.fee
+    trade.remarks = req.remarks
+    db.commit()
+
+    # 编辑历史交易 → 从该交易日期起增量重算（非全量，性能更优）
+    # 回退 last_rebuild_date，让 rebuild_holdings_to_date(force=False) 覆盖该日期
+    from datetime import timedelta
+    from models import TradingSession as _TS
+    rebuild_from = min(old_date, req.trade_date)
+    sess = db.query(_TS).filter(_TS.user_id == write_uid).first()
+    if sess:
+        new_last = rebuild_from - timedelta(days=1)
+        if not sess.last_rebuild_date or new_last < sess.last_rebuild_date:
+            sess.last_rebuild_date = new_last
+            db.flush()
+    rebuild_holdings_to_date(db, write_uid, date.today(), force=False)
+
+    return TradeOut.model_validate(trade)
+
+
+@app.delete("/api/trades/{trade_id}")
+def delete_trade(
+    trade_id: int,
+    user: User = Depends(require_user),
+    db: Session = Depends(get_db),
+):
+    """删除单条历史交易，触发从该日期起的增量重算。"""
+    from models import Transaction
+    from fastapi import HTTPException
+    write_uid = user.id
+
+    trade = db.query(Transaction).filter(
+        Transaction.id == trade_id,
+        Transaction.user_id == write_uid,
+    ).first()
+    if not trade:
+        raise HTTPException(404, "交易记录不存在")
+
+    # 记录删除前日期，用于确定重算起点
+    rebuild_from = trade.trade_date
+
+    db.delete(trade)
+    db.commit()
+
+    # 删除历史交易 → 从该日期起增量重算（非全量，性能更优）
+    from datetime import timedelta
+    from models import TradingSession as _TS
+    sess = db.query(_TS).filter(_TS.user_id == write_uid).first()
+    if sess:
+        new_last = rebuild_from - timedelta(days=1)
+        if not sess.last_rebuild_date or new_last < sess.last_rebuild_date:
+            sess.last_rebuild_date = new_last
+            db.flush()
+    rebuild_holdings_to_date(db, write_uid, date.today(), force=False)
+
+    return {"ok": True, "deleted_id": trade_id}
+
+
+@app.get("/api/trading-session", response_model=TradingSessionOut | None)
+def get_trading_session_endpoint(
+    request: Request,
+    user: User = Depends(require_user),
+    db: Session = Depends(get_db),
+):
+    """查询当前用户的交易会话（起始日、最近重算日等）。"""
+    from models import TradingSession
+    from middleware.auth import _resolve_eff_from_request
+    _u, eff_uid = _resolve_eff_from_request(request, db)
+    ts = db.query(TradingSession).filter_by(user_id=eff_uid).first()
+    return TradingSessionOut.model_validate(ts) if ts else None
+
+
+@app.get("/api/holdings/snapshot", response_model=list[HoldingSnapshotOut])
+def get_snapshot_endpoint(
+    as_of: date,
+    request: Request,
+    user: User = Depends(require_user),
+    db: Session = Depends(get_db),
+):
+    """查询某日持仓快照（含 CASH 行）。"""
+    from middleware.auth import _resolve_eff_from_request
+    _u, eff_uid = _resolve_eff_from_request(request, db)
+    rows = get_snapshot_for_date(db, eff_uid, as_of)
+    if rows is None:
+        return []
+    return [HoldingSnapshotOut(**row) for row in rows]
+
+
+@app.get("/api/holdings/snapshot-range", response_model=SnapshotRangeOut)
+def get_snapshot_range_endpoint(
+    request: Request,
+    user: User = Depends(require_user),
+    db: Session = Depends(get_db),
+):
+    """查询快照日期范围（用于前端日期控件 min/max）。"""
+    from middleware.auth import _resolve_eff_from_request
+    _u, eff_uid = _resolve_eff_from_request(request, db)
+    rng = get_snapshot_date_range(db, eff_uid)
+    if rng is None:
+        return SnapshotRangeOut(start_date=None, end_date=None)
+    return SnapshotRangeOut(start_date=rng[0], end_date=rng[1])
+
+
+@app.get("/api/holdings/daily-trades", response_model=list[TradeOut])
+def get_daily_trades_endpoint(
+    as_of: date,
+    request: Request,
+    user: User = Depends(require_user),
+    db: Session = Depends(get_db),
+):
+    """查询某日交易记录（用于估值表当日交易可视）。"""
+    from middleware.auth import _resolve_eff_from_request
+    _u, eff_uid = _resolve_eff_from_request(request, db)
+    rows = get_trades_for_date(db, eff_uid, as_of)
+    return [TradeOut(**row) for row in rows]

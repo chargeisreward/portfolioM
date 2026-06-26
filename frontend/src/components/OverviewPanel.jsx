@@ -2,7 +2,6 @@ import React, { useState, useEffect, useRef, useMemo, useCallback } from 'react'
 import * as echarts from 'echarts'
 import * as api from '../api'
 import { rawApi } from '../api'
-import MetricTimeseriesChart from './MetricTimeseriesChart'
 
 const CAT_LABELS = { a_share_equity:'A股基金', a_share_etf:'A股ETF', bond:'债券', gold:'黄金', hk_equity:'港股', qdii_equity:'QDII', us_stock:'美股', us_etf:'美股ETF' }
 const CAT_SHORT = { a_share_equity:'A基主动', a_share_etf:'A基指数', bond:'债券', gold:'黄金', hk_equity:'港股', qdii_equity:'QDI', us_stock:'美股', us_etf:'美股E' }
@@ -45,8 +44,7 @@ export default function OverviewPanel() {
   const [type2Filter, setType2Filter] = useState('all')
   const [kpi, setKpi] = useState(null)        // spec §4.8: real KPI from /api/penetration/kpi
   const [bizDate, setBizDate] = useState(null) // for KPI fetch param
-  const [expandedKpi, setExpandedKpi] = useState(null)  // 'pe' | 'daily_change' | 'tech_weight' | null
-  const [kpiWindow, setKpiWindow] = useState(90)
+  const [marketIndices, setMarketIndices] = useState([])
   const [drillableCodes, setDrillableCodes] = useState(new Set())  // 可下钻基金代码集合
 
   // 获取可下钻基金代码列表（SecurityMaster.is_drillable=True）
@@ -55,6 +53,14 @@ export default function OverviewPanel() {
       const codes = new Set((r.data || []).filter(s => s.is_drillable).map(s => s.security_code))
       setDrillableCodes(codes)
     }).catch(() => {})
+  }, [])
+
+  // 市场指数涨跌幅（30秒刷新）
+  useEffect(() => {
+    const fetchIndices = () => rawApi.get('/market/indices').then(r => setMarketIndices(r.data?.indices || [])).catch(() => {})
+    fetchIndices()
+    const timer = setInterval(fetchIndices, 30000)
+    return () => clearInterval(timer)
   }, [])
 
   useEffect(() => {
@@ -337,13 +343,13 @@ export default function OverviewPanel() {
           <div className="kpi-sub">{currency}</div>
         </div>
         <div className="kpi-card"><div className="kpi-label">穿透股票</div><div className="kpi-value">{kpi ? kpi.drilled_stock_count : (penTable.length || '—')}</div><div className="kpi-sub">{summary?.fund_count||0}基金</div></div>
-        <div className="kpi-card" style={{ cursor: 'pointer' }} onClick={() => setExpandedKpi(prev => prev === 'pe' ? null : 'pe')}>
-          <div className="kpi-label">组合PE {expandedKpi === 'pe' ? '▼' : '▸'}</div>
-          <div className="kpi-value">{(kpi?.portfolio_pe_weighted ?? pe.portfolio_weighted_pe)?.toFixed(1)||'—'}</div>
+        <div className="kpi-card">
+          <div className="kpi-label">基金下钻 PE</div>
+          <div className="kpi-value">{kpi?.portfolio_pe_weighted?.toFixed(1) || '—'}</div>
           <div className="kpi-sub">300: {(kpi?.csi300_pe ?? pe.csi300_pe)?.toFixed(1) || '—'}</div>
         </div>
-        <div className="kpi-card" style={{ cursor: 'pointer' }} onClick={() => setExpandedKpi(prev => prev === 'daily_change' ? null : 'daily_change')}>
-          <div className="kpi-label">当日涨幅 {expandedKpi === 'daily_change' ? '▼' : '▸'}</div>
+        <div className="kpi-card">
+          <div className="kpi-label">上日涨跌幅</div>
           <div className="kpi-value" style={{
             color: kpi?.daily_change_pct == null ? undefined
                    : (kpi.daily_change_pct > 0 ? 'var(--up)'
@@ -355,14 +361,31 @@ export default function OverviewPanel() {
               : '—'}
           </div>
           <div className="kpi-sub" style={{ fontSize: 10 }}>
-            {kpi?.daily_change_breakdown?.prev_trade_date
-              ? `vs ${kpi.daily_change_breakdown.prev_trade_date} 收盘`
+            {kpi?.daily_change_breakdown?.latest_trade_date && kpi?.daily_change_breakdown?.prev_trade_date
+              ? `${kpi.daily_change_breakdown.latest_trade_date} vs ${kpi.daily_change_breakdown.prev_trade_date}`
               : '未加载'}
           </div>
         </div>
-        <div className="kpi-card"><div className="kpi-label">Forecast PE</div><div className="kpi-value">{pe.portfolio_forecast_pe_1y?.toFixed(1)||'—'}</div><div className="kpi-sub">1年后预期</div></div>
-        <div className="kpi-card" style={{ cursor: 'pointer' }} onClick={() => setExpandedKpi(prev => prev === 'tech_weight' ? null : 'tech_weight')}>
-          <div className="kpi-label">科技占比 {expandedKpi === 'tech_weight' ? '▼' : '▸'}</div>
+        <div className="kpi-card">
+          <div className="kpi-label">当日涨跌幅</div>
+          <div className="kpi-value" style={{
+            color: kpi?.intraday_change_pct == null ? undefined
+                   : (kpi.intraday_change_pct > 0 ? 'var(--up)'
+                   : kpi.intraday_change_pct < 0 ? 'var(--down)' : undefined),
+            fontWeight: 600,
+          }}>
+            {kpi?.intraday_change_pct != null
+              ? (kpi.intraday_change_pct > 0 ? '+' : '') + kpi.intraday_change_pct.toFixed(2) + '%'
+              : '—'}
+          </div>
+          <div className="kpi-sub" style={{ fontSize: 10 }}>
+            {kpi?.intraday_breakdown?.covered_count > 0
+              ? `覆盖 ${kpi.intraday_breakdown.covered_count} 只`
+              : '盘中实时'}
+          </div>
+        </div>
+        <div className="kpi-card">
+          <div className="kpi-label">科技占比</div>
           <div className="kpi-value">{kpi?.tech_weight_pct != null ? kpi.tech_weight_pct.toFixed(1) + '%' : '—'}</div>
           <div className="kpi-sub" style={{ fontSize: 10 }}>
             {kpi?.tech_weight_breakdown
@@ -372,29 +395,26 @@ export default function OverviewPanel() {
         </div>
       </div>
 
-      {expandedKpi && (
-        <div className="raised" style={{ padding: 12, marginBottom: 10 }}>
-          <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', marginBottom: 8 }}>
-            <span className="section-title">
-              {expandedKpi === 'pe' ? '组合PE 序时' :
-               expandedKpi === 'daily_change' ? '当日涨幅 序时' :
-               expandedKpi === 'tech_weight' ? '科技占比 序时' : ''}
-            </span>
-            <div style={{ display: 'flex', gap: 6, alignItems: 'center' }}>
-              <select value={kpiWindow} onChange={e => setKpiWindow(Number(e.target.value))}>
-                <option value={90}>近 90 天</option>
-                <option value={180}>近 180 天</option>
-                <option value={360}>近 360 天</option>
-              </select>
-              <button className="btn-ghost" onClick={() => setExpandedKpi(null)}>折叠</button>
+      {/* 市场指数涨跌幅 */}
+      <div className="kpi-grid" style={{ gridTemplateColumns: 'repeat(6, 1fr)', marginTop: 4 }}>
+        {marketIndices.map(idx => (
+          <div className="kpi-card" key={idx.code}>
+            <div className="kpi-label">{idx.name}</div>
+            <div className="kpi-value" style={{
+              color: idx.change_pct == null ? undefined
+                     : (idx.change_pct > 0 ? 'var(--up)'
+                     : idx.change_pct < 0 ? 'var(--down)' : undefined),
+              fontWeight: 600,
+              fontSize: 18,
+            }}>
+              {idx.change_pct != null
+                ? (idx.change_pct > 0 ? '+' : '') + idx.change_pct.toFixed(2) + '%'
+                : '—'}
             </div>
+            <div className="kpi-sub" style={{ fontSize: 10 }}>当日涨跌幅</div>
           </div>
-          <MetricTimeseriesChart metric="pe_weighted" window={kpiWindow} scope="both" />
-          <div style={{ fontSize: 11, color: 'var(--text-muted)', marginTop: 4 }}>
-            当日涨幅/科技占比的序时口径暂统一展示 PE 序时（其他维度需 future 计算）
-          </div>
-        </div>
-      )}
+        ))}
+      </div>
 
       {/* 本位币切换（总资产下方） */}
       <div className="raised" style={{ padding: '8px 12px', display: 'flex', alignItems: 'center', gap: 8 }}>

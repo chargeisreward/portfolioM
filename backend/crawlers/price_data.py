@@ -68,6 +68,7 @@ def fetch_tencent_quote(ticker: str) -> dict | None:
             "low": _safe_float(parts, 34),
             "open": _safe_float(parts, 5),
             "prev_close": _safe_float(parts, 4),
+            "change_pct": _safe_float(parts, 32),  # 原生涨跌幅% (parts[32])
             "volume": _safe_float(parts, 36),
             "turnover_rate": _safe_get(parts, 38),
             "amplitude": _safe_get(parts, 43),
@@ -368,6 +369,13 @@ def fetch_price_history(ticker: str, days: int = 365, *, force: bool = False) ->
 
 
 # ---------- 工具函数 ----------
+
+def _compute_change_pct(price: float | None, prev_close: float | None) -> float | None:
+    """计算涨跌幅% = (price - prev_close) / prev_close * 100"""
+    if price is None or prev_close is None or prev_close <= 0:
+        return None
+    return round((price - prev_close) / prev_close * 100, 4)
+
 
 def _safe_get(parts: list, idx: int) -> str | None:
     return parts[idx].strip() if idx < len(parts) and parts[idx].strip() not in ("", "-") else None

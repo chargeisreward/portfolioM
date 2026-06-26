@@ -238,7 +238,8 @@ class PriceCache(Base):
     high_px = Column(Float, nullable=True)
     low_px = Column(Float, nullable=True)
     volume = Column(Float, nullable=True)
-    source = Column(String(20))  # tencent / yfinance / akshare
+    source = Column(String(20))  # tencent / yfinance / akshare / intraday
+    change_pct = Column(Float, nullable=True)  # 盘中实时涨跌幅% (intraday)
     created_at = Column(DateTime, default=datetime.utcnow)
 
 

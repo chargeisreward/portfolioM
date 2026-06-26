@@ -24,19 +24,28 @@ def _load_fund_index_map(db: Session) -> dict[str, tuple[str, str]]:
 
 
 def _resolve_snapshot_date(db: Session, as_of: _date) -> _date | None:
-    """解析实际可用的 snapshot 日期。
+    """解析实际可用的 snapshot 日期（带 2 次拉取规则门控）。
+
+    门控：as_of 先 clamp 到 get_confirmed_as_of(db)，再查 ≤ 的最近日期。
+    2 次拉取规则（2026-06-26）：T 日 snapshot 在 T+1 日 08:00 后才视为已确认，
+    避免前端在 T 日 09:00 查到尚未生成的 T 日 snapshot 而回退到 T-1。
 
     回退策略（按优先级）：
-    1. ≤ as_of 的最近有数据日期 — 前端传今天（snapshot 尚未生成）时取上一交易日
-    2. 若 as_of 早于所有 snapshot（例如 current_business_date 落后于 snapshot 生成日期），
-       回退到表中最新 snapshot 日期 — 保证用户始终能看到下钻数据
+    1. ≤ effective_as_of 的最近有数据日期
+    2. 若 effective_as_of 早于所有 snapshot，回退到表中最新 snapshot 日期
 
     返回 None 仅当表完全为空。
     """
     from sqlalchemy import func
-    # 1. ≤ as_of 的最近日期
+    from services.trading_calendar import get_confirmed_as_of
+
+    # 2 次规则门控：as_of 不超过 confirmed
+    confirmed = get_confirmed_as_of(db)
+    effective_as_of = min(as_of, confirmed)
+
+    # 1. ≤ effective_as_of 的最近日期
     row = db.query(func.max(FundDrillSnapshot.as_of_date)).filter(
-        FundDrillSnapshot.as_of_date <= as_of
+        FundDrillSnapshot.as_of_date <= effective_as_of
     ).scalar()
     if row is not None:
         return row
@@ -44,7 +53,8 @@ def _resolve_snapshot_date(db: Session, as_of: _date) -> _date | None:
     latest = db.query(func.max(FundDrillSnapshot.as_of_date)).scalar()
     if latest is not None and latest > as_of:
         logger.info(
-            f"_resolve_snapshot_date: as_of {as_of} 早于所有 snapshot，回退到最新 {latest}"
+            f"_resolve_snapshot_date: as_of {as_of} (effective={effective_as_of}) "
+            f"早于所有 snapshot，回退到最新 {latest}"
         )
     return latest
 

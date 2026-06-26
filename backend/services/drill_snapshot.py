@@ -22,7 +22,7 @@ from __future__ import annotations
 
 import logging
 from collections import defaultdict
-from datetime import date, timedelta
+from datetime import date, datetime, time, timedelta
 
 from sqlalchemy.orm import Session
 
@@ -44,6 +44,18 @@ STOCK_PRICE_FRESHNESS_RATIO = 0.95   # 至少 95% 成分股有当日价才生成
 STALE_PRICE_FALLBACK_DAYS = 7        # 缺失可用 T-1..T-7 任意一天的价作为替补
 CASH_RATIO = 0.05                    # 5% 现金
 STOCK_RATIO = 1 - CASH_RATIO         # 95% 成分股
+
+
+def _is_past_cutoff(as_of_date: date) -> bool:
+    """是否已过 2 次拉取窗口（as_of_date + 1 day 08:00 北京时间）。
+
+    2 次拉取规则（2026-06-26）：
+      - T 日 20:00 第 1 次拉 T 日收盘价
+      - T+1 日 08:00 第 2 次拉 T 日收盘价（关门时间）
+    T+1 日 08:00 后允许 ≤ T 回退填入 T 字段（is_stale=True）。
+    """
+    cutoff = datetime.combine(as_of_date + timedelta(days=1), time(8, 0))
+    return datetime.now() >= cutoff
 
 
 def _load_valuation_snapshots(db: Session, as_of_date: date) -> dict[str, dict]:
@@ -158,11 +170,22 @@ def _latest_index_constituents(db: Session, idx_code: str, on_or_before: date) -
     )
 
 
-def _get_stock_price(db: Session, stock_code: str, as_of_date: date) -> tuple[float | None, bool]:
-    """返回 (price, is_stale)。先 T 日，找不到则向前回退 STALE_PRICE_FALLBACK_DAYS 天。"""
+def _get_stock_price(
+    db: Session, stock_code: str, as_of_date: date, strict_mode: bool = True
+) -> tuple[float | None, bool]:
+    """返回 (price, is_stale)。
+
+    strict_mode=True（定时任务 — 2 次拉取规则）:
+      - PriceCache[as_of_date] 有价 → (price, False)
+      - 无价且未过 2 次窗口(as_of_date+1day 08:00) → (None, False)（拒绝回退，跳过该 code）
+      - 无价且已过窗口 → 回退 ≤ as_of_date 最近价 → (price, True)
+
+    strict_mode=False（手动触发）: 保留原 T→T-7 立即回退逻辑。
+    """
     norm = stock_code.split(".")[0]
-    candidates = [as_of_date - timedelta(days=d) for d in range(STALE_PRICE_FALLBACK_DAYS + 1)]
-    for i, d in enumerate(candidates):
+
+    def _query_price_for_date(d: date) -> float | None:
+        """查 PriceCache[stock_code, d] 或 [norm, d] 的 close_px。"""
         row = (
             db.query(PriceCache)
             .filter(PriceCache.stock_code == stock_code, PriceCache.trade_date == d)
@@ -170,7 +193,7 @@ def _get_stock_price(db: Session, stock_code: str, as_of_date: date) -> tuple[fl
             .first()
         )
         if row and row.close_px:
-            return float(row.close_px), (i > 0)
+            return float(row.close_px)
         # 后缀无关查询（如 688041 在 .SH 数据源中存为 688041 而非 688041.SH）
         if norm != stock_code:
             row = (
@@ -180,7 +203,32 @@ def _get_stock_price(db: Session, stock_code: str, as_of_date: date) -> tuple[fl
                 .first()
             )
             if row and row.close_px:
-                return float(row.close_px), (i > 0)
+                return float(row.close_px)
+        return None
+
+    if not strict_mode:
+        # 原逻辑：T→T-1..T-7 立即回退
+        candidates = [as_of_date - timedelta(days=d) for d in range(STALE_PRICE_FALLBACK_DAYS + 1)]
+        for i, d in enumerate(candidates):
+            price = _query_price_for_date(d)
+            if price is not None:
+                return price, (i > 0)
+        return None, False
+
+    # strict_mode=True: 2 次拉取规则
+    # 1. 先查 T 日
+    price = _query_price_for_date(as_of_date)
+    if price is not None:
+        return price, False
+    # 2. 检查是否已过 2 次拉取窗口
+    if not _is_past_cutoff(as_of_date):
+        return None, False  # 未关门，拒绝回退
+    # 3. 已关门，允许 ≤ T 回退（T-1..T-7）
+    for i in range(1, STALE_PRICE_FALLBACK_DAYS + 1):
+        d = as_of_date - timedelta(days=i)
+        price = _query_price_for_date(d)
+        if price is not None:
+            return price, True
     return None, False
 
 
@@ -194,11 +242,22 @@ def _guess_currency(stock_code: str) -> str:
     return "CNY"
 
 
-def _get_fx_rate(db: Session, from_ccy: str, to_ccy: str, as_of_date: date) -> float | None:
-    """取 T 日汇率 (from→to)；若 T 日缺失，向前回退 7 天。"""
+def _get_fx_rate(
+    db: Session, from_ccy: str, to_ccy: str, as_of_date: date, strict_mode: bool = True
+) -> float | None:
+    """取 T 日汇率 (from→to)。
+
+    strict_mode=True（定时任务 — 2 次拉取规则）:
+      - ExchangeRate[as_of_date] 有 → 返回 rate
+      - 无且未过 2 次窗口 → 返回 None（拒绝回退）
+      - 无且已过窗口 → 回退 ≤ as_of_date 7 天内最近汇率
+
+    strict_mode=False（手动触发）: 原逻辑（T→T-6 立即回退）。
+    """
     if from_ccy == to_ccy:
         return 1.0
-    for d in [as_of_date - timedelta(days=i) for i in range(7)]:
+
+    def _query_rate_for_date(d: date) -> float | None:
         row = db.query(ExchangeRate).filter(
             ExchangeRate.rate_date == d,
             ExchangeRate.from_currency == from_ccy,
@@ -206,6 +265,28 @@ def _get_fx_rate(db: Session, from_ccy: str, to_ccy: str, as_of_date: date) -> f
         ).first()
         if row and row.rate:
             return float(row.rate)
+        return None
+
+    if not strict_mode:
+        # 原逻辑：T→T-6 立即回退
+        for d in [as_of_date - timedelta(days=i) for i in range(7)]:
+            rate = _query_rate_for_date(d)
+            if rate is not None:
+                return rate
+        return None
+
+    # strict_mode=True: 2 次拉取规则
+    rate = _query_rate_for_date(as_of_date)
+    if rate is not None:
+        return rate
+    if not _is_past_cutoff(as_of_date):
+        return None  # 未关门，拒绝回退
+    # 已关门，允许 ≤ T 回退
+    for i in range(1, 7):
+        d = as_of_date - timedelta(days=i)
+        rate = _query_rate_for_date(d)
+        if rate is not None:
+            return rate
     return None
 
 
@@ -218,8 +299,14 @@ def _get_fund_price(db: Session, fund_code: str) -> float | None:
     return sum(prices) / len(prices)
 
 
-def generate_drill_snapshot_for_date(db: Session, as_of_date: date) -> dict:
+def generate_drill_snapshot_for_date(
+    db: Session, as_of_date: date, strict_mode: bool = True
+) -> dict:
     """为 as_of_date 生成所有可下钻基金的截面快照。
+
+    strict_mode=True（定时任务 — 2 次拉取规则）：
+      _get_stock_price / _get_fx_rate 严守 T+1 08:00 关门时间，未过 cutoff 拒绝回退。
+    strict_mode=False（手动触发）：保留原 T→T-7 立即回退逻辑，方便修复历史数据。
 
     Returns: {
       "as_of_date": str,
@@ -260,7 +347,7 @@ def generate_drill_snapshot_for_date(db: Session, as_of_date: date) -> dict:
         priced = []
         missing = []
         for s in constituents:
-            price, stale = _get_stock_price(db, s.stock_code, as_of_date)
+            price, stale = _get_stock_price(db, s.stock_code, as_of_date, strict_mode=strict_mode)
             if price is None:
                 missing.append(s.stock_code)
             else:
@@ -274,10 +361,12 @@ def generate_drill_snapshot_for_date(db: Session, as_of_date: date) -> dict:
                 "skip": "low_freshness",
                 "ratio": round(ratio, 4),
                 "missing": missing[:20],
+                "strict_mode": strict_mode,
+                "past_cutoff": _is_past_cutoff(as_of_date) if strict_mode else None,
             })
             logger.warning(
-                "drill snapshot skip %s: fresh %d/%d (%.2f%%), missing: %s",
-                fund_code, len(priced), len(constituents), ratio * 100, missing[:10],
+                "drill snapshot skip %s: fresh %d/%d (%.2f%%), strict=%s, missing: %s",
+                fund_code, len(priced), len(constituents), ratio * 100, strict_mode, missing[:10],
             )
             continue
 
@@ -303,7 +392,7 @@ def generate_drill_snapshot_for_date(db: Session, as_of_date: date) -> dict:
             weight_pct = s.weight if (s.weight and s.weight > 0) else default_w
             currency = _guess_currency(s.stock_code)
             # 汇率折算 (2026-06-24 补丁): 港股/美股用 CNY 价算 shares_eq
-            fx_rate = _get_fx_rate(db, currency, "CNY", as_of_date)
+            fx_rate = _get_fx_rate(db, currency, "CNY", as_of_date, strict_mode=strict_mode)
             fx_date = as_of_date if fx_rate else None
             price_cny = float(price) * fx_rate if fx_rate else float(price)
             # 双币种规则 (2026-06-25): baseline_price_cny 在公共层算好，下游取公共数据不临时算

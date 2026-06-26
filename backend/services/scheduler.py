@@ -15,7 +15,7 @@ from apscheduler.schedulers.background import BackgroundScheduler
 from sqlalchemy.orm import Session
 
 from database import SessionLocal
-from models import Holding, PriceCache, StockInfoCache, AssetType
+from models import Holding, PriceCache, StockInfoCache, AssetType, FullHoldingSnapshot
 from services.data_pull_task_service import record_task_start, record_task_finish
 
 logger = logging.getLogger(__name__)
@@ -151,6 +151,17 @@ def _is_trading_hours(now: datetime) -> bool:
     return _is_a_share_trading_hours(now) or _is_us_trading_hours(now)
 
 
+def _is_market_open_window(now: datetime) -> bool:
+    """盘中+盘后窗口：A股 9:15-16:00 + 美股 21:30-05:00
+
+    比交易时段更宽，覆盖集合竞价到盘后，确保收盘后仍能拉到当日涨跌幅。
+    """
+    t = now.time()
+    a_share = time(9, 15) <= t <= time(16, 0)
+    us = t >= time(21, 30) or t <= time(5, 0)
+    return a_share or us
+
+
 # ---------- 任务1：实时行情抓取 ----------
 
 @track_run("realtime_prices")
@@ -194,6 +205,10 @@ def job_fetch_realtime_prices(force: bool = False, user_id: int | None = None):
                 logger.warning("日历门控失败，继续执行: %s", e)
 
         updated = 0
+        # 2 次拉取规则（2026-06-26）：盘中只更新 Holding.price/amount，不写 PriceCache[today]
+        # （避免盘中把 T 日"未确认"价写入 PriceCache，污染 snapshot as_of_date 判定）
+        # 盘后（>= 15:00 A 股收盘后）才写 PriceCache[today]
+        can_write_price_cache = now.time() >= time(15, 0)
 
         for h in holdings:
             try:
@@ -236,13 +251,48 @@ def job_fetch_realtime_prices(force: bool = False, user_id: int | None = None):
                 else:
                     h.amount_cny = h.amount
 
-                # 写入价格缓存
-                _save_price_cache(db, code, today, price, quote_info)
+                # 写入价格缓存（仅盘后写，避免盘中污染 snapshot as_of_date 判定）
+                if can_write_price_cache:
+                    _save_price_cache(db, code, today, price, quote_info)
                 updated += 1
 
             except Exception as e:
                 logger.warning("抓取行情失败 [%s]: %s", code, e)
                 continue
+
+        # === 海外基金 NAV 延迟公布例外（盘后才跑，避免盘中打 lsjz）===
+        # 海外基金（QDII/港股通）NAV 晚数天公布，2 次拉取规则对它们太严格；
+        # 盘后回拉最近 5 个 CN 交易日，比对覆写 fund_daily_nav + PriceCache，
+        # 级联重算受影响日期的 fund_drill_snapshot。整段 try/except 包裹，
+        # 回拉失败不阻塞主行情抓取的 db.commit()。
+        if can_write_price_cache:
+            try:
+                from services.overseas_fund_nav import (
+                    get_overseas_fund_holdings, lookback_and_overwrite_nav,
+                )
+                from config import EM_MIN_INTERVAL
+                overseas = get_overseas_fund_holdings(db)
+                affected_dates: set[date] = set()
+                for idx, h in enumerate(overseas):
+                    try:
+                        dates = lookback_and_overwrite_nav(
+                            db, h.security_code, lookback_days=5,
+                        )
+                        affected_dates.update(dates)
+                    except Exception as e:
+                        logger.warning("海外基金回拉失败 [%s]: %s", h.security_code, e)
+                    if idx < len(overseas) - 1:
+                        _time_mod.sleep(EM_MIN_INTERVAL)
+                # 级联重算受影响日期的 snapshot（strict_mode=False，手动语义）
+                if affected_dates:
+                    from services.drill_snapshot import generate_drill_snapshot_for_date
+                    for d in sorted(affected_dates):
+                        try:
+                            generate_drill_snapshot_for_date(db, d, strict_mode=False)
+                        except Exception as e:
+                            logger.warning("级联重算 snapshot 失败 [%s]: %s", d, e)
+            except Exception as e:
+                logger.warning("海外基金回拉段异常: %s", e, exc_info=True)
 
         db.commit()
         logger.info("行情抓取完成 (user_id=%s)，更新 %d/%d 只持仓", user_id, updated, len(holdings))
@@ -283,6 +333,108 @@ def _save_price_cache(
         db.add(cache)
     except Exception as e:
         logger.warning("写入价格缓存失败 [%s]: %s", stock_code, e)
+
+
+# ---------- 任务1c：盘中实时涨跌幅抓取 ----------
+
+def _upsert_change_pct(
+    db: Session,
+    stock_code: str,
+    trade_date: date,
+    change_pct: float,
+):
+    """UPSERT change_pct：同 (stock_code, trade_date) 已存在则 UPDATE，否则 INSERT。
+    避免一天内同一 code 插入多行（PriceCache 无 UNIQUE 约束）。"""
+    try:
+        existing = db.query(PriceCache).filter(
+            PriceCache.stock_code == stock_code,
+            PriceCache.trade_date == trade_date,
+        ).first()
+        if existing:
+            existing.change_pct = change_pct
+            existing.source = "intraday"
+        else:
+            db.add(PriceCache(
+                stock_code=stock_code,
+                trade_date=trade_date,
+                change_pct=change_pct,
+                source="intraday",
+            ))
+    except Exception as e:
+        logger.warning("UPSERT change_pct 失败 [%s]: %s", stock_code, e)
+
+
+@track_run("intraday_change_pct")
+def job_fetch_intraday_change_pct():
+    """盘中+盘后每5分钟：抓取全持仓中二级市场品种的涨跌幅，写入 PriceCache.change_pct。
+
+    - 窗口：A股 9:15-16:00 + 美股 21:30-05:00（比交易时段宽，确保盘后也能拉到当日涨跌幅）
+    - 只抓非 .OF、非 CASH 品种（.OF 无实时涨跌幅）
+    - 使用腾讯接口原生 parts[32] 涨跌幅字段（非自己计算）
+    - UPSERT 逻辑：同 (stock_code, trade_date=today) 已存在则 UPDATE change_pct
+    """
+    now = datetime.now()
+    if not _is_market_open_window(now):
+        return {"skipped": "not_market_open_window"}
+
+    db: Session = SessionLocal()
+    try:
+        from crawlers.price_data import fetch_tencent_quote
+        from sqlalchemy import func as _func
+
+        today = date.today()
+
+        # 1. 品种获取：FullHoldingSnapshot 最新日期的所有 stock_code（非 cash）
+        latest_snap_date = db.query(_func.max(FullHoldingSnapshot.as_of_date)).scalar()
+        codes_set: set[str] = set()
+        if latest_snap_date:
+            snap_codes = db.query(FullHoldingSnapshot.stock_code).filter(
+                FullHoldingSnapshot.as_of_date == latest_snap_date,
+                FullHoldingSnapshot.source_type != "cash",
+            ).distinct().all()
+            codes_set.update(r[0] for r in snap_codes if r[0])
+
+        # 2. 兜底：Holding 表中所有非 .OF 品种（防止 snapshot 未生成）
+        holding_codes = db.query(Holding.security_code).filter(
+            ~Holding.security_code.like("%.OF"),
+        ).distinct().all()
+        codes_set.update(r[0] for r in holding_codes if r[0])
+
+        # 3. 过滤掉 .OF（无实时涨跌幅）+ 去重
+        codes = sorted([c for c in codes_set if c and not c.endswith(".OF")])
+        if not codes:
+            logger.info("盘中涨跌幅抓取：无适用品种，跳过")
+            return {"skipped": "no_codes"}
+
+        updated = 0
+        failed = 0
+        for code in codes:
+            try:
+                info = fetch_tencent_quote(code)
+                if not info or info.get("change_pct") is None:
+                    failed += 1
+                    continue
+                _upsert_change_pct(db, code, today, float(info["change_pct"]))
+                updated += 1
+            except Exception as e:
+                logger.warning("盘中涨跌幅抓取失败 [%s]: %s", code, e)
+                failed += 1
+                continue
+
+        db.commit()
+        logger.info("盘中涨跌幅抓取完成：更新 %d/%d 只（失败 %d）", updated, len(codes), failed)
+        return {
+            "codes_total": len(codes),
+            "updated": updated,
+            "failed": failed,
+        }
+
+    except Exception as e:
+        logger.error("盘中涨跌幅抓取任务异常: %s", e, exc_info=True)
+        db.rollback()
+        raise
+    finally:
+        db.close()
 
 
 # ---------- 任务2：财务基本面数据更新 ----------
@@ -652,12 +804,12 @@ def start_scheduler():
         misfire_grace_time=60,
     )
 
-    # 任务1b：snapshot 智能补缺 — 每日 06:00 + 20:00
-    # 覆盖美股昨日收盘 + A/H 股当日收盘；2 次/天避免限流
+    # 任务1b：snapshot 智能补缺 — 每日 08:00 + 20:00
+    # 早 8 点（过 T+1 关门时间，确保 2 次拉取规则闭环）+ 晚 8 点（A/H 股收盘后）
     scheduler.add_job(
         job_fill_snapshot_gaps_smart,
         "cron",
-        hour="6,20",
+        hour="8,20",
         minute=0,
         id="fill_snapshot_gaps_smart",
         name="snapshot 智能补缺（15 天窗口）",
@@ -776,16 +928,27 @@ def start_scheduler():
         misfire_grace_time=300,
     )
 
-    # 任务10：公共下钻截面生成（每日 18:00 — A股/港股收盘后，生成 fund_drill_snapshot）
+    # 任务10：公共下钻截面生成（每日 09:00 — T+1 日 08:00 关门后 1 小时，2 次拉取规则闭环）
     scheduler.add_job(
         job_generate_drill_snapshot,
         "cron",
-        hour=18,
+        hour=9,
         minute=0,
         id="drill_snapshot",
         name="公共下钻截面生成",
         max_instances=1,
         misfire_grace_time=3600,
+    )
+
+    # 任务11：盘中实时涨跌幅 — 交易时段每5分钟
+    scheduler.add_job(
+        job_fetch_intraday_change_pct,
+        "interval",
+        minutes=5,
+        id="intraday_change_pct",
+        name="盘中实时涨跌幅抓取",
+        max_instances=1,
+        misfire_grace_time=60,
     )
 
     scheduler.start()
@@ -810,7 +973,7 @@ def job_detect_data_gaps():
 
 
 @track_run("drill_snapshot")
-def job_generate_drill_snapshot(as_of_date=None):
+def job_generate_drill_snapshot(as_of_date=None, strict_mode: bool = True):
     """T+1 收盘后生成公共下钻截面（fund_drill_snapshot — 2026-06-24 引入）。
 
     算法（参考 services/drill_snapshot.py）：
@@ -818,27 +981,28 @@ def job_generate_drill_snapshot(as_of_date=None):
         读 index_constituents[最近月份] + PriceCache[T]
         校验 95% 价格可得，缺失用 T-1 价
         算 shares_equivalent = fund_price × 0.95 × (weight/100) / current_price
-    默认生成最近一个交易日（市场全部收盘后）。
+
+    2 次拉取规则（2026-06-26）：
+      - 定时任务（strict_mode=True）：as_of_date = get_confirmed_as_of(db)，
+        严守 T+1 08:00 关门时间，未过 cutoff 拒绝回退。
+      - 手动触发（strict_mode=False）：as_of_date 可显式传入，保留原 T→T-7 立即回退。
     """
     from datetime import date as _date
     from services.drill_snapshot import generate_drill_snapshot_for_date
+    from services.trading_calendar import get_confirmed_as_of
     if as_of_date is None:
-        # 取最近一个有 PriceCache 的交易日（视为最近收盘日）
-        from models import PriceCache
-        from sqlalchemy import func
-        last = c = None  # noqa
+        # 定时任务：用 get_confirmed_as_of 严守 2 次拉取规则
         db_probe = SessionLocal()
         try:
-            c = db_probe.query(func.max(PriceCache.trade_date)).scalar()
+            as_of_date = get_confirmed_as_of(db_probe)
         finally:
             db_probe.close()
-        as_of_date = c
     if as_of_date is None:
-        logger.warning("drill_snapshot: no PriceCache date found, skip")
-        return {"skipped": "no_price_cache_date"}
+        logger.warning("drill_snapshot: no confirmed date found, skip")
+        return {"skipped": "no_confirmed_date"}
     db = SessionLocal()
     try:
-        return generate_drill_snapshot_for_date(db, as_of_date)
+        return generate_drill_snapshot_for_date(db, as_of_date, strict_mode=strict_mode)
     except Exception as e:
         logger.error("drill_snapshot failed: %s", e, exc_info=True)
         raise
@@ -977,6 +1141,7 @@ JOB_DISPATCH: dict[str, dict] = {
     "info_hot_stocks": {"name": "同花顺热点抓取", "func": job_crawl_hot_stocks},
     "detect_data_gaps": {"name": "数据补足检测", "func": job_detect_data_gaps},
     "drill_snapshot": {"name": "公共下钻截面生成", "func": job_generate_drill_snapshot},
+    "intraday_change_pct": {"name": "盘中实时涨跌幅抓取", "func": job_fetch_intraday_change_pct},
 }
 
 

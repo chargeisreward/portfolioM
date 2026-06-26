@@ -1957,13 +1957,20 @@ def scheduler_status():
 
 
 @app.post("/api/scheduler/trigger/{job_id}")
-def trigger_job(job_id: str, force: bool = False, background: bool = False):
+def trigger_job(
+    job_id: str,
+    force: bool = False,
+    background: bool = False,
+    as_of_date: date = None,  # 仅 job_id="drill_snapshot" 用
+):
     """手动触发指定定时任务。
 
     Args:
         job_id: 8 个 job 之一 (见 _JOB_DISPATCH)
         force: True 时绕过 dedup 守门（强制重拉）
         background: True 时把 handler 放到 daemon 线程跑，立即返回；否则同步等结果
+        as_of_date: 仅 drill_snapshot 用，显式指定生成日期。
+                    手动触发不守 2 次拉取规则（strict_mode=False）。
     """
     import threading
     register_job_handlers()
@@ -1974,15 +1981,19 @@ def trigger_job(job_id: str, force: bool = False, background: bool = False):
             "message": f"Unknown job_id: {job_id}. "
                        f"Available: {sorted(_JOB_DISPATCH.keys())}",
         }
+    # 构造 kwargs
+    kwargs = {"force": force}
+    if job_id == "drill_snapshot" and as_of_date is not None:
+        kwargs = {"as_of_date": as_of_date, "strict_mode": False}
     if background:
         threading.Thread(
             target=handler,
-            kwargs={"force": force},
+            kwargs=kwargs,
             daemon=True,
         ).start()
         return {"status": "ok", "mode": "queued", "job_id": job_id, "force": force}
     try:
-        result = handler(force=force)
+        result = handler(**kwargs)
         return {
             "status": "ok",
             "mode": "sync",
@@ -3220,11 +3231,16 @@ def get_top10_holdings(
             fx_to_cny[fc] = r.rate
 
     # prev_trade_date = 最近一个已闭环交易日（PriceCache 落库即代表当天收盘价生成）
-    latest_td = db.query(_func.max(PriceCache.trade_date)).scalar()
+    # 2 次拉取规则（2026-06-26）：latest_td/prev_td 不超过 confirmed_as_of
+    from services.trading_calendar import get_confirmed_as_of
+    confirmed_as_of = get_confirmed_as_of(db)
+    latest_td = (db.query(_func.max(PriceCache.trade_date))
+                 .filter(PriceCache.trade_date <= confirmed_as_of).scalar())
     prev_td = None
     if latest_td:
         prev_td = (db.query(_func.max(PriceCache.trade_date))
-                   .filter(PriceCache.trade_date < latest_td).scalar())
+                   .filter(PriceCache.trade_date < latest_td,
+                           PriceCache.trade_date <= confirmed_as_of).scalar())
     prev_px_map: dict[str, float] = {}
     if prev_td and candidates:
         codes = list({c["stock_code"] for c in candidates})
@@ -3301,6 +3317,11 @@ def get_dimension_drilled(
     )
     from middleware.auth import _resolve_eff_from_request
     _u, eff_uid = _resolve_eff_from_request(request, db)
+
+    # 2 次拉取规则（2026-06-26）：as_of_date 不超过 confirmed_as_of，
+    # 避免前端在 T 日看到未确认的 T 日价（后续所有查询统一用 clamped 值）
+    from services.trading_calendar import get_confirmed_as_of
+    as_of_date = min(as_of_date, get_confirmed_as_of(db))
 
     DIM_COL_DRILLED = {
         "swy1": "swy_l1", "swy2": "swy_l2", "swy3": "swy_l3", "swy4": "swy_l4",
@@ -4095,20 +4116,26 @@ def get_full_holding_summary(
     from services.drill_public_service import get_public_cards
     from models import AShareFinancialSnapshot, HKShareFinancialSnapshot
     from middleware.auth import _resolve_eff_from_request
+    from services.trading_calendar import get_confirmed_as_of
     _u, eff_uid = _resolve_eff_from_request(request, db)
 
+    # 2 次拉取规则（2026-06-26）：as_of_date 不超过 confirmed_as_of，
+    # 避免前端在 T 日看到未确认的 T 日价
+    confirmed_as_of = get_confirmed_as_of(db)
+    effective_as_of = min(as_of_date, confirmed_as_of)
+
     # 下钻成分股聚合（用新三层 service 架构，双币种算法）
-    drilled_resp = get_all_drill_constituents(db, as_of_date, eff_uid)
+    drilled_resp = get_all_drill_constituents(db, effective_as_of, eff_uid)
     all_stocks = (drilled_resp or {}).get("stocks") or []
 
     # A / HK 检测（估值是市场公共数据，不按 user 隔离 — 2026-06-25）
     a_snap_keys = {a.stock_code.split(".")[0] for a in
                    db.query(AShareFinancialSnapshot).filter(
-                       AShareFinancialSnapshot.as_of_date == as_of_date,
+                       AShareFinancialSnapshot.as_of_date == effective_as_of,
                    ).all()}
     h_snap_keys = {h.stock_code.split(".")[0] for h in
                    db.query(HKShareFinancialSnapshot).filter(
-                       HKShareFinancialSnapshot.as_of_date == as_of_date,
+                       HKShareFinancialSnapshot.as_of_date == effective_as_of,
                    ).all()}
     a_stocks, h_stocks = [], []
     for s in all_stocks:
@@ -4131,7 +4158,7 @@ def get_full_holding_summary(
     # CSI 300: 仅指标 (参照系, 不含金额 / 占比)
     # 2026-06-25：改用 drill_public_service.get_public_cards 返回的 000300 卡片，
     # 与下钻页面 CSI300 卡片数值完全一致。
-    public_cards = get_public_cards(db, as_of_date)
+    public_cards = get_public_cards(db, effective_as_of)
     csi300_src = next((c for c in public_cards if c["index_code"] == "000300"), None)
     if csi300_src:
         csi300_card = {
@@ -4222,7 +4249,7 @@ def get_kpi(
 ):
     """顶部 KPI bar 实时数据（替换硬编码）。
 
-    三个近期调整（2026-06-23）：
+    近期调整：
       - csi300_pe：改用下钻页面（drillable_funds.list_drillable_indices）计算的 000300 加权 PE；
         旧实现用的是 Csi300Analyzer 的 baseline（IndexConstituent × StockFinancial.ttm_pe），
         与下钻卡片不一致。
@@ -4234,8 +4261,11 @@ def get_kpi(
         例：6/24 中国开盘前（6/23 snapshot 已落库）→ MAX=6/23 → 用 6/23 作分母。
       - tech_weight_pct：科技占比 = 当前 Holding × PriceCache 最新价 × 汇率（与「主题」pie 同口径），
         按 type2 ∈ {'emerging','us_tech'} 聚合的 CNY 金额 / 总额 × 100。
+      - portfolio_pe/pb/ps_weighted（2026-06-26）：改用 drill_orchestration_service.compute_scope_metrics
+        实时计算 fund_drill_snapshot 公共数据，与「分析→全持仓→全部下钻证券」4 口径卡片完全同算法、
+        同数值；旧实现读 AggregationCache 预聚合表，算法不同导致 Overview 与 Analysis 页面 PE 不一致。
     """
-    from models import FullHoldingSnapshot, AggregationCache, Holding, SecurityMaster, PriceCache, ExchangeRate
+    from models import FullHoldingSnapshot, Holding, SecurityMaster, PriceCache, ExchangeRate
     from sqlalchemy import func as _func
     from middleware.auth import _resolve_eff_from_request
     _u, eff_uid = _resolve_eff_from_request(request, db)
@@ -4249,17 +4279,20 @@ def get_kpi(
         FullHoldingSnapshot.user_id == eff_uid,
     ).scalar() or 0
 
-    # Read _total row from cache (must be populated first) — 按 user 过滤
-    p_total = db.query(AggregationCache).filter(
-        AggregationCache.as_of_date == as_of_date,
-        AggregationCache.scope == "portfolio",
-        AggregationCache.dimension == "l1",
-        AggregationCache.key == "_total",
-        AggregationCache.user_id == eff_uid,
-    ).first()
+    # 基金下钻 PE/PB/PS — 与「分析→全持仓→全部下钻证券」4 口径卡片完全同算法
+    # (drill_orchestration_service.compute_scope_metrics on fund_drill_snapshot 公共数据)
+    # 2026-06-26：替换旧 AggregationCache 来源，保证 Overview KPI = Analysis 4 口径卡片数值
+    from services.drill_orchestration_service import get_all_drill_constituents, compute_scope_metrics
+    drilled_resp = get_all_drill_constituents(db, as_of_date, eff_uid)
+    drilled_metrics = compute_scope_metrics((drilled_resp or {}).get("stocks") or [])
 
     # ----- 0. 共用：当前汇率 + 当前 Holding + PriceCache 最新价 → 实时动态市值映射 -----
     # 一次拉好给「当日涨幅分子」+「科技占比」共用
+    # 2 次拉取规则（2026-06-26）：latest_td 不超过 get_confirmed_as_of(db)，
+    # 避免盘中读到未确认的 today 价
+    from services.trading_calendar import get_confirmed_as_of
+    confirmed_as_of = get_confirmed_as_of(db)
+
     fx_to_cny = {"CNY": 1.0}
     for fc in ("USD", "HKD", "CAD"):
         r = (db.query(ExchangeRate)
@@ -4270,19 +4303,19 @@ def get_kpi(
 
     holdings = db.query(Holding).filter(Holding.user_id == eff_uid).all()
     sm_map = {m.security_code: m for m in db.query(SecurityMaster).all()}
-    # PriceCache 最新 close_px（按 stock_code）
+    # latest_td_row：所有 code 统一用的「最近已确认交易日」（≤ confirmed_as_of）
+    latest_td_row = (db.query(_func.max(PriceCache.trade_date))
+                     .filter(PriceCache.trade_date <= confirmed_as_of).scalar()
+                     if holdings else None)
+    # PriceCache 最新 close_px（统一用 latest_td_row，保证所有 code 同一日期口径）
     latest_px_cache: dict[str, float] = {}
-    if holdings:
+    if holdings and latest_td_row:
         codes = [h.security_code for h in holdings if h.security_code]
-        sub = (db.query(PriceCache.stock_code,
-                        _func.max(PriceCache.trade_date).label("max_d"))
-               .filter(PriceCache.stock_code.in_(codes))
-               .group_by(PriceCache.stock_code).subquery())
-        rows = (db.query(PriceCache.stock_code, PriceCache.trade_date, PriceCache.close_px)
-                .join(sub, (PriceCache.stock_code == sub.c.stock_code)
-                              & (PriceCache.trade_date == sub.c.max_d))
+        rows = (db.query(PriceCache.stock_code, PriceCache.close_px)
+                .filter(PriceCache.stock_code.in_(codes),
+                        PriceCache.trade_date == latest_td_row)
                 .all())
-        latest_px_cache = {r[0]: float(r[2]) for r in rows if r[2] is not None}
+        latest_px_cache = {r[0]: float(r[1]) for r in rows if r[1] is not None}
 
     def _holding_cny(h) -> float:
         """单只 Holding 的实时 CNY 市值 = quantity × (PriceCache 最新价 or Holding.price) × fx"""
@@ -4320,17 +4353,18 @@ def get_kpi(
     try:
         # 2a. 分子：当前实时动态市值（已在 _holding_cny 里实现 — latest_px_cache 是每个 code 最新一行）
         numerator = sum(_holding_cny(h) for h in holdings)
-        # 同时记录「最新 trade_date」作为 today 侧参考
-        latest_td_row = db.query(_func.max(PriceCache.trade_date)).scalar() if holdings else None
+        # latest_td_row 已在前面「0. 共用语料」算好（带 confirmed_as_of 门控），此处不再重复查
         daily_change_breakdown["numerator_cny"] = round(numerator, 2)
         daily_change_breakdown["latest_trade_date"] = latest_td_row.isoformat() if latest_td_row else None
 
         # 2b. 分母：找「最近一个已闭环交易日」的 PriceCache 行，构造上一交易日动态市值
         # 逻辑：取 MAX(PriceCache.trade_date) 中「严格早于 latest_td_row」的最大值
         # — 这就是「最近一个已闭环交易日」（PriceCache 落库即代表那天收盘价已生成）
+        # 2 次拉取规则（2026-06-26）：prev_td 也加 <= confirmed_as_of 门控
         if latest_td_row:
             prev_td_row = (db.query(_func.max(PriceCache.trade_date))
-                           .filter(PriceCache.trade_date < latest_td_row).scalar())
+                           .filter(PriceCache.trade_date < latest_td_row,
+                                   PriceCache.trade_date <= confirmed_as_of).scalar())
             if prev_td_row:
                 # 取 prev_td_row 的 close_px
                 codes = [h.security_code for h in holdings if h.security_code]
@@ -4387,21 +4421,99 @@ def get_kpi(
     except Exception as e:
         logging.getLogger(__name__).warning("科技占比计算失败: %s", e, exc_info=True)
 
+    # ----- 4. 当日涨跌幅 = Σ(Weight_i × change_pct_i) -----
+    # Weight 分母 = 全持仓总市值（FullHoldingSnapshot.amount_cny 按 stock_code 聚合）
+    # 分子 = 可获得实时涨跌幅的品种（PriceCache[today].change_pct 非空）
+    # .OF 基金 / CASH 无 change_pct → 排除在分子外，但仍占分母权重
+    intraday_change_pct = None
+    intraday_breakdown = {"total_weight": 0.0, "covered_weight": 0.0, "covered_count": 0}
+    try:
+        today_pc = date.today()
+        # 全持仓权重：从最新 FullHoldingSnapshot 按 stock_code 聚合 amount_cny
+        latest_snap_date = db.query(_func.max(FullHoldingSnapshot.as_of_date)).filter(
+            FullHoldingSnapshot.user_id == eff_uid,
+        ).scalar()
+        if latest_snap_date:
+            snap_rows = db.query(
+                FullHoldingSnapshot.stock_code,
+                _func.sum(FullHoldingSnapshot.amount_cny),
+            ).filter(
+                FullHoldingSnapshot.as_of_date == latest_snap_date,
+                FullHoldingSnapshot.user_id == eff_uid,
+            ).group_by(FullHoldingSnapshot.stock_code).all()
+
+            # 查 today 的 change_pct（只查非 .OF 品种）
+            codes = [r[0] for r in snap_rows if r[0] and not r[0].endswith(".OF")]
+            change_map: dict[str, float] = {}
+            if codes:
+                pc_rows = db.query(PriceCache.stock_code, PriceCache.change_pct).filter(
+                    PriceCache.stock_code.in_(codes),
+                    PriceCache.trade_date == today_pc,
+                    PriceCache.change_pct.isnot(None),
+                ).all()
+                change_map = {r[0]: float(r[1]) for r in pc_rows if r[1] is not None}
+
+            total_value = sum(float(r[1] or 0) for r in snap_rows)
+            covered_value = 0.0
+            weighted_sum = 0.0
+            for code, amt in snap_rows:
+                if code in change_map and total_value > 0:
+                    w = float(amt or 0) / total_value
+                    weighted_sum += w * change_map[code]
+                    covered_value += float(amt or 0)
+
+            if total_value > 0 and change_map:
+                intraday_change_pct = round(weighted_sum, 4)
+            intraday_breakdown = {
+                "total_weight": round(total_value, 2),
+                "covered_weight": round(covered_value, 2),
+                "covered_count": len(change_map),
+            }
+    except Exception as e:
+        logging.getLogger(__name__).warning("当日涨跌幅计算失败: %s", e, exc_info=True)
+
     return {
         "as_of_date": as_of_date.isoformat(),
         "values": {
             "total_amount_cny": round(total_amount, 2),
             "drilled_stock_count": drilled_stocks,
-            "portfolio_pe_weighted": p_total.pe_weighted if p_total else None,
-            "portfolio_pb_weighted": p_total.pb_weighted if p_total else None,
-            "portfolio_ps_weighted": p_total.ps_weighted if p_total else None,
+            "portfolio_pe_weighted": drilled_metrics.get("weighted_pe"),
+            "portfolio_pb_weighted": drilled_metrics.get("weighted_pb"),
+            "portfolio_ps_weighted": drilled_metrics.get("weighted_ps"),
             "csi300_pe": csi300_pe,                              # 下钻口径
-            "daily_change_pct": daily_change_pct,                # 替代 high_growth_weight_pct 语义
-            "tech_weight_pct": tech_weight_pct,                  # 替代 midstream_weight_pct 语义
+            "daily_change_pct": daily_change_pct,                # 上日涨跌幅（confirmed_as_of close vs prev）
+            "intraday_change_pct": intraday_change_pct,          # 当日涨跌幅（Σ Weight × change_pct）
+            "tech_weight_pct": tech_weight_pct,
             "tech_weight_breakdown": tech_weight_breakdown,
             "daily_change_breakdown": daily_change_breakdown,
+            "intraday_breakdown": intraday_breakdown,
         },
     }
+
+
+# ---------- 市场指数涨跌幅 ----------
+MARKET_INDICES = [
+    ("sh000300", "沪深300"),
+    ("sh000985", "中证全A"),
+    ("sh000688", "科创50"),
+    ("sz399673", "创业板50"),
+    ("usDJI", "道琼斯30"),
+    ("usNDX", "纳指100"),
+]
+
+@app.get("/api/market/indices")
+def get_market_indices():
+    """实时获取6个市场指数的涨跌幅（腾讯接口原生 parts[32]）。"""
+    from crawlers.price_data import fetch_tencent_quote
+    results = []
+    for code, name in MARKET_INDICES:
+        try:
+            info = fetch_tencent_quote(code)
+            change_pct = info.get("change_pct") if info else None
+            results.append({"code": code, "name": name, "change_pct": change_pct})
+        except Exception:
+            results.append({"code": code, "name": name, "change_pct": None})
+    return {"indices": results}
 
 
 @app.post("/api/admin/import-source-data")

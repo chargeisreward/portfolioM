@@ -9,7 +9,7 @@
 惰性持久化：is_trading_day DB miss → 计算 → INSERT → 后续请求零计算。
 """
 import logging
-from datetime import date, timedelta
+from datetime import date, datetime, time, timedelta
 
 from sqlalchemy.orm import Session
 
@@ -458,6 +458,51 @@ def is_any_market_open_today(db: Session) -> bool:
         if is_trading_day(m, today, db):
             return True
     return False
+
+
+# ============================================================
+# 已确认收盘日（2 次拉取规则 — 2026-06-26 引入）
+# ============================================================
+# 规则：T 日的收盘价在 T+1 日 08:00（北京时间）后才视为"已确认"。
+#   - T 日 20:00：第 1 次拉 T 日收盘价
+#   - T+1 日 08:00：第 2 次拉 T 日收盘价（关门时间）
+#   - T+1 日 08:00 后：snapshot as_of_date 可推进到 T；读取端点 latest_td 可切到 T
+# get_confirmed_as_of 返回当前时刻"已确认的最近交易日"。
+# ============================================================
+
+CONFIRMED_CUTOFF_TIME = time(8, 0)  # 关门时间：次日 08:00
+
+
+def get_confirmed_as_of(db: Session, market: str = "CN") -> date:
+    """返回当前时刻"已确认收盘"的最近交易日。
+
+    语义：T 日的收盘价在 T+1 日 08:00 后才视为已确认。
+      - now >= 08:00 → candidate = today - 1（昨日已过次日 08:00 关门）
+      - now <  08:00 → candidate = today - 2（昨日还未过次日 08:00 关门，前日已过）
+    然后从 candidate 向前找最近交易日（复用 is_trading_day）。
+
+    用于：
+      - drill_snapshot 定时任务的 as_of_date
+      - 读取端点（KPI/full-holding-summary 等）的 latest_td 上限
+      - drill_public_service._resolve_snapshot_date 的 effective_as_of 上限
+    """
+    now = datetime.now()
+    today = now.date()
+    if now.time() >= CONFIRMED_CUTOFF_TIME:
+        candidate = today - timedelta(days=1)
+    else:
+        candidate = today - timedelta(days=2)
+    # 从 candidate 向前找最近交易日（最多回退 10 天避免死循环）
+    for i in range(10):
+        d = candidate - timedelta(days=i)
+        if is_trading_day(market, d, db):
+            return d
+    # 极端情况：10 天内无交易日（如超长假期），返回 candidate 本身
+    logger.warning(
+        "get_confirmed_as_of: 10 天内未找到 %s 交易日，fallback to %s",
+        market, candidate,
+    )
+    return candidate
 
 
 def populate_market(market: str, start_year: int, end_year: int, db: Session) -> int:

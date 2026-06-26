@@ -18,6 +18,7 @@ attempts and errors; it is best-effort, not authoritative.
 Usage:
     python scripts/crawl_index_official.py --provider csi --index 000300 \\
         --as-of-date 2026-05-29 --out sourceData/202605数据/000300.xlsx
+    # 基础数据基准期5月29日
 """
 from __future__ import annotations
 

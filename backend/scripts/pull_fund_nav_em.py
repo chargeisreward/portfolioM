@@ -190,7 +190,7 @@ def main():
                         source="eastmoney",
                     ))
                     inserted += 1
-                if td == _date(2026, 5, 29):
+                if td == _date(2026, 5, 29):  # 基础数据基准期5月29日
                     nav5_29 = r["accumulated_nav"]
             db.commit()
             logger.info("[%d/%d] %s: rows=%d  cum_nav_5_29=%s",

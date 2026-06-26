@@ -197,7 +197,7 @@ def import_index_constituents(db: Session, source_path: Path) -> ImportReport:
         if not m:
             continue
         index_code = m.group(1).split(".")[0]
-        as_of = index_dates.get(index_code) or _date(2026, 5, 29)  # fallback
+        as_of = index_dates.get(index_code) or _date(2026, 5, 29)  # 基础数据基准期5月29日 fallback
         df = pd.read_excel(xl, sheet_name=sheet)
         count, _ = _process_sheet(db, sheet, df, as_of)
         total += count

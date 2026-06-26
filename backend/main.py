@@ -3150,6 +3150,7 @@ def get_top10_holdings(
 
     # 2b. drilled — 复用 list_drillable_indices + get_index_drill_detail 一次性聚合
     holdings_agg = {c: info for c, info in by_code.items() if info["quantity"] > 0}
+    # 基础数据基准期5月29日：nav_529=基准日净值(as_of_date), nav_618=6/18最新净值日
     fund_navs_map: dict[str, dict] = {}
     if drillable_codes:
         nav_rows = (db.query(FundDailyNav)
@@ -3361,6 +3362,7 @@ def get_dimension_drilled(
         holdings_agg[code]["amount_cny"] += (h.amount_cny or 0.0)
     holdings_agg = {k: v for k, v in holdings_agg.items() if v["quantity"] > 0}
 
+    # 基础数据基准期5月29日：nav_529=基准日净值(as_of_date), nav_618=6/18最新净值日
     fund_navs_map: dict[str, dict] = {}
     if drillable_codes:
         nav_rows = (

@@ -98,7 +98,7 @@ def _seed_e2e_data(db, as_of=date(2026, 6, 25)):
     # A 股估值快照（不传 user_id，落库 NULL）
     # 600519.SH: pe_ttm=30.0, pb_mrq=10.0, ps_ttm=15.0, dividend_yield=1.5
     a_snap1 = AShareFinancialSnapshot(
-        as_of_date=date(2026, 5, 29),
+        as_of_date=date(2026, 5, 29),  # 基础数据基准期5月29日
         stock_code="600519.SH",
         stock_name="贵州茅台",
         pe_ttm=30.0,
@@ -111,7 +111,7 @@ def _seed_e2e_data(db, as_of=date(2026, 6, 25)):
     )
     # 000858.SZ: pe_ttm=20.0, pb_mrq=5.0, ps_ttm=2.0, dividend_yield=2.0
     a_snap2 = AShareFinancialSnapshot(
-        as_of_date=date(2026, 5, 29),
+        as_of_date=date(2026, 5, 29),  # 基础数据基准期5月29日
         stock_code="000858.SZ",
         stock_name="五粮液",
         pe_ttm=20.0,
@@ -402,7 +402,7 @@ class TestValuationUserIdOptional:
 
         # 直接查 AShareFinancialSnapshot（不带 user_id 过滤）
         rows = e2e_db.query(AShareFinancialSnapshot).filter(
-            AShareFinancialSnapshot.as_of_date == date(2026, 5, 29)
+            AShareFinancialSnapshot.as_of_date == date(2026, 5, 29)  # 基础数据基准期5月29日
         ).all()
         assert len(rows) == 2
         # user_id 应该是 NULL（落库时未传）

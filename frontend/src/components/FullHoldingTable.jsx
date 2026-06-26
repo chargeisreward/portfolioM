@@ -34,7 +34,7 @@ function inferCurrency(code) {
  *
  * 字段语义:
  *   - 约当数量: 直股 = amount_cny / baseline_price (实际持股数);
- *               成分股 = Σ amount_529 / baseline_price (drill 等效股数);
+ *               成分股 = Σ amount_base / baseline_price (drill 等效股数);
  *               基金/现金 = '-' (后端不返回)
  *   - 昨日收盘: 后端 current_price (原币种) → 一律折算为人民币展示
  *   - 估算市值: 同样折算为人民币

@@ -11,6 +11,7 @@
 
 数据落到 index_constituent_snapshot 表中，
 与 5/29 持仓快照 (as_of_date=2026-05-29) 同表存。
+基础数据基准期5月29日。
 
 用法:
   python scripts/pull_index_weights.py                       # 拉所有 12 个指数
@@ -103,7 +104,7 @@ def _pull_csi_weights(idx_code: str, idx_name: str) -> list[dict]:
         try:
             base_date = datetime.strptime(base_date[:10], "%Y-%m-%d").date()
         except ValueError:
-            base_date = _date(2026, 5, 29)
+            base_date = _date(2026, 5, 29)  # 基础数据基准期5月29日
     elif hasattr(base_date, "date"):
         base_date = base_date.date()
 
@@ -142,7 +143,7 @@ def _pull_szse_cons(idx_code: str, idx_name: str) -> list[dict]:
         try:
             base_date = datetime.strptime(base_date[:10], "%Y-%m-%d").date()
         except ValueError:
-            base_date = _date(2026, 5, 29)
+            base_date = _date(2026, 5, 29)  # 基础数据基准期5月29日
     elif hasattr(base_date, "date"):
         base_date = base_date.date()
     for _, r in df.iterrows():
@@ -164,7 +165,7 @@ def _pull_szse_cons(idx_code: str, idx_name: str) -> list[dict]:
 def main():
     logging.basicConfig(level=logging.INFO, format="%(asctime)s %(message)s")
     ap = argparse.ArgumentParser()
-    ap.add_argument("--as-of-date", default="2026-05-29",
+    ap.add_argument("--as-of-date", default="2026-05-29",  # 基础数据基准期5月29日
                     help="as_of_date for snapshot (overrides akshare-reported date)")
     ap.add_argument("--codes", nargs="*", help="指定指数代码，默认全部")
     ap.add_argument("--dry-run", action="store_true")

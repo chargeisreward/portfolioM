@@ -79,6 +79,7 @@ def _aggregate_holdings_by_fund(db: Session, user_id: int | None = None) -> dict
 
 def _load_fund_navs(db: Session, fund_codes: list[str]) -> dict[str, dict]:
     """保留原 FundDailyNav 读取逻辑（用户最新算法已不再用 1.z，但保留以备 debug）。
+    基础数据基准期5月29日：nav_529=基准日净值, nav_618=6/18最新净值日。
     返回 {fund_code: {nav_529, cumnav_529, nav_618, cumnav_618}}。"""
     if not fund_codes:
         return {}

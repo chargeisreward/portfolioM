@@ -44,7 +44,7 @@ def main():
 
     db = SessionLocal()
     try:
-        as_of = _date(2026, 5, 29)
+        as_of = _date(2026, 5, 29)  # 基础数据基准期5月29日
         if args.market in ("A", "AH"):
             a_rows = db.query(AShareFinancialSnapshot).filter_by(as_of_date=as_of).all()
         else:

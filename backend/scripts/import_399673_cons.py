@@ -45,6 +45,7 @@ def import_399673(db: Session, source_path: Path) -> ImportReport:
         return report
 
     # Determine as_of_date from the 日期 column (all rows share the same date)
+    # 基础数据基准期5月29日
     as_of = _date(2026, 5, 29)
     if "日期" in df.columns and not df.empty:
         v = df["日期"].iloc[0]

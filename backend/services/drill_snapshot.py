@@ -125,7 +125,7 @@ def _latest_index_constituents(db: Session, idx_code: str, on_or_before: date) -
       - 如果 5/29 有 weight（非空），就用 5/29（指数公司真实权重）
       - 如果 5/29 weight 全空（如 399673 PG 旧数据），才用最近的 6/15 兜底
     """
-    # 步骤 1: 找到 5/29 是否有 weight
+    # 步骤 1: 基础数据基准期5月29日 — 找到该日是否有 weight
     may29 = (
         db.query(IndexConstituentSnapshot)
         .filter(
@@ -470,7 +470,7 @@ def generate_drill_snapshot_for_date(db: Session, as_of_date: date) -> dict:
 
 
 def get_drill_snapshot_for_fund(db: Session, fund_code: str, as_of_date: date) -> list[FundDrillSnapshot] | None:
-    """取某 fund 在 as_of_date 的下钻截面；若当日缺失，回退到最近一天。"""
+    """取某 fund 在 as_of_date 的下钻截面；若当日缺失，先后向再前向回退到最近一天。"""
     rows = (
         db.query(FundDrillSnapshot)
         .filter(FundDrillSnapshot.fund_code == fund_code, FundDrillSnapshot.as_of_date == as_of_date)
@@ -478,17 +478,30 @@ def get_drill_snapshot_for_fund(db: Session, fund_code: str, as_of_date: date) -
     )
     if rows:
         return rows
-    # 回退：取该 fund 最近的截面日期
+    # 后向回退：取该 fund <= as_of_date 的最近截面日期
     latest_date = (
         db.query(FundDrillSnapshot.as_of_date)
         .filter(FundDrillSnapshot.fund_code == fund_code, FundDrillSnapshot.as_of_date <= as_of_date)
         .order_by(FundDrillSnapshot.as_of_date.desc())
         .first()
     )
-    if not latest_date:
+    if latest_date:
+        return (
+            db.query(FundDrillSnapshot)
+            .filter(FundDrillSnapshot.fund_code == fund_code, FundDrillSnapshot.as_of_date == latest_date[0])
+            .all()
+        )
+    # 前向回退：取该 fund > as_of_date 的最近截面日期（基础数据基准期5月29日无下钻截面时用后续截面）
+    next_date = (
+        db.query(FundDrillSnapshot.as_of_date)
+        .filter(FundDrillSnapshot.fund_code == fund_code, FundDrillSnapshot.as_of_date > as_of_date)
+        .order_by(FundDrillSnapshot.as_of_date.asc())
+        .first()
+    )
+    if not next_date:
         return None
     return (
         db.query(FundDrillSnapshot)
-        .filter(FundDrillSnapshot.fund_code == fund_code, FundDrillSnapshot.as_of_date == latest_date[0])
+        .filter(FundDrillSnapshot.fund_code == fund_code, FundDrillSnapshot.as_of_date == next_date[0])
         .all()
     )

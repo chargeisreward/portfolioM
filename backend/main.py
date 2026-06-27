@@ -1,5 +1,6 @@
 """PortfolioM — FastAPI 应用入口"""
 import hashlib
+import logging
 import os
 import re as _re
 import secrets

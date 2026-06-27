@@ -658,8 +658,9 @@ class PenetrationSnapshot(Base):
 
 class FullHoldingSnapshot(Base):
     """全持仓快照（下钻基金 + 直接股票 + 不下钻基金 + 现金）。
-    一只成分股可能来自多只上层基金，所以 UK 只约束 (as_of_date, stock_code,
-    source_holding_code)，每行都是唯一的"这只股票从这个来源获得 X 金额"。
+    一只成分股可能来自多只上层基金，所以 UK 约束 (as_of_date, user_id,
+    stock_code, source_holding_code)，每行都是唯一的"该用户这只股票从这个
+    来源获得 X 金额"。多用户隔离：同一只股票来自同一基金的不同用户分别成行。
     同一只股票的多个来源会被合并到 full_holding_view 中。
 
     行业字段存储 7 套体系：
@@ -668,7 +669,7 @@ class FullHoldingSnapshot(Base):
     """
     __tablename__ = "full_holding_snapshot"
     __table_args__ = (
-        UniqueConstraint("as_of_date", "stock_code", "source_holding_code",
+        UniqueConstraint("as_of_date", "user_id", "stock_code", "source_holding_code",
                          name="ux_fhsnap"),
     )
 

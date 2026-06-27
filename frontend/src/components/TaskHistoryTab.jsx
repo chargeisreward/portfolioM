@@ -52,6 +52,7 @@ export default function TaskHistoryTab() {
     { id: 'financial_fundamentals', name: '财务数据' },
     { id: 'detect_data_gaps', name: '数据缺口检测' },
     { id: 'backfill_gaps', name: '回填缺口' },
+    { id: 'pull_fund_nav', name: '基金净值' },
   ]
 
   const statusColor = { SUCCESS: 'green', FAILED: 'red', RUNNING: 'orange', SKIPPED: 'gray' }

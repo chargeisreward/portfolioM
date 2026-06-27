@@ -1150,6 +1150,13 @@ def get_portfolio_trend(
         for r in pc_rows:
             pc_map.setdefault(r.stock_code, {})[r.trade_date.isoformat()] = r.close_px
 
+        # 2.1 .OF 基金从 fund_daily_nav 补充（PriceCache 无 .OF 数据时）
+        # 使 chart 能正确显示 .OF 基金资产值，避免"虚假下跌"
+        from services.trend_service import load_of_nav_to_pc_map, resolve_px
+        of_codes = [c for c in holding_codes if c.endswith(".OF")]
+        if of_codes:
+            load_of_nav_to_pc_map(db, pc_map, of_codes, cutoff)
+
         # 3. 汇率（按 date 查）
         fx_rows = db.query(ExchangeRate).filter(ExchangeRate.rate_date >= cutoff).all()
         # (date, from, to) -> rate
@@ -1190,26 +1197,10 @@ def get_portfolio_trend(
         all_dates = sorted({d for code_dates in pc_map.values() for d in code_dates.keys()})
         all_dates = [d for d in all_dates if d >= cutoff.isoformat()]
 
-        # 5. 对每只 holding 构建"已知价 → 该日及以后沿用"映射（不编造：用其最后已知真实价回填未来无价日）
-        # 注意：这是"backward-fill last known"，不是 forward-fill 编造。
-        # 规则：某 holding 在 D 日无价，则用该 holding 在 D 之前最近的真实价代替。
-        #      如果该 holding 整段 90 天都没价，则跳过（不编造）。
-        def _resolve_px(code_map: dict, d_iso: str) -> float | None:
-            # 真实价优先
-            if d_iso in code_map:
-                return code_map[d_iso]
-            # 找该日之前的最近真实价
-            try:
-                d = date.fromisoformat(d_iso)
-            except (ValueError, TypeError):
-                return None
-            for k in range(1, days + 5):
-                nd = (d - timedelta(days=k)).isoformat()
-                if nd in code_map:
-                    return code_map[nd]
-                if (d - timedelta(days=k)) < cutoff:
-                    break
-            return None
+        # 5. 取价逻辑已抽到 services.trend_service.resolve_px
+        #    - 当日真实价优先
+        #    - 当日 close_px=None（休市日被 intraday job 写入空行）→ backward-fill 到最近真实价
+        #    - 窗口内全无价 → 返回 None（跳过该 holding，不编造）
 
         # 6. 跳过整只 holding 在窗口内完全无价的情况（无法计算 → 不编造）
         # 优化：只看 pc_map 里是否有该 code 的任何价格，不再做 O(D×K) 双重 any
@@ -1242,7 +1233,7 @@ def get_portfolio_trend(
             total = 0.0
             for h in eligible:
                 cm = pc_map.get(h.security_code, {})
-                px = _resolve_px(cm, d_iso)
+                px = resolve_px(cm, d_iso, days=days, cutoff=cutoff)
                 if px is None:
                     continue  # 该 holding 还未"上市"（早于其最早有价日）— 跳过
                 cur = h.currency or "CNY"
@@ -5467,12 +5458,14 @@ def admin_list_data_pull_tasks(
 
 
 @app.post("/api/admin/data-pull-tasks/trigger/{job_id}")
-def admin_trigger_data_pull_task(job_id: str, request: Request):
-    """手动触发数据拉取任务。"""
-    # 简单实现：返回 job_id，实际触发逻辑在 Task 7 集成 scheduler
+def admin_trigger_data_pull_task(job_id: str, request: Request, db: Session = Depends(get_db)):
+    """手动触发数据拉取任务（同步执行 + 写入 DataPullTask 历史）。"""
+    from services.scheduler import trigger_job, JOB_DISPATCH
+    if job_id not in JOB_DISPATCH:
+        return {"status": "error", "job_id": job_id, "message": f"未知 job_id，可用: {sorted(JOB_DISPATCH.keys())}"}
     user_id = getattr(request.state, 'user_id', None) or getattr(request.state, 'user', None)
     triggered_by = f"manual:{user_id}" if user_id else "manual"
-    return {"status": "ok", "job_id": job_id, "triggered_by": triggered_by, "message": "触发请求已记录，Task 7 将集成 scheduler"}
+    return trigger_job(db, job_id, triggered_by=triggered_by)
 
 
 # ========== 内容上传端点（子项目 2）==========

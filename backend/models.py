@@ -95,6 +95,10 @@ class DataPullTask(Base):
     error_message = Column(Text, nullable=True)
     triggered_by = Column(String(40))                    # scheduler / manual:<user_id>
     created_at = Column(DateTime, default=datetime.utcnow)
+    # --- 管理员监控扩展（2026-06-27）— nullable 向后兼容 ---
+    planned_count = Column(Integer, nullable=True)       # 本次拉取计划数量
+    success_count = Column(Integer, nullable=True)       # 实际拉取有效数量
+    coverage_rate = Column(Float, nullable=True)         # 覆盖率 = success / planned
 
 
 class SecurityTypeConfig(Base):

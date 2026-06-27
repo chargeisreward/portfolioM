@@ -95,6 +95,10 @@ def init_db():
         ("fund_drill_snapshot", "baseline_price_cny", "FLOAT"),
         # === 2026-06-26 HoldingDailySnapshot holding_uid：区分同代码不同批次 ===
         ("holding_daily_snapshot", "holding_uid", "INTEGER"),
+        # === 2026-06-27 DataPullTask 监控扩展（planned_count/success_count/coverage_rate）===
+        ("data_pull_task", "planned_count", "INTEGER"),
+        ("data_pull_task", "success_count", "INTEGER"),
+        ("data_pull_task", "coverage_rate", "FLOAT"),
     ]
     from sqlalchemy import inspect
     insp = inspect(engine)

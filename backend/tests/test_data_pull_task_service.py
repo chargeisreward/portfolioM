@@ -82,3 +82,28 @@ def test_list_tasks_filter_by_status(fresh_db):
     running_only = list_tasks(fresh_db, status="RUNNING")
     assert len(running_only["items"]) == 1
     assert running_only["items"][0]["job_id"] == "job2"
+
+
+def test_record_task_finish_with_metrics(fresh_db):
+    """record_task_finish 支持记录 planned_count/success_count/coverage_rate（管理员监控用）。"""
+    task = record_task_start(fresh_db, "pull_fund_nav", "基金净值拉取", "scheduler")
+    finished = record_task_finish(
+        fresh_db, task["id"], "SUCCESS",
+        records_pulled=15,
+        planned_count=28,
+        success_count=15,
+        coverage_rate=15 / 28,
+    )
+    assert finished["status"] == "SUCCESS"
+    assert finished["planned_count"] == 28
+    assert finished["success_count"] == 15
+    assert finished["coverage_rate"] == pytest.approx(15 / 28)
+
+
+def test_record_task_finish_metrics_optional(fresh_db):
+    """新字段 nullable — 旧调用方式（不传 metrics）仍兼容。"""
+    task = record_task_start(fresh_db, "backfill_gaps", "历史价补缺", "scheduler")
+    finished = record_task_finish(fresh_db, task["id"], "SUCCESS", records_pulled=10)
+    assert finished["planned_count"] is None
+    assert finished["success_count"] is None
+    assert finished["coverage_rate"] is None

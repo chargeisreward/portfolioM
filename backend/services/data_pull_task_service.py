@@ -36,8 +36,15 @@ def record_task_finish(
     status: str,
     records_pulled: int = 0,
     error_message: str | None = None,
+    planned_count: int | None = None,
+    success_count: int | None = None,
+    coverage_rate: float | None = None,
 ) -> dict | None:
-    """记录任务结束（更新状态）。"""
+    """记录任务结束（更新状态）。
+
+    新增 planned_count/success_count/coverage_rate 三个可选参数（管理员监控用），
+    不传则保持 None（向后兼容旧调用方式）。
+    """
     task = db.query(DataPullTask).filter(DataPullTask.id == task_id).first()
     if not task:
         return None
@@ -45,6 +52,9 @@ def record_task_finish(
     task.finished_at = datetime.utcnow()
     task.records_pulled = records_pulled
     task.error_message = error_message
+    task.planned_count = planned_count
+    task.success_count = success_count
+    task.coverage_rate = coverage_rate
     db.commit()
     db.refresh(task)
     return _to_dict(task)
@@ -93,4 +103,7 @@ def _to_dict(task: DataPullTask) -> dict:
         "records_pulled": task.records_pulled,
         "error_message": task.error_message,
         "triggered_by": task.triggered_by,
+        "planned_count": task.planned_count,
+        "success_count": task.success_count,
+        "coverage_rate": task.coverage_rate,
     }

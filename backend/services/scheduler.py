@@ -15,8 +15,23 @@ from apscheduler.schedulers.background import BackgroundScheduler
 from sqlalchemy.orm import Session
 
 from database import SessionLocal
-from models import Holding, PriceCache, StockInfoCache, AssetType, FullHoldingSnapshot
+from models import Holding, PriceCache, StockInfoCache, AssetType, FullHoldingSnapshot, FundDailyNav, TradingCalendar
 from services.data_pull_task_service import record_task_start, record_task_finish
+from services.fund_nav_fetcher import fetch_nav_all as _raw_fetch_nav_all, parse_nav_row as _parse_nav_row
+
+
+def fetch_nav_all(fund_code: str, start: str, end: str, **kw):
+    """Wrapper: 拉取东财原始 NAV 行 + 解析为标准 dict 列表。
+
+    供 job_pull_fund_nav 调用。测试时 monkeypatch 此函数即可注入 mock 数据。
+    """
+    raw_rows = _raw_fetch_nav_all(fund_code, start, end)
+    parsed = []
+    for r in raw_rows:
+        p = _parse_nav_row(r)
+        if p:
+            parsed.append(p)
+    return parsed
 
 logger = logging.getLogger(__name__)
 
@@ -78,7 +93,14 @@ def track_run(job_id: str):
                 "duration_ms": int((_time_mod.time() - t0) * 1000),
             }
             if task_id is not None:
-                _try_record_finish(task_id, "SUCCESS", records_pulled=_extract_record_count(result))
+                metrics = _extract_metrics(result)
+                _try_record_finish(
+                    task_id, "SUCCESS",
+                    records_pulled=metrics["records_pulled"],
+                    planned_count=metrics["planned_count"],
+                    success_count=metrics["success_count"],
+                    coverage_rate=metrics["coverage_rate"],
+                )
             return result
         return wrapper
     return deco
@@ -102,6 +124,42 @@ def _extract_record_count(result) -> int:
     return 0
 
 
+def _extract_metrics(result) -> dict:
+    """从 job 返回值中提取 records_pulled/planned_count/success_count/coverage_rate。
+
+    向后兼容：若返回 dict 无 planned/success 字段，则 planned/success/coverage 为 None。
+    """
+    records_pulled = _extract_record_count(result)
+    planned = None
+    success = None
+    coverage = None
+    if isinstance(result, dict):
+        # 计划数量字段（按优先级）
+        for k in ("planned", "planned_count", "expected"):
+            v = result.get(k)
+            if isinstance(v, int):
+                planned = v
+                break
+        # 实际有效数量字段（按优先级，与 records_pulled 区分）
+        for k in ("pulled", "success_count", "filled", "filled_total"):
+            v = result.get(k)
+            if isinstance(v, int):
+                success = v
+                break
+        # 若 success 没拿到，回退用 records_pulled
+        if success is None:
+            success = records_pulled
+        # 覆盖率
+        if planned and planned > 0 and success is not None:
+            coverage = success / planned
+    return {
+        "records_pulled": records_pulled,
+        "planned_count": planned,
+        "success_count": success,
+        "coverage_rate": coverage,
+    }
+
+
 def _try_record_start(job_id: str, triggered_by: str) -> int | None:
     """尝试记录任务开始（使用独立 db 会话，失败不阻塞 job 执行）。返回 task_id 或 None。"""
     rec_db = SessionLocal()
@@ -115,11 +173,26 @@ def _try_record_start(job_id: str, triggered_by: str) -> int | None:
         rec_db.close()
 
 
-def _try_record_finish(task_id: int, status: str, records_pulled: int = 0, error_message: str | None = None) -> None:
+def _try_record_finish(
+    task_id: int,
+    status: str,
+    records_pulled: int = 0,
+    error_message: str | None = None,
+    planned_count: int | None = None,
+    success_count: int | None = None,
+    coverage_rate: float | None = None,
+) -> None:
     """尝试记录任务结束（使用独立 db 会话，失败不阻塞）。"""
     rec_db = SessionLocal()
     try:
-        record_task_finish(rec_db, task_id, status, records_pulled=records_pulled, error_message=error_message)
+        record_task_finish(
+            rec_db, task_id, status,
+            records_pulled=records_pulled,
+            error_message=error_message,
+            planned_count=planned_count,
+            success_count=success_count,
+            coverage_rate=coverage_rate,
+        )
     except Exception as e:
         logger.warning("record_task_finish 失败 (task_id=%s): %s", task_id, e)
     finally:
@@ -699,6 +772,127 @@ def job_backfill_gaps(days: int = 90):
         db.close()
 
 
+@track_run("pull_fund_nav")
+def job_pull_fund_nav(days: int = 30):
+    """.OF 基金净值定时拉取（增量补缺）。
+
+    背景：job_backfill_gaps 对 .OF 代码无效（_tencent_symbol 返回 None），
+    导致 fund_daily_nav 只能靠手动/本地同步。本 job 直连东财 lsjz API 拉取净值，
+    按增量补缺模式（已有 trade_date 跳过）。
+
+    返回 dict（供 track_run 提取覆盖率）：
+      planned:       计划拉取的 (基金 × 日期) 总数
+      pulled:        实际新写入 fund_daily_nav 的行数
+      filled_total:  同 pulled（兼容字段名）
+      details:       每只基金的拉取明细
+    """
+    from datetime import date as _date, timedelta as _td
+
+    db: Session = SessionLocal()
+    try:
+        # 1. 找出所有 .OF 持仓（去重）
+        of_codes = sorted({
+            row[0] for row in
+            db.query(Holding.security_code)
+            .filter(Holding.security_code.like("%.OF"))
+            .distinct()
+            .all()
+        })
+        if not of_codes:
+            logger.info("pull_fund_nav: 无 .OF 持仓，跳过")
+            return {"planned": 0, "pulled": 0, "filled_total": 0, "details": []}
+
+        # 2. 计算目标日期窗口（过去 N 天，含今天）
+        today = _date.today()
+        target_dates = [today - _td(days=i) for i in range(days)]
+
+        # 2.1 用 TradingCalendar 过滤出 CN 交易日（避免周末/节假日膨胀 planned_count）
+        #     若日历表无数据（如测试环境），回退到原 target_dates（向后兼容）
+        trading_days_set = set(
+            row[0] for row in
+            db.query(TradingCalendar.date)
+            .filter(TradingCalendar.market == "CN")
+            .filter(TradingCalendar.date.in_(target_dates))
+            .filter(TradingCalendar.is_trading.is_(True))
+            .all()
+        )
+        if trading_days_set:
+            target_dates = [d for d in target_dates if d in trading_days_set]
+
+        # 3. 每只基金：查已有日期，确定缺口，调 API 拉 + 写入
+        # planned = 本次需补缺的 (基金 × 日期) 数（不含已存在的）。
+        # 语义：planned=0 表示无缺口（数据已完整），coverage=None；
+        #       planned>0 且 pulled=0 表示拉取失败，coverage=0.0。
+        target_dates_set = set(target_dates)  # 用于写入时过滤（只写目标窗口内的交易日）
+        planned_total = 0
+        pulled_total = 0
+        details = []
+        for code in of_codes:
+            existing = set(
+                row[0] for row in
+                db.query(FundDailyNav.trade_date)
+                .filter(FundDailyNav.fund_code == code)
+                .all()
+            )
+            missing_dates = [d for d in target_dates if d not in existing]
+            planned_total += len(missing_dates)
+            if not missing_dates:
+                details.append({"code": code, "status": "complete", "missing": 0, "pulled": 0})
+                continue
+
+            # 东财 lsjz API 用不带后缀的 6 位代码
+            bare_code = code[:-3] if code.endswith(".OF") else code
+            start_str = (min(missing_dates) - _td(days=1)).strftime("%Y-%m-%d")
+            end_str = max(missing_dates).strftime("%Y-%m-%d")
+            try:
+                # fetch_nav_all 是本模块的 wrapper：拉取 + 解析为标准 dict
+                parsed_rows = fetch_nav_all(bare_code, start_str, end_str)
+            except Exception as e:
+                logger.warning("pull_fund_nav: fetch %s 失败: %s", code, e)
+                details.append({"code": code, "status": "fetch_error", "missing": len(missing_dates), "pulled": 0, "error": str(e)[:100]})
+                continue
+
+            # 增量写入：只写 target_dates_set 内 + 未存在的 trade_date
+            # （防止 API 返回非交易日/窗口外日期污染 pulled 计数）
+            pulled = 0
+            for parsed in parsed_rows:
+                td = parsed["trade_date"]
+                if td not in target_dates_set:
+                    continue  # 跳过窗口外/非交易日
+                if td in existing:
+                    continue
+                db.add(FundDailyNav(
+                    fund_code=code,
+                    trade_date=td,
+                    nav=parsed["nav"],
+                    accumulated_nav=parsed["accumulated_nav"],
+                    daily_return=parsed["daily_return"],
+                    source="eastmoney_lsjz",
+                ))
+                pulled += 1
+                existing.add(td)  # 防同批次重复
+            if pulled:
+                db.commit()
+            pulled_total += pulled
+            details.append({"code": code, "status": "ok", "missing": len(missing_dates), "pulled": pulled})
+
+        logger.info(
+            "pull_fund_nav 完成: %d 只 .OF 基金, planned=%d, pulled=%d",
+            len(of_codes), planned_total, pulled_total,
+        )
+        return {
+            "planned": planned_total,
+            "pulled": pulled_total,
+            "filled_total": pulled_total,
+            "details": details,
+        }
+    except Exception as e:
+        logger.error("pull_fund_nav 任务异常: %s", e, exc_info=True)
+        return {"status": "error", "message": str(e)[:500], "planned": 0, "pulled": 0, "filled_total": 0}
+    finally:
+        db.close()
+
+
 # ---------- 调度器启停 ----------
 
 def _run_code_map_preflight(db: Session, pools: tuple[str, ...] = ("holdings", "drilled")) -> dict:
@@ -951,6 +1145,20 @@ def start_scheduler():
         misfire_grace_time=60,
     )
 
+    # 任务12：.OF 基金净值定时拉取 — 每日 6:40 / 20:40（增量补缺，直连东财 lsjz）
+    # 解决 job_backfill_gaps 对 .OF 代码无效（腾讯 API 不支持场外基金）的问题
+    scheduler.add_job(
+        job_pull_fund_nav,
+        "cron",
+        hour="6,20",
+        minute=40,
+        id="pull_fund_nav",
+        name=".OF基金净值拉取",
+        max_instances=1,
+        misfire_grace_time=600,
+        kwargs={"days": 30},
+    )
+
     scheduler.start()
     logger.info(
         "调度器已启动，注册 %d 个定时任务",
@@ -1142,6 +1350,7 @@ JOB_DISPATCH: dict[str, dict] = {
     "detect_data_gaps": {"name": "数据补足检测", "func": job_detect_data_gaps},
     "drill_snapshot": {"name": "公共下钻截面生成", "func": job_generate_drill_snapshot},
     "intraday_change_pct": {"name": "盘中实时涨跌幅抓取", "func": job_fetch_intraday_change_pct},
+    "pull_fund_nav": {"name": ".OF基金净值拉取", "func": job_pull_fund_nav},
 }
 
 
@@ -1184,16 +1393,22 @@ def trigger_job(db: Session, job_id: str, triggered_by: str = "manual", **kwargs
 
     try:
         result = func(**kwargs) if kwargs else func()
-        records = _extract_record_count(result)
+        metrics = _extract_metrics(result)
         if task_id is not None:
             try:
-                record_task_finish(db, task_id, "SUCCESS", records_pulled=records)
+                record_task_finish(
+                    db, task_id, "SUCCESS",
+                    records_pulled=metrics["records_pulled"],
+                    planned_count=metrics["planned_count"],
+                    success_count=metrics["success_count"],
+                    coverage_rate=metrics["coverage_rate"],
+                )
             except Exception as e:
                 logger.warning("trigger_job: record_task_finish 失败 (task_id=%s): %s", task_id, e)
         return {
             "status": "ok",
             "job_id": job_id,
-            "records": records,
+            "records": metrics["records_pulled"],
             "result": result if isinstance(result, dict)
                       else {"value": str(result)[:200] if result is not None else None},
         }

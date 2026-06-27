@@ -237,24 +237,33 @@ def _resolve_dynamic_metrics(stock_code: str, as_of_date: _date, db: Session):
     return None, None, None, None
 
 
-def _wipe(db: Session, as_of_date: _date):
-    db.query(PenetrationSnapshot).filter(PenetrationSnapshot.as_of_date == as_of_date).delete(synchronize_session=False)
-    db.query(FullHoldingSnapshot).filter(FullHoldingSnapshot.as_of_date == as_of_date).delete(synchronize_session=False)
+def _wipe(db: Session, as_of_date: _date, user_id: int):
+    """清理目标 user_id 在 as_of_date 的穿透快照（不影响其他用户）。"""
+    db.query(PenetrationSnapshot).filter(
+        PenetrationSnapshot.as_of_date == as_of_date,
+        PenetrationSnapshot.user_id == user_id,
+    ).delete(synchronize_session=False)
+    db.query(FullHoldingSnapshot).filter(
+        FullHoldingSnapshot.as_of_date == as_of_date,
+        FullHoldingSnapshot.user_id == user_id,
+    ).delete(synchronize_session=False)
     db.commit()
 
 
-def run_penetration(db: Session, as_of_date: _date) -> PenetrationReport:
+def run_penetration(db: Session, as_of_date: _date, user_id: int) -> PenetrationReport:
     """Drill all eligible holdings and write penetration_snapshot + full_holding_snapshot.
 
     full_holding_snapshot is then merged by stock_code so the same security
     exposed via multiple funds collapses into one row with summed amount.
+
+    user_id: 仅处理该用户的持仓，写入的快照行带此 user_id（多用户隔离）。
     """
     report = PenetrationReport(as_of_date=as_of_date)
-    _wipe(db, as_of_date)
+    _wipe(db, as_of_date, user_id)
 
     # Aggregate holdings by security_code (multiple buy batches collapse to one row)
     agg: dict[str, dict] = {}
-    for h in db.query(Holding).all():
+    for h in db.query(Holding).filter(Holding.user_id == user_id).all():
         code = h.security_code
         if code not in agg:
             agg[code] = {
@@ -295,6 +304,7 @@ def run_penetration(db: Session, as_of_date: _date) -> PenetrationReport:
                 stype = "undrilled_fund"
             fh_rows.append(FullHoldingSnapshot(
                 as_of_date=as_of_date,
+                user_id=user_id,
                 stock_code=h_code,
                 stock_name=h["security_name"],
                 source_type=stype,
@@ -318,6 +328,7 @@ def run_penetration(db: Session, as_of_date: _date) -> PenetrationReport:
             report.holdings_skipped.append(f"{h_code}(no fund_index_map)")
             fh_rows.append(FullHoldingSnapshot(
                 as_of_date=as_of_date,
+                user_id=user_id,
                 stock_code=h_code,
                 stock_name=h["security_name"],
                 source_type="undrilled_fund",
@@ -332,6 +343,7 @@ def run_penetration(db: Session, as_of_date: _date) -> PenetrationReport:
             report.holdings_skipped.append(f"{h_code}(no constituents for {idx_code})")
             fh_rows.append(FullHoldingSnapshot(
                 as_of_date=as_of_date,
+                user_id=user_id,
                 stock_code=h_code,
                 stock_name=h["security_name"],
                 source_type="undrilled_fund",
@@ -356,6 +368,7 @@ def run_penetration(db: Session, as_of_date: _date) -> PenetrationReport:
 
             pn_rows.append(PenetrationSnapshot(
                 as_of_date=as_of_date,
+                user_id=user_id,
                 holding_code=h_code,
                 holding_name=h["security_name"],
                 holding_amount_cny=round(h_amt, 4),
@@ -375,6 +388,7 @@ def run_penetration(db: Session, as_of_date: _date) -> PenetrationReport:
             pe, pb, ps, eps = _resolve_dynamic_metrics(s.stock_code, as_of_date, db)
             fh_rows.append(FullHoldingSnapshot(
                 as_of_date=as_of_date,
+                user_id=user_id,
                 stock_code=s.stock_code,
                 stock_name=s.stock_name,
                 source_type="drilled_fund",
@@ -396,6 +410,7 @@ def run_penetration(db: Session, as_of_date: _date) -> PenetrationReport:
         if m is None:
             merged[r.stock_code] = FullHoldingSnapshot(
                 as_of_date=r.as_of_date,
+                user_id=user_id,
                 stock_code=r.stock_code,
                 stock_name=r.stock_name,
                 source_type=r.source_type,
@@ -442,3 +457,22 @@ def run_penetration(db: Session, as_of_date: _date) -> PenetrationReport:
     report.rows_inserted_pnsnap = len(pn_rows)
     report.rows_inserted_fhsnap = len(merged)
     return report
+
+
+def run_penetration_all_users(db: Session, as_of_date: _date) -> PenetrationReport:
+    """为所有有持仓的用户分别跑 run_penetration，返回合并 report。
+
+    用于 admin-import / auto-import 等批量场景：遍历 holdings 表中所有
+    distinct user_id，逐个调用 run_penetration(db, as_of_date, user_id)。
+    """
+    user_ids = [r[0] for r in db.query(Holding.user_id).distinct().all()]
+    merged_report = PenetrationReport(as_of_date=as_of_date)
+    for uid in user_ids:
+        rep = run_penetration(db, as_of_date, uid)
+        merged_report.holdings_seen += rep.holdings_seen
+        merged_report.holdings_drilled += rep.holdings_drilled
+        merged_report.holdings_skipped.extend(rep.holdings_skipped)
+        merged_report.rows_inserted_pnsnap += rep.rows_inserted_pnsnap
+        merged_report.rows_inserted_fhsnap += rep.rows_inserted_fhsnap
+        merged_report.errors.extend(rep.errors)
+    return merged_report

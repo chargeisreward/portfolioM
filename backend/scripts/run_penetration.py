@@ -8,7 +8,7 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
 from database import SessionLocal
-from services.penetration_v2 import run_penetration
+from services.penetration_v2 import run_penetration_all_users
 
 
 def main():
@@ -19,7 +19,7 @@ def main():
     as_of = _date.fromisoformat(args.as_of_date)
     db = SessionLocal()
     try:
-        rep = run_penetration(db, as_of)
+        rep = run_penetration_all_users(db, as_of)
         print(f"as_of_date={rep.as_of_date}")
         print(f"holdings_seen={rep.holdings_seen}")
         print(f"holdings_drilled={rep.holdings_drilled}")

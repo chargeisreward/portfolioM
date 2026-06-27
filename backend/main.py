@@ -788,7 +788,7 @@ def startup():
                         from scripts.import_index_constituents import import_index_constituents
                         from scripts.import_a_share_financials import import_a_share
                         from scripts.import_hk_share_financials import import_hk_share
-                        from services.penetration_v2 import run_penetration as run_pen
+                        from services.penetration_v2 import run_penetration_all_users as run_pen
                         from services.aggregation import refresh_all_dimensions, write_timeseries_for_day
                         import_fund_index_map(db, biz, folder / "基金-指数.xlsx")
                         import_index_constituents(db, folder / "指数构成.xlsx")
@@ -2727,7 +2727,7 @@ from services.data_version import (
     list_available_versions,
     resolve_source_folder,
 )
-from services.penetration_v2 import run_penetration as run_penetration_v2
+from services.penetration_v2 import run_penetration_all_users as run_penetration_v2
 from services.aggregation import (
     aggregate_dimension,
     upsert_dimension,

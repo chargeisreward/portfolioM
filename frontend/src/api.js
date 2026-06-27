@@ -207,6 +207,17 @@ export const getSnapshotRange = () =>
 export const getDailyTrades = (params) =>
   api.get('/holdings/daily-trades', { params }).then(r => r.data)
 
+// ---------- 估值表日截面（2026-06-27）----------
+// 数据源：valuation_daily_snapshot 表（按 user_id 隔离，含锁定状态）
+export const getValuationSnapshot = (params) =>
+  api.get('/valuation/snapshot', { params }).then(r => r.data)
+
+export const getValuationRange = () =>
+  api.get('/valuation/snapshot-range').then(r => r.data)
+
+export const postValuationRebuild = (data = {}) =>
+  api.post('/valuation/rebuild', data).then(r => r.data)
+
 // ---------- 管理员价格刷新（2026-06-26）----------
 // 全用户持仓并集 + 增量（TTL），公共数据层模式
 export const adminFillPricesAll = () =>

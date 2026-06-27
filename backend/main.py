@@ -32,6 +32,11 @@ from services.trading_rebuild_service import (
     ensure_initial_snapshot, rebuild_holdings_to_date,
     get_snapshot_for_date, get_snapshot_date_range, get_trades_for_date,
 )
+from services.valuation_snapshot_service import (
+    rebuild_valuation_to_date,
+    get_valuation_snapshot,
+    get_valuation_date_range,
+)
 from services.llm_service import parse_trades_with_llm
 from services.security_onboarding_service import onboard_new_security
 from middleware.auth import require_user, require_advisor, require_admin
@@ -5942,6 +5947,14 @@ def confirm_trades_endpoint(
     # 触发重算到今天（增量）
     rebuild_holdings_to_date(db, write_uid, today, force=False)
 
+    # 同步重算估值表截面（新增交易影响今日截面，force_from=today 解锁重算今日）
+    try:
+        rebuild_valuation_to_date(db, write_uid, today, force_from=today)
+    except Exception as e:
+        logging.getLogger(__name__).error(
+            "rebuild_valuation_to_date after confirm failed: %s", e, exc_info=True,
+        )
+
     # 返回最新日持仓快照
     snapshot_rows = get_snapshot_for_date(db, write_uid, today) or []
     return TradeConfirmResponse(
@@ -6025,6 +6038,14 @@ def update_trade(
             db.flush()
     rebuild_holdings_to_date(db, write_uid, date.today(), force=False)
 
+    # 同步重算估值表截面（编辑历史交易，从 rebuild_from 起解锁重算）
+    try:
+        rebuild_valuation_to_date(db, write_uid, date.today(), force_from=rebuild_from)
+    except Exception as e:
+        logging.getLogger(__name__).error(
+            "rebuild_valuation_to_date after trade update failed: %s", e, exc_info=True,
+        )
+
     return TradeOut.model_validate(trade)
 
 
@@ -6062,6 +6083,14 @@ def delete_trade(
             sess.last_rebuild_date = new_last
             db.flush()
     rebuild_holdings_to_date(db, write_uid, date.today(), force=False)
+
+    # 同步重算估值表截面（删除历史交易，从 rebuild_from 起解锁重算）
+    try:
+        rebuild_valuation_to_date(db, write_uid, date.today(), force_from=rebuild_from)
+    except Exception as e:
+        logging.getLogger(__name__).error(
+            "rebuild_valuation_to_date after trade delete failed: %s", e, exc_info=True,
+        )
 
     return {"ok": True, "deleted_id": trade_id}
 
@@ -6123,3 +6152,68 @@ def get_daily_trades_endpoint(
     _u, eff_uid = _resolve_eff_from_request(request, db)
     rows = get_trades_for_date(db, eff_uid, as_of)
     return [TradeOut(**row) for row in rows]
+
+
+# ---------- 估值表日截面（2026-06-27）----------
+# 数据源：valuation_daily_snapshot 表（按 user_id 隔离，含锁定状态）
+# 截面存储：持仓+股价+市值+关键指标(PE/PB/PS)，锁定后不重算
+
+@app.get("/api/valuation/snapshot")
+def get_valuation_snapshot_endpoint(
+    as_of: date,
+    request: Request,
+    user: User = Depends(require_user),
+    db: Session = Depends(get_db),
+):
+    """读取估值表截面（含 is_locked + holdings[]）。
+
+    截面不存在时服务自动触发 _rebuild_one_day + _check_and_lock。
+    """
+    from middleware.auth import _resolve_eff_from_request
+    _u, eff_uid = _resolve_eff_from_request(request, db)
+    snap = get_valuation_snapshot(db, eff_uid, as_of)
+    if snap is None:
+        return {"as_of_date": as_of.isoformat(), "is_locked": False, "locked_at": None, "holdings": []}
+    return snap
+
+
+@app.get("/api/valuation/snapshot-range")
+def get_valuation_range_endpoint(
+    request: Request,
+    user: User = Depends(require_user),
+    db: Session = Depends(get_db),
+):
+    """查询估值截面日期范围（用于前端日期控件 min/max）。"""
+    from middleware.auth import _resolve_eff_from_request
+    _u, eff_uid = _resolve_eff_from_request(request, db)
+    rng = get_valuation_date_range(db, eff_uid)
+    if rng is None:
+        return {"start_date": None, "end_date": None}
+    return {"start_date": rng[0].isoformat(), "end_date": rng[1].isoformat()}
+
+
+@app.post("/api/valuation/rebuild")
+def rebuild_valuation_endpoint(
+    payload: dict = None,
+    user: User = Depends(require_user),
+    db: Session = Depends(get_db),
+):
+    """手动触发估值表重算（管理员/手动触发）。
+
+    Body: {"force_from": "YYYY-MM-DD"}  # 可选，触发解锁重算
+    """
+    # 估值表重算只允许操作自己的数据，不支持 view_as（与 trade 写入一致）
+    eff_uid = user.id
+    payload = payload or {}
+    force_from_str = payload.get("force_from")
+    force_from = None
+    if force_from_str:
+        try:
+            force_from = date.fromisoformat(force_from_str)
+        except (ValueError, TypeError):
+            from fastapi import HTTPException
+            raise HTTPException(400, f"Invalid force_from: {force_from_str}")
+
+    today = date.today()
+    result = rebuild_valuation_to_date(db, eff_uid, today, force_from=force_from)
+    return result

@@ -1100,6 +1100,47 @@ class HoldingDailySnapshot(Base):
     created_at = Column(DateTime, default=datetime.utcnow)
 
 
+class ValuationDailySnapshot(Base):
+    """估值表日截面（按 user_id 隔离）— 持仓+股价+市值+关键指标+锁定状态。
+
+    锁定语义：is_locked=True 表示该日截面已固化，不再重算。
+    触发解锁的条件：①更新历史交易记录 ②历史价格变更。
+    定时任务每日盘后生成新截面，未锁定截面每次跑都会重算 + 检查锁定条件。
+    """
+    __tablename__ = "valuation_daily_snapshot"
+    __table_args__ = (
+        UniqueConstraint("user_id", "as_of_date", "security_code", "holding_uid",
+                         name="ux_valsnap_user_date_code_uid"),
+    )
+
+    id = Column(Integer, primary_key=True, autoincrement=True)
+    user_id = Column(BigInteger, nullable=False, index=True)
+    as_of_date = Column(Date, nullable=False, index=True)
+    security_code = Column(String(20), nullable=False, index=True)
+    security_name = Column(String(100))
+    quantity = Column(Float)
+    price = Column(Float)              # 原币单价
+    price_cny = Column(Float)          # 本币单价
+    currency = Column(String(10))
+    fx_rate = Column(Float)
+    amount_cny = Column(Float)         # 市值本币
+    asset_type = Column(String(20))    # 类型（asset_type 枚举值）
+    type2 = Column(String(40))         # 主题（来自 SecurityMaster.type2）
+    is_cash = Column(Boolean, default=False)
+    holding_uid = Column(Integer)      # 关联 Holding.id，区分同代码不同批次；NULL=CASH
+    # 关键指标（来自 AShare/HK/OverseasShareFinancialSnapshot 公共数据，写入时复制固化）
+    pe_ttm = Column(Float)
+    pb_mrq = Column(Float)
+    ps_ttm = Column(Float)
+    dividend_yield = Column(Float)
+    market_cap = Column(Float)
+    # 锁定状态
+    is_locked = Column(Boolean, default=False, nullable=False, index=True)
+    locked_at = Column(DateTime, nullable=True)
+    created_at = Column(DateTime, default=datetime.utcnow)
+    updated_at = Column(DateTime, default=datetime.utcnow, onupdate=datetime.utcnow)
+
+
 class TradingSession(Base):
     """交易会话：记录某用户的起始日 + 起始持仓快照状态。
 

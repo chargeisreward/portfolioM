@@ -893,6 +893,49 @@ def job_pull_fund_nav(days: int = 30):
         db.close()
 
 
+@track_run("valuation_snapshot")
+def job_valuation_snapshot():
+    """每日 20:45 执行 — 为所有 user 重算估值截面（含未锁定的也重跑 + 检查锁定）。
+
+    调度时间设计：
+    - 20:00 job_backfill_gaps（拉股价）
+    - 20:40 job_pull_fund_nav（拉基金净值）
+    - 20:45 job_valuation_snapshot（重算估值截面，此时价格已就位）
+
+    返回 dict（供 track_run 提取覆盖率）：
+      planned_count:   计划处理的 user 数
+      success_count:   成功处理的 user 数
+      coverage_rate:   成功率（success/planned，planned=0 时为 None）
+      details:         每 user 的处理结果
+    """
+    from services.valuation_snapshot_service import rebuild_valuation_to_date
+    db: Session = SessionLocal()
+    try:
+        today = date.today()
+        # 遍历所有有持仓的用户
+        user_ids = [uid for (uid,) in db.query(Holding.user_id).distinct().all()]
+        results = {}
+        for uid in user_ids:
+            try:
+                r = rebuild_valuation_to_date(db, uid, today, force_from=None)
+                results[uid] = r
+            except Exception as e:
+                logger.error("valuation_snapshot user_id=%s failed: %s", uid, e, exc_info=True)
+                results[uid] = {"error": str(e)[:500]}
+        success_count = sum(1 for v in results.values() if "error" not in v)
+        return {
+            "planned_count": len(user_ids),
+            "success_count": success_count,
+            "coverage_rate": (success_count / len(user_ids)) if user_ids else None,
+            "details": results,
+        }
+    except Exception as e:
+        logger.error("job_valuation_snapshot failed: %s", e, exc_info=True)
+        raise
+    finally:
+        db.close()
+
+
 # ---------- 调度器启停 ----------
 
 def _run_code_map_preflight(db: Session, pools: tuple[str, ...] = ("holdings", "drilled")) -> dict:
@@ -1157,6 +1200,19 @@ def start_scheduler():
         max_instances=1,
         misfire_grace_time=600,
         kwargs={"days": 30},
+    )
+
+    # 任务13：估值表日截面重算 — 每日 20:45（在 pull_fund_nav 20:40 之后，价格已就位）
+    # 为所有 user 重算估值截面（含未锁定的也重跑 + 检查锁定条件，符合则锁定）
+    scheduler.add_job(
+        job_valuation_snapshot,
+        "cron",
+        hour=20,
+        minute=45,
+        id="valuation_snapshot",
+        name="估值表日截面重算",
+        max_instances=1,
+        misfire_grace_time=600,
     )
 
     scheduler.start()

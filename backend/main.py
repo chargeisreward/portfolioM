@@ -4242,9 +4242,9 @@ def get_kpi(
     """顶部 KPI bar 实时数据（替换硬编码）。
 
     近期调整：
-      - csi300_pe：改用下钻页面（drillable_funds.list_drillable_indices）计算的 000300 加权 PE；
-        旧实现用的是 Csi300Analyzer 的 baseline（IndexConstituent × StockFinancial.ttm_pe），
-        与下钻卡片不一致。
+      - csi300_pe（2026-06-27 修复）：改用公共数据口径 _csi300_scope_totals（Csi300ConstituentSnapshot
+        官方权重 × A/H 估值快照），HS300 作为对比基准独立于用户持仓，所有用户看到同一基准值。
+        旧实现用 list_drillable_indices(user_id)，用户不持有 HS300 基金时 csi300_pe=None（Bug）。
       - daily_change_pct：当日涨幅 = 总览动态市值 / 上一交易日 FullHoldingSnapshot 静态市值 − 1。
         「上一交易日」= MAX(FullHoldingSnapshot.as_of_date)（不限制 < today）。
         — FullHoldingSnapshot 只在「美/中/港三地全部收盘、import 跑完」之后才落库，
@@ -4319,16 +4319,15 @@ def get_kpi(
         cur = h.currency or "CNY"
         return px * qty * fx_to_cny.get(cur, 1.0)
 
-    # ----- 1. 300 PE：下钻口径 -----
+    # ----- 1. 300 PE：公共数据口径（Csi300ConstituentSnapshot 官方权重 × A/H 估值快照）-----
+    # HS300 作为对比基准，PE 应独立于用户持仓，所有用户看到同一基准值。
+    # 旧实现用 list_drillable_indices(user_id)，用户不持有 HS300 基金时 csi300_pe=None（Bug：王用户看不到 300 PE）。
     csi300_pe = None
     try:
-        from services.drillable_funds import list_drillable_indices
-        indices = list_drillable_indices(db, as_of_date, user_id=eff_uid)
-        csi300_card = next((c for c in indices if c.get("index_code") == "000300"), None)
-        if csi300_card:
-            csi300_pe = csi300_card.get("weighted_pe")
+        csi300_totals = _csi300_scope_totals(db, as_of_date)
+        csi300_pe = csi300_totals.get("weighted_pe")
     except Exception as e:
-        logging.getLogger(__name__).warning("下钻口径 csi300_pe 计算失败: %s", e)
+        logging.getLogger(__name__).warning("公共口径 csi300_pe 计算失败: %s", e)
 
     # ----- 2. 当日涨幅 = 总览动态市值 / 上一交易日动态市值 − 1 -----
     # 分子：当前实时动态市值（Holding × PriceCache 最新价 × fx）

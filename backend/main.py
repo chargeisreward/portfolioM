@@ -4319,15 +4319,24 @@ def get_kpi(
         cur = h.currency or "CNY"
         return px * qty * fx_to_cny.get(cur, 1.0)
 
-    # ----- 1. 300 PE：公共数据口径（Csi300ConstituentSnapshot 官方权重 × A/H 估值快照）-----
-    # HS300 作为对比基准，PE 应独立于用户持仓，所有用户看到同一基准值。
-    # 旧实现用 list_drillable_indices(user_id)，用户不持有 HS300 基金时 csi300_pe=None（Bug：王用户看不到 300 PE）。
+    # ----- 1. 300 PE：与持仓卡片/下钻页面同口径（get_public_cards on fund_drill_snapshot）-----
+    # 2026-06-27 修复：改用 get_public_cards（fund_drill_snapshot 公共数据，每日更新），
+    # 与「分析→全持仓→全部沪深 300 证券」4 口径卡片及下钻页面 CSI300 卡片数值完全一致。
+    # get_public_cards 独立于 user_id（不读 Holding），所有用户看到同一基准值。
+    # fallback：fund_drill_snapshot 无 000300 数据时回退到 _csi300_scope_totals（月度基准数据）。
     csi300_pe = None
     try:
-        csi300_totals = _csi300_scope_totals(db, as_of_date)
-        csi300_pe = csi300_totals.get("weighted_pe")
+        from services.drill_public_service import get_public_cards
+        effective_as_of = min(as_of_date, confirmed_as_of)
+        public_cards = get_public_cards(db, effective_as_of)
+        csi300_card = next((c for c in public_cards if c.get("index_code") == "000300"), None)
+        if csi300_card:
+            csi300_pe = csi300_card.get("weighted_pe")
+        if csi300_pe is None:
+            csi300_totals = _csi300_scope_totals(db, as_of_date)
+            csi300_pe = csi300_totals.get("weighted_pe")
     except Exception as e:
-        logging.getLogger(__name__).warning("公共口径 csi300_pe 计算失败: %s", e)
+        logging.getLogger(__name__).warning("csi300_pe 计算失败: %s", e)
 
     # ----- 2. 当日涨幅 = 总览动态市值 / 上一交易日动态市值 − 1 -----
     # 分子：当前实时动态市值（Holding × PriceCache 最新价 × fx）

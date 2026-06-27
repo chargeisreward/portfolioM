@@ -55,6 +55,7 @@ export default function ValuationPanel() {
   const [selectedDate, setSelectedDate] = useState('')
   const [snapshot, setSnapshot] = useState(null)  // {as_of_date, is_locked, locked_at, holdings[]}
   const [dailyTrades, setDailyTrades] = useState([])
+  const [kpi, setKpi] = useState(null)  // 后端 KPI（PE/涨跌幅/科技占比，口径同 OverviewPanel）
   const [viewMode, setViewMode] = useState('type')  // 'type' | 'theme'
   const [loading, setLoading] = useState(false)
 
@@ -68,20 +69,26 @@ export default function ValuationPanel() {
     }).catch(() => {})
   }, [])
 
-  // ---- 选中日期变化时加载估值截面 + 当日交易 ----
-  // KPI 不再调 /api/penetration/kpi（数据源不一致），改为从 snapshot.holdings 本地计算
+  // ---- 选中日期变化时加载估值截面 + 当日交易 + KPI ----
+  // KPI 调 /api/penetration/kpi（口径与 OverviewPanel 一致）：
+  //   PE/涨跌幅/科技占比/CSI300PE 从 Holding+PriceCache+drill_orchestration 实时计算（不依赖 FullHoldingSnapshot）
+  //   total_amount_cny/drilled_stock_count 从 FullHoldingSnapshot 读取 — 若该日无穿透快照则为 0，
+  //   用估值截面本地计算值覆盖（见下方 effectiveKpi）
   const loadData = useCallback((asOf) => {
     if (!asOf) return
     setLoading(true)
     Promise.all([
       api.getValuationSnapshot({ as_of: asOf }),
       api.getDailyTrades({ as_of: asOf }),
-    ]).then(([snap, trades]) => {
+      api.getKpi(asOf).catch(() => null),
+    ]).then(([snap, trades, kpiData]) => {
       setSnapshot(snap)
       setDailyTrades(trades || [])
+      setKpi(kpiData?.values || kpiData || null)
     }).catch(() => {
       setSnapshot(null)
       setDailyTrades([])
+      setKpi(null)
     }).finally(() => setLoading(false))
   }, [])
 
@@ -92,43 +99,20 @@ export default function ValuationPanel() {
   // ---- 估值表合计 ----
   const holdings = snapshot?.holdings || []
   const totalAmountCny = holdings.reduce((s, r) => s + (r.amount_cny || 0), 0)
+  const localDrilledCount = holdings.filter(h => !h.is_cash).length
 
-  // ---- KPI 本地计算（数据源：ValuationDailySnapshot，与估值表一致）----
-  // 替代原 api.getKpi → /api/penetration/kpi（读 FullHoldingSnapshot，数据源不一致导致 ¥0）
-  // 计算口径对齐 OverviewPanel：总资产/持仓数/加权PE/科技占比 从 holdings 直接算；
-  // 上日涨跌幅/当日涨跌幅/CSI300PE 估值截面不存储，显示 "—"。
-  const kpi = React.useMemo(() => {
-    if (!holdings.length) return null
-    const nonCash = holdings.filter(h => !h.is_cash)
-    // 基金类（穿透载体）：A股主动/指数、QDII、美股ETF
-    const fundTypes = new Set(['a_share_equity', 'a_share_etf', 'qdii_equity', 'us_etf'])
-    const fundCount = nonCash.filter(h => fundTypes.has(h.asset_type)).length
-    // 加权 PE：sum(amount * pe) / sum(amount)，仅对 pe > 0 的非现金持仓
-    let peSum = 0, peWeight = 0
-    nonCash.forEach(h => {
-      if (h.pe_ttm && h.pe_ttm > 0 && h.amount_cny > 0) {
-        peSum += h.amount_cny * h.pe_ttm
-        peWeight += h.amount_cny
-      }
-    })
-    const portfolio_pe_weighted = peWeight > 0 ? peSum / peWeight : null
-    // 科技占比：type2 in {emerging, gold}（与 OverviewPanel.tech_weight_breakdown 口径对齐）
-    const emergingCny = nonCash.filter(h => h.type2 === 'emerging').reduce((s, h) => s + (h.amount_cny || 0), 0)
-    const goldCny = nonCash.filter(h => h.type2 === 'gold').reduce((s, h) => s + (h.amount_cny || 0), 0)
-    const techCny = emergingCny + goldCny
-    const tech_weight_pct = totalAmountCny > 0 ? techCny / totalAmountCny * 100 : null
+  // ---- 有效 KPI：后端 KPI + 本地覆盖 total_amount_cny/drilled_stock_count ----
+  // 后端 /api/penetration/kpi 的 total_amount_cny/drilled_stock_count 从 FullHoldingSnapshot 读取，
+  // 若该日无穿透快照则返回 0；用估值截面（ValuationDailySnapshot）的本地计算值覆盖，
+  // 保证 KPI 卡片与估值表数据源一致（总额/持仓数来自估值截面，PE/涨跌幅/科技占比来自后端口径）。
+  const effectiveKpi = React.useMemo(() => {
+    if (!kpi && !holdings.length) return null
     return {
-      total_amount_cny: totalAmountCny,
-      drilled_stock_count: nonCash.length,  // 估值表口径：非现金持仓数
-      fund_count: fundCount,
-      portfolio_pe_weighted,
-      csi300_pe: null,              // 估值截面不存储指数 PE
-      daily_change_pct: null,       // 估值截面不存储上日涨跌
-      intraday_change_pct: null,    // 估值截面不存储盘中涨跌
-      tech_weight_pct,
-      tech_weight_breakdown: { emerging_cny: emergingCny, gold_cny: goldCny, us_tech_cny: 0 },
+      ...(kpi || {}),
+      total_amount_cny: totalAmountCny > 0 ? totalAmountCny : (kpi?.total_amount_cny || 0),
+      drilled_stock_count: localDrilledCount > 0 ? localDrilledCount : (kpi?.drilled_stock_count || 0),
     }
-  }, [holdings, totalAmountCny])
+  }, [kpi, holdings, totalAmountCny, localDrilledCount])
 
   // 现金行单独提取（永远第一行）
   const cashRow = holdings.find(h => h.is_cash) || null
@@ -181,12 +165,12 @@ export default function ValuationPanel() {
       <div className="kpi-grid" style={{ marginBottom: 16 }}>
         <div className="kpi-card">
           <div className="kpi-label">总资产</div>
-          <div className="kpi-value">{kpi?.total_amount_cny != null ? fmtAmount(kpi.total_amount_cny) : '—'}</div>
+          <div className="kpi-value">{effectiveKpi?.total_amount_cny != null ? fmtAmount(effectiveKpi.total_amount_cny) : '—'}</div>
           <div className="kpi-sub">CNY</div>
         </div>
         <div className="kpi-card">
           <div className="kpi-label">穿透股票</div>
-          <div className="kpi-value">{kpi?.drilled_stock_count != null ? kpi.drilled_stock_count : '—'}</div>
+          <div className="kpi-value">{effectiveKpi?.drilled_stock_count != null ? effectiveKpi.drilled_stock_count : '—'}</div>
           <div className="kpi-sub">{kpi?.fund_count != null ? `${kpi.fund_count}基金` : '—'}</div>
         </div>
         <div className="kpi-card">
@@ -235,7 +219,7 @@ export default function ValuationPanel() {
           <div className="kpi-value">{kpi?.tech_weight_pct != null ? kpi.tech_weight_pct.toFixed(1) + '%' : '—'}</div>
           <div className="kpi-sub" style={{ fontSize: 10 }}>
             {kpi?.tech_weight_breakdown
-              ? `新兴 ${(kpi.tech_weight_breakdown.emerging_cny/10000).toFixed(0)}w + 黄金 ${(kpi.tech_weight_breakdown.gold_cny/10000).toFixed(0)}w`
+              ? `新兴 ${(kpi.tech_weight_breakdown.emerging_cny/10000).toFixed(0)}w + 美科 ${(kpi.tech_weight_breakdown.us_tech_cny/10000).toFixed(0)}w`
               : '未加载'}
           </div>
         </div>

@@ -8,7 +8,7 @@
 - 持仓+股价+市值: HoldingDailySnapshot (已有，按 user_id+as_of_date)
 - PE/PB/PS: AShare/HK/OverseasShareFinancialSnapshot 公共估值快照
 - type2: SecurityMaster.type2
-- 锁定条件: as_of_date <= get_confirmed_as_of(db)
+- 锁定条件: as_of_date <= get_confirmed_as_of(db) 且非现金行无价格缺失
 """
 from __future__ import annotations
 
@@ -16,6 +16,7 @@ import logging
 from datetime import date as _date, datetime, timedelta
 from typing import Optional
 
+from sqlalchemy import or_
 from sqlalchemy.orm import Session
 
 from models import (
@@ -134,12 +135,36 @@ def _resolve_type2(db: Session, security_code: str) -> Optional[str]:
 # ---------------------------------------------------------------------------
 
 def _check_and_lock(db: Session, user_id: int, as_of_date: _date) -> bool:
-    """检查 as_of_date <= get_confirmed_as_of(db)，是则把该日所有行 is_locked=True。
+    """锁定条件（两者均须满足）：
+    1. as_of_date <= get_confirmed_as_of(db)（T+1 08:00 后视为已确认）
+    2. 该日非现金行无价格缺失（price IS NULL 或 amount_cny=0 视为缺失）
 
+    有价格缺失时不锁定，等待后续价格补齐后重算时再锁定。
     Returns: True 若已锁定，False 若未锁定
     """
     confirmed_as_of = get_confirmed_as_of(db)
     if as_of_date > confirmed_as_of:
+        return False
+
+    # 价格完整性检查：非现金行 price IS NULL 或 amount_cny=0 视为缺失
+    missing_count = (
+        db.query(ValuationDailySnapshot)
+        .filter(
+            ValuationDailySnapshot.user_id == user_id,
+            ValuationDailySnapshot.as_of_date == as_of_date,
+            ValuationDailySnapshot.is_cash == False,  # noqa: E712
+            or_(
+                ValuationDailySnapshot.price == None,  # noqa: E711
+                ValuationDailySnapshot.amount_cny == 0,
+            ),
+        )
+        .count()
+    )
+    if missing_count > 0:
+        logger.warning(
+            "check_and_lock: skip locking user_id=%s as_of=%s — %s non-cash rows missing price",
+            user_id, as_of_date, missing_count,
+        )
         return False
 
     now = datetime.utcnow()

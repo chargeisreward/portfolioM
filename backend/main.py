@@ -16,7 +16,7 @@ from sqlalchemy import func
 from sqlalchemy.orm import Session
 
 from database import get_db, init_db
-from models import FundIndexMap, Holding, AssetType, OverseasShareFinancialSnapshot, User
+from models import FundIndexMap, Holding, AssetType, OverseasShareFinancialSnapshot, User, SecurityMaster
 from schemas import (
     HoldingOut, HoldingSummary, PenetrationRow, PenetrationSummary,
     IndustryChainAnalysis, GrowthAnalysis, ValuationMetrics,
@@ -24,7 +24,7 @@ from schemas import (
     SecurityMasterOut, SecurityMasterUpsert,
     SecurityTypeConfigOut, SecurityTypeConfigUpsert,
     TradeParseRequest, TradeParseResponse, ParsedTradeItem,
-    TradeConfirmRequest, TradeConfirmResponse, TradeUpdateRequest,
+    TradeConfirmRequest, TradeConfirmResponse, TradeConfirmResultItem, TradeUpdateRequest,
     TradeOut, HoldingSnapshotOut, TradingSessionOut, SnapshotRangeOut,
 )
 from services.importer import import_excel, get_holdings_summary
@@ -38,7 +38,7 @@ from services.valuation_snapshot_service import (
     get_valuation_date_range,
 )
 from services.llm_service import parse_trades_with_llm
-from services.security_onboarding_service import onboard_new_security
+from services.security_onboarding_service import onboard_new_security, verify_security_for_confirm
 from middleware.auth import require_user, require_advisor, require_admin
 from services.penetration import PenetrationEngine
 from services.growth_bucketer import GrowthBucketer, IndustryChainAnalyzer
@@ -73,6 +73,27 @@ _DEFAULT_ALLOWED_ORIGINS = [
 _EXTRA_ORIGINS = [o.strip() for o in os.environ.get("CORS_ALLOW_ORIGINS", "").split(",") if o.strip()]
 _ALLOWED_ORIGINS = _DEFAULT_ALLOWED_ORIGINS + _EXTRA_ORIGINS
 _ZEABUR_ORIGIN_RE = _re.compile(r"^https://[a-z0-9-]+\.zeabur\.app$")
+
+
+def _get_baseline_and_latest_nav_dates(db, today: date | None = None) -> tuple[date | None, date | None]:
+    """返回 (baseline_date, latest_nav_date)。
+
+    baseline_date = current_business_date(today)  # 数据业务日期（基期），如 2026-05-29
+    latest_nav_date = MAX(FundDailyNav.trade_date) WHERE trade_date <= today  # 最新净值日（动态）
+
+    重要：latest_nav_date 不是固定日期（如 6/18），而是 ≤ today 的最新数据日。
+    参见 docs/reference-data-business-date.md。
+    """
+    from services.data_version import current_business_date
+    from sqlalchemy import func as _func
+    from models import FundDailyNav
+    if today is None:
+        today = date.today()
+    baseline = current_business_date(today)
+    latest = db.query(_func.max(FundDailyNav.trade_date)).filter(
+        FundDailyNav.trade_date <= today,
+    ).scalar()
+    return baseline, latest
 
 
 def _is_allowed_origin(origin: str | None) -> bool:
@@ -1043,7 +1064,10 @@ def holdings_converted(target: str = Query("CNY"), request: Request = None, db: 
     from crawlers.exchange_rates import get_rate
     from middleware.auth import _resolve_eff_from_request
     _u, eff_uid = _resolve_eff_from_request(request, db)
-    rows = db.query(HoldingModel).filter(HoldingModel.user_id == eff_uid).all()
+    q = db.query(HoldingModel)
+    if eff_uid is not None:
+        q = q.filter(HoldingModel.user_id == eff_uid)
+    rows = q.all()
     # Build lookup from security_master
     sm_map = {}
     for sm in db.query(SecurityMaster).all():
@@ -1053,6 +1077,10 @@ def holdings_converted(target: str = Query("CNY"), request: Request = None, db: 
     for stc in db.query(SecurityTypeConfig).all():
         stc_map[stc.asset_type] = stc
 
+    # 实时取最新价（经 cache）；失败回退 Holding.price
+    # 总览 KPI 必须反映最新价格（非 Holding 表固化值），与估值表截面价口径不同（正常）
+    # 混合取价：A 股交易时段用实时价，非交易时段用收盘价（避免腾讯 API 返回盘中价）
+    from services.price_cache import get_latest_price
     result = []
     for h in rows:
         sm = sm_map.get(h.security_code)
@@ -1064,24 +1092,40 @@ def holdings_converted(target: str = Query("CNY"), request: Request = None, db: 
         stc = stc_map.get(asset_type)
         price_precision = stc.price_precision if stc else 2
 
-        # Convert to target currency
-        rate = get_rate(db, 'CNY', target) if target != 'CNY' else 1.0
-        if target == 'CNY':
-            converted = h.amount_cny or h.amount
-        else:
-            converted = round((h.amount_cny or h.amount) * rate, 2)
+        # 取最新价：.OF 走 FundDailyNav，A 股交易时段走实时价，非交易时段走收盘价
+        try:
+            latest_price, _, _ = get_latest_price(db, h.security_code, asset_type, orig_currency)
+        except Exception:
+            latest_price = None
+        effective_price = latest_price if (latest_price and latest_price > 0) else h.price
 
-        # 金额·原 = 数量 × 单价（原币种）
-        amount_original = round(h.quantity * h.price, 2) if h.price and h.quantity else None
+        # 用最新价重新计算金额（原币种 → CNY → target）
+        if effective_price and h.quantity:
+            amount_original = round(h.quantity * effective_price, 2)
+            rate_orig_to_cny = get_rate(db, orig_currency, 'CNY') if orig_currency != 'CNY' else 1.0
+            if rate_orig_to_cny > 0:
+                amount_cny = round(amount_original * rate_orig_to_cny, 2)
+            else:
+                amount_cny = h.amount_cny or h.amount
+        else:
+            amount_original = None
+            amount_cny = h.amount_cny or h.amount
+
+        # CNY → target
+        if target == 'CNY':
+            converted = amount_cny
+        else:
+            rate_cny_to_target = get_rate(db, 'CNY', target) if target != 'CNY' else 1.0
+            converted = round(amount_cny * rate_cny_to_target, 2) if rate_cny_to_target > 0 else amount_cny
 
         result.append({
             "security_code": h.security_code,
             "security_name": security_name,
             "quantity": h.quantity,
-            "price": h.price,
+            "price": effective_price,
             "price_precision": price_precision,
             "currency": orig_currency,
-            "amount": h.amount,
+            "amount": amount_original,
             "amount_original": amount_original,
             "amount_local": converted,
             "asset_type": asset_type,
@@ -1122,7 +1166,10 @@ def get_portfolio_trend(
             except Exception:
                 pass
 
-        rows = db.query(Holding).filter(Holding.user_id == eff_uid).all()
+        holdings_q = db.query(Holding)
+        if eff_uid is not None:
+            holdings_q = holdings_q.filter(Holding.user_id == eff_uid)
+        rows = holdings_q.all()
         if not rows:
             return {"series": [], "currency": target, "days": days}
 
@@ -3158,24 +3205,26 @@ def get_top10_holdings(
 
     # 2b. drilled — 复用 list_drillable_indices + get_index_drill_detail 一次性聚合
     holdings_agg = {c: info for c, info in by_code.items() if info["quantity"] > 0}
-    # 基础数据基准期5月29日：nav_529=基准日净值(as_of_date), nav_618=6/18最新净值日
+    # 基期 = as_of_date（= current_business_date，目前 2026-05-29）
+    # 最新日 = ≤ today 的最新 FundDailyNav.trade_date（动态）
+    _baseline_date_a2, _latest_nav_date_a2 = _get_baseline_and_latest_nav_dates(db)
     fund_navs_map: dict[str, dict] = {}
-    if drillable_codes:
+    if drillable_codes and _latest_nav_date_a2:
         nav_rows = (db.query(FundDailyNav)
                     .filter(FundDailyNav.fund_code.in_(sorted(drillable_codes)),
-                            FundDailyNav.trade_date.in_([as_of_date, date(2026, 6, 18)]))
+                            FundDailyNav.trade_date.in_([as_of_date, _latest_nav_date_a2]))
                     .all())
         for fc in drillable_codes:
-            fund_navs_map[fc] = {"nav_529": None, "cumnav_529": None,
-                                 "nav_618": None, "cumnav_618": None}
+            fund_navs_map[fc] = {"nav_baseline": None, "cumnav_baseline": None,
+                                 "nav_latest": None, "cumnav_latest": None}
         for r in nav_rows:
             fc = r.fund_code
             if r.trade_date == as_of_date:
-                fund_navs_map[fc]["nav_529"] = r.nav
-                fund_navs_map[fc]["cumnav_529"] = r.accumulated_nav
-            elif r.trade_date == date(2026, 6, 18):
-                fund_navs_map[fc]["nav_618"] = r.nav
-                fund_navs_map[fc]["cumnav_618"] = r.accumulated_nav
+                fund_navs_map[fc]["nav_baseline"] = r.nav
+                fund_navs_map[fc]["cumnav_baseline"] = r.accumulated_nav
+            elif r.trade_date == _latest_nav_date_a2:
+                fund_navs_map[fc]["nav_latest"] = r.nav
+                fund_navs_map[fc]["cumnav_latest"] = r.accumulated_nav
 
     indices = list_drillable_indices(db, as_of_date, user_id=eff_uid)
     drilled_acc: dict[str, dict] = {}
@@ -3380,27 +3429,29 @@ def get_dimension_drilled(
         holdings_agg[code]["amount_cny"] += (h.amount_cny or 0.0)
     holdings_agg = {k: v for k, v in holdings_agg.items() if v["quantity"] > 0}
 
-    # 基础数据基准期5月29日：nav_529=基准日净值(as_of_date), nav_618=6/18最新净值日
+    # 基期 = as_of_date（= current_business_date，目前 2026-05-29）
+    # 最新日 = ≤ today 的最新 FundDailyNav.trade_date（动态）
+    _baseline_date_a2b, _latest_nav_date_a2b = _get_baseline_and_latest_nav_dates(db)
     fund_navs_map: dict[str, dict] = {}
-    if drillable_codes:
+    if drillable_codes and _latest_nav_date_a2b:
         nav_rows = (
             db.query(FundDailyNav)
             .filter(
                 FundDailyNav.fund_code.in_(list(drillable_codes)),
-                FundDailyNav.trade_date.in_([as_of_date, date(2026, 6, 18)]),
+                FundDailyNav.trade_date.in_([as_of_date, _latest_nav_date_a2b]),
             )
             .all()
         )
         for fc in drillable_codes:
-            fund_navs_map[fc] = {"nav_529": None, "cumnav_529": None, "nav_618": None, "cumnav_618": None}
+            fund_navs_map[fc] = {"nav_baseline": None, "cumnav_baseline": None, "nav_latest": None, "cumnav_latest": None}
         for r in nav_rows:
             fc = r.fund_code
             if r.trade_date == as_of_date:
-                fund_navs_map[fc]["nav_529"] = r.nav
-                fund_navs_map[fc]["cumnav_529"] = r.accumulated_nav
-            elif r.trade_date == date(2026, 6, 18):
-                fund_navs_map[fc]["nav_618"] = r.nav
-                fund_navs_map[fc]["cumnav_618"] = r.accumulated_nav
+                fund_navs_map[fc]["nav_baseline"] = r.nav
+                fund_navs_map[fc]["cumnav_baseline"] = r.accumulated_nav
+            elif r.trade_date == _latest_nav_date_a2b:
+                fund_navs_map[fc]["nav_latest"] = r.nav
+                fund_navs_map[fc]["cumnav_latest"] = r.accumulated_nav
 
     indices = list_drillable_indices(db, as_of_date, user_id=eff_uid)
 
@@ -4267,14 +4318,18 @@ def get_kpi(
     from middleware.auth import _resolve_eff_from_request
     _u, eff_uid = _resolve_eff_from_request(request, db)
 
-    total_amount = db.query(_func.coalesce(_func.sum(FullHoldingSnapshot.amount_cny), 0)).filter(
+    total_amount_q = db.query(_func.coalesce(_func.sum(FullHoldingSnapshot.amount_cny), 0)).filter(
         FullHoldingSnapshot.as_of_date == as_of_date,
-        FullHoldingSnapshot.user_id == eff_uid,
-    ).scalar() or 0
-    drilled_stocks = db.query(_func.count(_func.distinct(FullHoldingSnapshot.stock_code))).filter(
+    )
+    if eff_uid is not None:
+        total_amount_q = total_amount_q.filter(FullHoldingSnapshot.user_id == eff_uid)
+    total_amount = total_amount_q.scalar() or 0
+    drilled_stocks_q = db.query(_func.count(_func.distinct(FullHoldingSnapshot.stock_code))).filter(
         FullHoldingSnapshot.as_of_date == as_of_date,
-        FullHoldingSnapshot.user_id == eff_uid,
-    ).scalar() or 0
+    )
+    if eff_uid is not None:
+        drilled_stocks_q = drilled_stocks_q.filter(FullHoldingSnapshot.user_id == eff_uid)
+    drilled_stocks = drilled_stocks_q.scalar() or 0
 
     # 基金下钻 PE/PB/PS — 与「分析→全持仓→全部下钻证券」4 口径卡片完全同算法
     # (drill_orchestration_service.compute_scope_metrics on fund_drill_snapshot 公共数据)
@@ -5447,6 +5502,117 @@ def admin_delete_fund_index_map(fund_code: str, as_of_date: date, db: Session = 
     return {"status": "ok"}
 
 
+# ========== Admin: 基金-指数映射视图（基于持仓 + SecurityMaster）==========
+
+@app.get("/api/admin/fund-index-view")
+def admin_fund_index_view(
+    request: Request = None,
+    db: Session = Depends(get_db),
+):
+    """列出当前用户持仓中所有非股票证券 + SecurityMaster 映射信息。
+
+    返回 {items: [...], total}。不分页（持仓基金数量通常 < 50）。
+    数据源：Holding LEFT JOIN SecurityMaster，过滤 security_type != 'stock'。
+    """
+    from middleware.auth import _resolve_eff_from_request
+    from sqlalchemy import distinct
+    _u, eff_uid = _resolve_eff_from_request(request, db)
+    if not eff_uid:
+        raise HTTPException(401, "请登录")
+
+    # 当前用户持仓的所有证券代码（去重）
+    holding_codes = [
+        r[0] for r in db.query(distinct(Holding.security_code))
+        .filter(Holding.user_id == eff_uid).all()
+    ]
+    if not holding_codes:
+        return {"items": [], "total": 0}
+
+    # 一次性查 SecurityMaster
+    sm_map = {
+        sm.security_code: sm
+        for sm in db.query(SecurityMaster)
+        .filter(SecurityMaster.security_code.in_(holding_codes)).all()
+    }
+
+    # 一次性查 Holding 的 security_name（用于 SecurityMaster 缺失时回退）
+    holding_name_map = {
+        r[0]: r[1] for r in db.query(Holding.security_code, Holding.security_name)
+        .filter(Holding.user_id == eff_uid, Holding.security_code.in_(holding_codes))
+        .distinct().all()
+    }
+
+    items = []
+    for code in sorted(holding_codes):
+        sm = sm_map.get(code)
+        # 过滤股票：SecurityMaster.security_type='stock' 或代码以纯数字+无后缀形式存在但 security_type=stock
+        sec_type = sm.security_type if sm else "fund"
+        if sec_type == "stock":
+            continue
+        items.append({
+            "security_code": code,
+            "security_name": (sm.security_name if sm else None) or holding_name_map.get(code) or code,
+            "security_type": sec_type,
+            "fund_type": sm.fund_type if sm else None,
+            "market": sm.market if sm else None,
+            "asset_type": sm.asset_type if sm else None,
+            "is_drillable": bool(sm.is_drillable) if sm else False,
+            "index_code": sm.index_code if sm else None,
+            "index_name": sm.index_name if sm else None,
+            "benchmark_formula": sm.benchmark_formula if sm else None,
+        })
+
+    return {"items": items, "total": len(items)}
+
+
+# ========== Admin: 指数下钻基础数据（模拟基金 10000 份）==========
+
+@app.get("/api/admin/index-drill-base")
+def admin_index_drill_base(
+    request: Request = None,
+    db: Session = Depends(get_db),
+):
+    """列出所有 is_drillable=True 基金的卡片数据（每基金一张卡片）。
+
+    模拟基金概念：固定 95% 股票 + 5% 现金，假设持有 10000 份。
+    卡片本身不计算占比/偏差，金额 = nav × 10000。
+    返回 {cards: [...], baseline_date, latest_date}。
+    """
+    from middleware.auth import _resolve_eff_from_request
+    _u, eff_uid = _resolve_eff_from_request(request, db)
+    if not eff_uid:
+        raise HTTPException(401, "请登录")
+
+    baseline_date, latest_nav_date = _get_baseline_and_latest_nav_dates(db)
+    from services.index_drill_base_service import list_drill_base_cards
+    return list_drill_base_cards(db, baseline_date, latest_nav_date)
+
+
+@app.get("/api/admin/index-drill-base-detail")
+def admin_index_drill_base_detail(
+    fund_code: str = Query(...),
+    request: Request = None,
+    db: Session = Depends(get_db),
+):
+    """获取单只基金的双日并排明细（最新日 vs 基期）。
+
+    返回 stocks 数组合并基期和最新日数据，按 stock_code 对齐。
+    基期用 pe_ttm/pb_mrq/ps_ttm（静态值），最新日用 pe_ttm_dynamic 等动态值。
+    约当数量 user_shares = 10000 × shares_equivalent。
+    """
+    from middleware.auth import _resolve_eff_from_request
+    _u, eff_uid = _resolve_eff_from_request(request, db)
+    if not eff_uid:
+        raise HTTPException(401, "请登录")
+
+    baseline_date, latest_nav_date = _get_baseline_and_latest_nav_dates(db)
+    from services.index_drill_base_service import get_drill_base_detail
+    result = get_drill_base_detail(db, fund_code, baseline_date, latest_nav_date)
+    if result is None:
+        raise HTTPException(404, f"基金不存在: {fund_code}")
+    return result
+
+
 # ========== Admin: 数据就绪 + 任务历史 ==========
 
 @app.get("/api/admin/data-readiness")
@@ -5856,13 +6022,22 @@ def parse_trades_endpoint(
         status = "exists"
         message = None
 
+        # 代码后缀 vs 名称特征一致性校验（场外基金 .OF vs 场内 ETF .SZ/.SH）
+        code_upper = code.upper()
+        name_upper = name.upper()
+        if code_upper.endswith(".OF") and "ETF" in name_upper and "联接" not in name_upper:
+            message = "场外基金代码与ETF名称不符，已按代码后缀处理"
+        elif (code_upper.endswith(".SZ") or code_upper.endswith(".SH")) and "联接" in name_upper:
+            message = "场内ETF代码与场外基金名称不符，已按代码后缀处理"
+
         # 查 SecurityMaster，不存在则 onboard
         sm = db.query(SecurityMaster).filter_by(security_code=code).first() if code else None
         if code and not sm:
             try:
                 result = onboard_new_security(db, code, name, context="trades/parse")
                 status = "new_verified" if result.get("security_verified") else "new_unverified"
-                message = result.get("message")
+                if not message:
+                    message = result.get("message")
                 db.commit()
             except Exception as e:
                 db.rollback()
@@ -5890,75 +6065,112 @@ def parse_trades_endpoint(
 @app.post("/api/trades/confirm", response_model=TradeConfirmResponse)
 def confirm_trades_endpoint(
     req: TradeConfirmRequest,
+    request: Request,
     user: User = Depends(require_user),
     db: Session = Depends(get_db),
 ):
-    """用户确认提交交易，写入 Transaction 表并触发重算。
+    """用户确认提交交易，写入 Transaction 表并触发重算（部分成功语义）。
 
     流程：
-    1. 逐条 upsert 到 Transaction 表（按唯一约束去重）
-    2. 调 rebuild_holdings_to_date 重算到今天
-    3. 返回最新持仓快照
+    1. 解析 effective user_id（admin 全局视图下拒绝，必须指定 view_as）
+    2. 逐条校验证券（verify_security_for_confirm）：通过则 upsert Transaction，失败则跳过
+    3. 仅当有成功条目时触发 rebuild_holdings_to_date + rebuild_valuation_to_date
+    4. 返回 confirmed/failed 列表 + 最新持仓快照
     """
     from models import Transaction, SecurityMaster
-    write_uid = user.id  # POST 写入用 user.id
+    from middleware.auth import _resolve_eff_from_request
+    from fastapi import HTTPException
+    _u, eff_uid = _resolve_eff_from_request(request, db)
+    if eff_uid is None:
+        # admin 全局视图下无法确定交易归属用户，必须指定 view_as
+        raise HTTPException(400, "管理员全局视图下不能确认交易，请通过 view_as 指定目标用户")
+    write_uid = eff_uid
 
     today = date.today()
-    confirmed_count = 0
-    for item in req.trades:
-        # upsert：按唯一约束 (user_id, trade_date, security_code, trade_type, confirmed_amount) 去重
-        existing = db.query(Transaction).filter(
-            Transaction.user_id == write_uid,
-            Transaction.trade_date == item.trade_date,
-            Transaction.security_code == item.security_code,
-            Transaction.trade_type == item.trade_type,
-            Transaction.confirmed_amount == item.confirmed_amount,
-        ).first()
-        if existing:
-            # 更新可编辑字段
-            existing.security_name = item.security_name
-            existing.confirmed_shares = item.confirmed_shares
-            existing.nav_price = item.nav_price
-            existing.nav_date = item.nav_date
-            existing.fee = item.fee
-            existing.remarks = item.remarks
-        else:
-            sm_exists = db.query(SecurityMaster).filter_by(security_code=item.security_code).first() is not None
-            db.add(Transaction(
-                user_id=write_uid,
-                trade_date=item.trade_date,
-                security_code=item.security_code,
-                security_name=item.security_name,
-                trade_type=item.trade_type,
-                confirmed_shares=item.confirmed_shares,
-                confirmed_amount=item.confirmed_amount,
-                nav_price=item.nav_price,
-                nav_date=item.nav_date,
-                fee=item.fee,
-                remarks=item.remarks,
-                security_verified=sm_exists,
-                security_added_to_master=sm_exists,
-                import_batch=f"confirm_{today.isoformat()}",
+    today_batch = f"confirm_{today.isoformat()}"
+    confirmed: list[TradeConfirmResultItem] = []
+    failed: list[TradeConfirmResultItem] = []
+
+    for idx, item in enumerate(req.trades):
+        # 1. 证券校验 + 新证券入库
+        verify = verify_security_for_confirm(db, item.security_code, item.security_name or "")
+        if not verify["verified"]:
+            failed.append(TradeConfirmResultItem(
+                index=idx, success=False, error="名称或代码可能有误",
+                security_code=item.security_code, security_name=item.security_name,
             ))
-            db.flush()  # autoflush=False：确保同批次后续 query 能查到，防止重复 add 触发 UniqueViolation
-            confirmed_count += 1
+            continue
+
+        # 2. upsert Transaction：按唯一约束 (user_id, trade_date, security_code, trade_type, import_batch) 去重
+        try:
+            existing = db.query(Transaction).filter(
+                Transaction.user_id == write_uid,
+                Transaction.trade_date == item.trade_date,
+                Transaction.security_code == item.security_code,
+                Transaction.trade_type == item.trade_type,
+                Transaction.import_batch == today_batch,
+            ).first()
+            if existing:
+                # 更新可编辑字段
+                existing.security_name = item.security_name
+                existing.confirmed_shares = item.confirmed_shares
+                existing.nav_price = item.nav_price
+                existing.nav_date = item.nav_date
+                existing.fee = item.fee
+                existing.remarks = item.remarks
+                trade_id = existing.id
+            else:
+                sm_exists = db.query(SecurityMaster).filter_by(
+                    security_code=item.security_code
+                ).first() is not None
+                new_tx = Transaction(
+                    user_id=write_uid,
+                    trade_date=item.trade_date,
+                    security_code=item.security_code,
+                    security_name=item.security_name,
+                    trade_type=item.trade_type,
+                    confirmed_shares=item.confirmed_shares,
+                    confirmed_amount=item.confirmed_amount,
+                    nav_price=item.nav_price,
+                    nav_date=item.nav_date,
+                    fee=item.fee,
+                    remarks=item.remarks,
+                    security_verified=sm_exists,
+                    security_added_to_master=sm_exists,
+                    import_batch=f"confirm_{today.isoformat()}",
+                )
+                db.add(new_tx)
+                db.flush()  # autoflush=False：确保同批次后续 query 能查到，防止重复 add 触发 UniqueViolation
+                trade_id = new_tx.id
+            confirmed.append(TradeConfirmResultItem(
+                index=idx, success=True, trade_id=trade_id,
+                security_code=item.security_code, security_name=item.security_name,
+            ))
+        except Exception as e:
+            db.rollback()
+            failed.append(TradeConfirmResultItem(
+                index=idx, success=False, error=f"入库失败: {e}",
+                security_code=item.security_code, security_name=item.security_name,
+            ))
     db.commit()
 
-    # 触发重算到今天（增量）
-    rebuild_holdings_to_date(db, write_uid, today, force=False)
+    # 3. 仅当有成功条目时触发 rebuild + valuation（避免空重建）
+    if confirmed:
+        rebuild_holdings_to_date(db, write_uid, today, force=False)
+        try:
+            rebuild_valuation_to_date(db, write_uid, today, force_from=today)
+        except Exception as e:
+            logging.getLogger(__name__).error(
+                "rebuild_valuation_to_date after confirm failed: %s", e, exc_info=True,
+            )
 
-    # 同步重算估值表截面（新增交易影响今日截面，force_from=today 解锁重算今日）
-    try:
-        rebuild_valuation_to_date(db, write_uid, today, force_from=today)
-    except Exception as e:
-        logging.getLogger(__name__).error(
-            "rebuild_valuation_to_date after confirm failed: %s", e, exc_info=True,
-        )
-
-    # 返回最新日持仓快照
+    # 4. 返回最新日持仓快照
     snapshot_rows = get_snapshot_for_date(db, write_uid, today) or []
     return TradeConfirmResponse(
-        confirmed_count=confirmed_count,
+        confirmed=confirmed,
+        failed=failed,
+        confirmed_count=len(confirmed),
+        failed_count=len(failed),
         latest_snapshot=[HoldingSnapshotOut(**row) for row in snapshot_rows],
     )
 
@@ -5975,7 +6187,9 @@ def list_trades(
     from models import Transaction
     from middleware.auth import _resolve_eff_from_request
     _u, eff_uid = _resolve_eff_from_request(request, db)
-    q = db.query(Transaction).filter(Transaction.user_id == eff_uid)
+    q = db.query(Transaction)
+    if eff_uid is not None:
+        q = q.filter(Transaction.user_id == eff_uid)
     if start_date:
         q = q.filter(Transaction.trade_date >= start_date)
     if end_date:
@@ -5988,27 +6202,31 @@ def list_trades(
 def update_trade(
     trade_id: int,
     req: TradeUpdateRequest,
+    request: Request,
     user: User = Depends(require_user),
     db: Session = Depends(get_db),
 ):
     """更新单条历史交易，触发全量重算（编辑历史交易后，从该日期起的快照需刷新）。
 
     流程：
-    1. 查找交易记录（by id + user_id，不支持 view_as 写入）
+    1. 查找交易记录（admin 全局视图可跨 user_id 查找）
     2. 更新可编辑字段
-    3. force=True 全量重算到今天
+    3. 从该日期起增量重算到今天（rebuild 用交易原属 user_id）
     """
     from models import Transaction
-    write_uid = user.id
+    from middleware.auth import _resolve_eff_from_request
+    _u, eff_uid = _resolve_eff_from_request(request, db)
 
-    trade = db.query(Transaction).filter(
-        Transaction.id == trade_id,
-        Transaction.user_id == write_uid,
-    ).first()
+    q = db.query(Transaction).filter(Transaction.id == trade_id)
+    if eff_uid is not None:
+        q = q.filter(Transaction.user_id == eff_uid)
+    trade = q.first()
     if not trade:
         from fastapi import HTTPException
         raise HTTPException(404, "交易记录不存在")
 
+    # rebuild 用交易原属 user_id（admin 全局视图下 != 登录 user.id）
+    write_uid = trade.user_id
     # 记录旧日期，用于确定重算起点
     old_date = trade.trade_date
 
@@ -6052,21 +6270,28 @@ def update_trade(
 @app.delete("/api/trades/{trade_id}")
 def delete_trade(
     trade_id: int,
+    request: Request,
     user: User = Depends(require_user),
     db: Session = Depends(get_db),
 ):
-    """删除单条历史交易，触发从该日期起的增量重算。"""
+    """删除单条历史交易，触发从该日期起的增量重算。
+
+    admin 全局视图下可跨 user_id 查找交易；rebuild 用交易原属 user_id。
+    """
     from models import Transaction
     from fastapi import HTTPException
-    write_uid = user.id
+    from middleware.auth import _resolve_eff_from_request
+    _u, eff_uid = _resolve_eff_from_request(request, db)
 
-    trade = db.query(Transaction).filter(
-        Transaction.id == trade_id,
-        Transaction.user_id == write_uid,
-    ).first()
+    q = db.query(Transaction).filter(Transaction.id == trade_id)
+    if eff_uid is not None:
+        q = q.filter(Transaction.user_id == eff_uid)
+    trade = q.first()
     if not trade:
         raise HTTPException(404, "交易记录不存在")
 
+    # rebuild 用交易原属 user_id（admin 全局视图下 != 登录 user.id）
+    write_uid = trade.user_id
     # 记录删除前日期，用于确定重算起点
     rebuild_from = trade.trade_date
 
@@ -6177,6 +6402,220 @@ def get_valuation_snapshot_endpoint(
     return snap
 
 
+@app.get("/api/valuation/kpi")
+def get_valuation_kpi_endpoint(
+    as_of_date: date = Query(...),
+    request: Request = None,
+    user: User = Depends(require_user),
+    db: Session = Depends(get_db),
+):
+    """估值表 KPI — 基于历史持仓 snapshot + 历史公共数据 + 当前证券主数据。
+
+    与 /api/penetration/kpi 的区别：
+    - 持仓来源：ValuationDailySnapshot(as_of_date) 而非当前 Holding
+    - 价格来源：ValuationDailySnapshot.price_cny（已固化）而非 PriceCache(confirmed_as_of)
+    - 下钻来源：get_all_drill_constituents(db, as_of_date, user_id, holdings_override=...)
+      传入历史持仓 dict，替代内部读 Holding 表
+    - 公共卡片：get_public_cards(db, as_of_date)（已带日期回退）
+    - 涨跌幅：KPI 4/5 均用总资产比值口径（该日总资产 / 上一日总资产 - 1）
+
+    KPI 4 上日涨跌幅 = prev_date 总资产 / prev_prev_date 总资产 - 1
+    KPI 5 当日涨跌幅 = as_of_date 总资产 / prev_date 总资产 - 1
+    两日都锁定 → 准确；任一未锁定 → 不准确但下次跑批会重算
+    """
+    from models import ValuationDailySnapshot, SecurityMaster
+    from sqlalchemy import func as _func
+    from middleware.auth import _resolve_eff_from_request
+    from services.drill_orchestration_service import (
+        get_all_drill_constituents, compute_scope_metrics,
+    )
+    from services.drill_public_service import get_public_cards
+
+    _u, eff_uid = _resolve_eff_from_request(request, db)
+    _logger = logging.getLogger(__name__)
+
+    # 1. 读历史持仓 snapshot
+    holdings_q = db.query(ValuationDailySnapshot).filter(
+        ValuationDailySnapshot.as_of_date == as_of_date,
+    )
+    if eff_uid is not None:
+        holdings_q = holdings_q.filter(ValuationDailySnapshot.user_id == eff_uid)
+    holdings = holdings_q.all()
+
+    if not holdings and eff_uid is not None:
+        # 用户该日无截面 — 尝试触发一次 rebuild（fallback 到当前 Holding）
+        # 适用于 admin 等直接导入 Holding 而未启用交易驱动重建的用户
+        # 注意：admin 全局视图（eff_uid=None）不触发 rebuild（无具体 user_id）
+        from services.valuation_snapshot_service import _rebuild_one_day, _check_and_lock
+        try:
+            n = _rebuild_one_day(db, eff_uid, as_of_date)
+            if n > 0:
+                _check_and_lock(db, eff_uid, as_of_date)
+                holdings = db.query(ValuationDailySnapshot).filter(
+                    ValuationDailySnapshot.as_of_date == as_of_date,
+                    ValuationDailySnapshot.user_id == eff_uid,
+                ).all()
+        except Exception as e:
+            _logger.warning("valuation/kpi rebuild fallback failed for user_id=%s: %s",
+                            eff_uid, e, exc_info=True)
+        if not holdings:
+            return {"as_of_date": as_of_date.isoformat(), "values": None, "reason": "no_snapshot"}
+    elif not holdings:
+        return {"as_of_date": as_of_date.isoformat(), "values": None, "reason": "no_snapshot"}
+
+    total_amount = sum((h.amount_cny or 0) for h in holdings)
+
+    # 2. 构造 holdings_override（供 get_all_drill_constituents 使用，结构同 user_service.get_user_fund_holdings）
+    #    过滤 CASH 行（基金下钻不包含现金），跨批次聚合
+    holdings_override: dict[str, dict] = {}
+    for h in holdings:
+        if h.is_cash or not h.security_code:
+            continue
+        code = h.security_code
+        if code not in holdings_override:
+            holdings_override[code] = {"quantity": 0.0, "amount_cny": 0.0, "price": h.price}
+        holdings_override[code]["quantity"] += (h.quantity or 0.0)
+        holdings_override[code]["amount_cny"] += (h.amount_cny or 0.0)
+
+    # 3. 穿透股票数 + 组合PE：基于 fund_drill_snapshot(as_of_date) + 历史持仓
+    drilled_resp = get_all_drill_constituents(
+        db, as_of_date, eff_uid, holdings_override=holdings_override,
+    )
+    drilled_stocks = 0
+    portfolio_pe = None
+    drilled_available = drilled_resp is not None and bool(drilled_resp.get("stocks"))
+    if drilled_available:
+        non_cash_stocks = [s for s in drilled_resp["stocks"] if not s.get("is_cash")]
+        drilled_stocks = len(non_cash_stocks)
+        metrics = compute_scope_metrics(drilled_resp["stocks"])
+        portfolio_pe = metrics.get("weighted_pe")
+
+    # 4. CSI300 PE：get_public_cards(as_of_date) 找 000300
+    csi300_pe = None
+    try:
+        public_cards = get_public_cards(db, as_of_date)
+        csi300_card = next((c for c in public_cards if c.get("index_code") == "000300"), None)
+        if csi300_card:
+            csi300_pe = csi300_card.get("weighted_pe")
+    except Exception as e:
+        _logger.warning("valuation/kpi csi300_pe 计算失败: %s", e)
+
+    # 5. 上日涨跌幅 + 当日涨跌幅（同口径：总资产比值）
+    #    KPI 4 = prev_date / prev_prev_date - 1
+    #    KPI 5 = as_of_date / prev_date - 1
+    daily_change_pct = None
+    daily_change_breakdown = {
+        "numerator_cny": None,       # prev_date 总资产
+        "denominator_cny": None,     # prev_prev_date 总资产
+        "latest_trade_date": None,   # = prev_date
+        "prev_trade_date": None,     # = prev_prev_date
+    }
+    intraday_change_pct = None
+    intraday_breakdown = {
+        "numerator_cny": round(total_amount, 2),  # as_of_date 总资产
+        "denominator_cny": None,                  # prev_date 总资产
+        "latest_trade_date": as_of_date.isoformat(),
+        "prev_trade_date": None,                  # = prev_date
+    }
+    try:
+        # 查 prev_date（< as_of_date 的最大日期）
+        prev_date = db.query(_func.max(ValuationDailySnapshot.as_of_date)).filter(
+            ValuationDailySnapshot.as_of_date < as_of_date,
+            ValuationDailySnapshot.user_id == eff_uid,
+        ).scalar()
+
+        if prev_date:
+            # prev_date 总资产（KPI 4 分子 + KPI 5 分母共用）
+            prev_total = db.query(_func.coalesce(_func.sum(ValuationDailySnapshot.amount_cny), 0)).filter(
+                ValuationDailySnapshot.as_of_date == prev_date,
+                ValuationDailySnapshot.user_id == eff_uid,
+            ).scalar() or 0
+
+            # KPI 5 当日涨跌幅：as_of_date / prev_date
+            if prev_total > 0:
+                intraday_change_pct = round((total_amount - prev_total) / prev_total * 100, 4)
+                intraday_breakdown["denominator_cny"] = round(prev_total, 2)
+                intraday_breakdown["prev_trade_date"] = prev_date.isoformat()
+
+            # KPI 4 上日涨跌幅：prev_date / prev_prev_date
+            prev_prev_date = db.query(_func.max(ValuationDailySnapshot.as_of_date)).filter(
+                ValuationDailySnapshot.as_of_date < prev_date,
+                ValuationDailySnapshot.user_id == eff_uid,
+            ).scalar()
+            if prev_prev_date:
+                prev_prev_total = db.query(_func.coalesce(_func.sum(ValuationDailySnapshot.amount_cny), 0)).filter(
+                    ValuationDailySnapshot.as_of_date == prev_prev_date,
+                    ValuationDailySnapshot.user_id == eff_uid,
+                ).scalar() or 0
+                if prev_prev_total > 0:
+                    daily_change_pct = round((prev_total - prev_prev_total) / prev_prev_total * 100, 4)
+                    daily_change_breakdown = {
+                        "numerator_cny": round(prev_total, 2),
+                        "denominator_cny": round(prev_prev_total, 2),
+                        "latest_trade_date": prev_date.isoformat(),
+                        "prev_trade_date": prev_prev_date.isoformat(),
+                    }
+    except Exception as e:
+        _logger.warning("valuation/kpi 涨跌幅计算失败: %s", e, exc_info=True)
+
+    # 6. 科技占比：ValuationDailySnapshot.amount_cny × SecurityMaster.type2（当前主数据）
+    _EMERGING_KEYS = {"emerging", "新兴产业"}
+    _US_TECH_KEYS = {"us_tech", "美股科技"}
+    tech_weight_pct = None
+    tech_weight_breakdown = {"emerging_cny": 0.0, "us_tech_cny": 0.0, "total_cny": 0.0}
+    try:
+        sm_map = {m.security_code: m for m in db.query(SecurityMaster).all()}
+        emerging_cny = us_tech_cny = total_cny = 0.0
+        for h in holdings:
+            v = h.amount_cny or 0
+            total_cny += v
+            sm = sm_map.get(h.security_code)
+            t2 = sm.type2 if sm else None
+            if t2 in _EMERGING_KEYS:
+                emerging_cny += v
+            elif t2 in _US_TECH_KEYS:
+                us_tech_cny += v
+        tech_weight_breakdown = {
+            "emerging_cny": round(emerging_cny, 2),
+            "us_tech_cny": round(us_tech_cny, 2),
+            "total_cny": round(total_cny, 2),
+        }
+        if total_cny > 0:
+            tech_weight_pct = round((emerging_cny + us_tech_cny) / total_cny * 100, 4)
+    except Exception as e:
+        _logger.warning("valuation/kpi 科技占比计算失败: %s", e, exc_info=True)
+
+    # 7. fund_count：估值表中可下钻基金数（SecurityMaster.is_drillable=True）
+    fund_count = 0
+    try:
+        if not sm_map:
+            sm_map = {m.security_code: m for m in db.query(SecurityMaster).all()}
+        fund_count = sum(
+            1 for h in holdings
+            if sm_map.get(h.security_code) and sm_map[h.security_code].is_drillable
+        )
+    except Exception:
+        pass
+
+    return {
+        "as_of_date": as_of_date.isoformat(),
+        "values": {
+            "total_amount_cny": round(total_amount, 2),
+            "drilled_stock_count": drilled_stocks,
+            "drilled_available": drilled_available,
+            "portfolio_pe_weighted": portfolio_pe,
+            "csi300_pe": csi300_pe,
+            "daily_change_pct": daily_change_pct,
+            "daily_change_breakdown": daily_change_breakdown,
+            "intraday_change_pct": intraday_change_pct,
+            "intraday_breakdown": intraday_breakdown,
+            "tech_weight_pct": tech_weight_pct,
+            "tech_weight_breakdown": tech_weight_breakdown,
+            "fund_count": fund_count,
+        },
+    }
+
+
 @app.get("/api/valuation/snapshot-range")
 def get_valuation_range_endpoint(
     request: Request,
@@ -6185,25 +6624,92 @@ def get_valuation_range_endpoint(
 ):
     """查询估值截面日期范围（用于前端日期控件 min/max）。"""
     from middleware.auth import _resolve_eff_from_request
+    from services.valuation_snapshot_service import _rebuild_one_day, _check_and_lock
+    from services.trading_calendar import get_confirmed_as_of
     _u, eff_uid = _resolve_eff_from_request(request, db)
     rng = get_valuation_date_range(db, eff_uid)
     if rng is None:
-        return {"start_date": None, "end_date": None}
+        # 用户无任何估值截面 — 尝试为 confirmed_as_of 触发一次 rebuild（fallback 到当前 Holding）
+        # 适用于 admin 等直接导入 Holding 而未启用交易驱动重建的用户
+        # 用 confirmed_as_of 而非 today：与 /api/valuation/kpi 口径一致，
+        # 避免周末/节假日生成的未锁定截面污染日期范围
+        try:
+            biz_date = get_confirmed_as_of(db)
+            n = _rebuild_one_day(db, eff_uid, biz_date)
+            if n > 0:
+                _check_and_lock(db, eff_uid, biz_date)
+                rng = get_valuation_date_range(db, eff_uid)
+        except Exception as e:
+            logging.getLogger(__name__).warning(
+                "snapshot-range rebuild fallback failed for user_id=%s: %s",
+                eff_uid, e, exc_info=True,
+            )
+        if rng is None:
+            return {"start_date": None, "end_date": None}
     return {"start_date": rng[0].isoformat(), "end_date": rng[1].isoformat()}
+
+
+@app.get("/api/valuation/trend")
+def get_valuation_trend_endpoint(
+    days: int = Query(90, ge=1, le=365),
+    request: Request = None,
+    user: User = Depends(require_user),
+    db: Session = Depends(get_db),
+):
+    """估值表资产合计走势（批量）。
+
+    返回最近 days 天内每日资产合计 + is_locked。
+    单次 SQL 聚合，供前端走势图【估值】标签使用。
+    """
+    from middleware.auth import _resolve_eff_from_request
+    from datetime import timedelta as _td
+    from sqlalchemy import func as _f
+    from models import ValuationDailySnapshot
+    _u, eff_uid = _resolve_eff_from_request(request, db)
+    today = date.today()
+    cutoff = today - _td(days=days)
+    rows = (
+        db.query(
+            ValuationDailySnapshot.as_of_date,
+            _f.sum(ValuationDailySnapshot.amount_cny).label("total"),
+            _f.bool_or(ValuationDailySnapshot.is_locked).label("is_locked"),
+        )
+        .filter(
+            ValuationDailySnapshot.user_id == eff_uid,
+            ValuationDailySnapshot.as_of_date >= cutoff,
+            ValuationDailySnapshot.as_of_date <= today,
+        )
+        .group_by(ValuationDailySnapshot.as_of_date)
+        .order_by(ValuationDailySnapshot.as_of_date)
+        .all()
+    )
+    return {
+        "series": [
+            {
+                "date": r.as_of_date.isoformat(),
+                "total": round(float(r.total or 0), 2),
+                "is_locked": bool(r.is_locked),
+            }
+            for r in rows
+        ],
+        "days": days,
+    }
 
 
 @app.post("/api/valuation/rebuild")
 def rebuild_valuation_endpoint(
+    request: Request,
     payload: dict = None,
     user: User = Depends(require_user),
     db: Session = Depends(get_db),
 ):
-    """手动触发估值表重算（管理员/手动触发）。
+    """手动触发估值表重算。
 
+    权限：用户自身 / 顾问看 client / 管理员看任意（与 snapshot 端点一致，支持 view_as）。
     Body: {"force_from": "YYYY-MM-DD"}  # 可选，触发解锁重算
     """
-    # 估值表重算只允许操作自己的数据，不支持 view_as（与 trade 写入一致）
-    eff_uid = user.id
+    from middleware.auth import _resolve_eff_from_request
+    _u, eff_uid = _resolve_eff_from_request(request, db)
     payload = payload or {}
     force_from_str = payload.get("force_from")
     force_from = None

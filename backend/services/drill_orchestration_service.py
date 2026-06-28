@@ -241,7 +241,12 @@ def get_drill_detail(
     }
 
 
-def get_all_drill_constituents(db: Session, as_of: _date, user_id: int) -> dict | None:
+def get_all_drill_constituents(
+    db: Session,
+    as_of: _date,
+    user_id: int,
+    holdings_override: dict[str, dict] | None = None,
+) -> dict | None:
     """跨所有可下钻指数聚合成分股（按 effective user 隔离）。
 
     用与 get_drill_detail 相同的双币种算法，跨所有可下钻指数按 stock_code 合并，
@@ -249,7 +254,9 @@ def get_all_drill_constituents(db: Session, as_of: _date, user_id: int) -> dict 
 
     数据流：
       1. public_service.get_public_cards(as_of) → 所有公共卡片（含 fund_codes + effective_date）
-      2. user_service.get_user_fund_holdings(user_id, fund_codes) → 用户持仓
+      2. 持仓来源：
+         - holdings_override 非空 → 直接使用（供估值表历史持仓场景）
+         - 否则 → user_service.get_user_fund_holdings(user_id, fund_codes) 读当前 Holding
       3. 一次性查 FundDrillSnapshot（effective_date × 用户持有的 fund）取 per-fund × per-stock 明细
       4. join：user_hold_shares = user_quantity × shares_equivalent
          est_market_value_cny = user_hold_shares × current_price_cny（本币 CNY）
@@ -258,6 +265,12 @@ def get_all_drill_constituents(db: Session, as_of: _date, user_id: int) -> dict 
 
     双币种规则 (2026-06-25)：est_market_value_cny 用本币(CNY)价 current_price_cny 算，
     保证 A 股/H 股量纲一致。本币字段在公共数据层算好存表，此处直接取。
+
+    holdings_override 结构（与 user_service.get_user_fund_holdings 返回值一致）：
+        {
+            "510300.SH": {"quantity": 10000.0, "amount_cny": 45000.0, "price": 4.5},
+            ...
+        }
 
     返回结构：
         {
@@ -287,11 +300,19 @@ def get_all_drill_constituents(db: Session, as_of: _date, user_id: int) -> dict 
     if not public_cards:
         return None
 
-    # 2. 收集所有 fund_codes，调用户层拿持仓
+    # 2. 收集所有 fund_codes，拿持仓
     all_fund_codes: set[str] = set()
     for card in public_cards:
         all_fund_codes.update(card["fund_codes"])
-    user_holdings = user_service.get_user_fund_holdings(db, user_id, list(all_fund_codes))
+    if holdings_override is not None:
+        # 估值表场景：用历史持仓 snapshot（已固化），仅保留与公共卡片 fund_codes 交集
+        user_holdings = {
+            code: info for code, info in holdings_override.items()
+            if code in all_fund_codes
+        }
+    else:
+        # 默认场景：读当前 Holding 表
+        user_holdings = user_service.get_user_fund_holdings(db, user_id, list(all_fund_codes))
     if not user_holdings:
         return None
 

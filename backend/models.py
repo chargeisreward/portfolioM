@@ -1039,8 +1039,10 @@ class Transaction(Base):
     """
     __tablename__ = "transaction_record"
     __table_args__ = (
-        UniqueConstraint("user_id", "trade_date", "security_code", "trade_type", "confirmed_amount",
-                         name="ux_tx_user_date_code_type_amt"),
+        # 不设 UK：Transaction.id 自增保证每行唯一（用户批注："由于id自增，不会产生唯一性约束"）
+        # 同代码多批次是不同渠道买入，不聚合，需要允许同日同代码同类型多行
+        # 普通交易去重由应用层 upsert 逻辑处理（confirm_trades_endpoint 按
+        # user_id+trade_date+security_code+trade_type+import_batch 查询）
     )
 
     id = Column(Integer, primary_key=True, autoincrement=True)
@@ -1121,6 +1123,7 @@ class ValuationDailySnapshot(Base):
     quantity = Column(Float)
     price = Column(Float)              # 原币单价
     price_cny = Column(Float)          # 本币单价
+    price_date = Column(Date, nullable=True)  # 价格实际日期（trade_date）；NULL=未记录/历史数据
     currency = Column(String(10))
     fx_rate = Column(Float)
     amount_cny = Column(Float)         # 市值本币

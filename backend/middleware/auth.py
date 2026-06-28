@@ -81,9 +81,15 @@ def get_effective_user_id(
     return target.id
 
 
-def _resolve_eff_from_request(request: Request, db: Session) -> tuple[User, int]:
+def _resolve_eff_from_request(request: Request, db: Session) -> tuple[User, Optional[int]]:
     """从 request.state.user + view_as query 解析 (user, effective_user_id)。
     假设 middleware 已注入 user；不抛 401（应已被 require_user 校验）。
+
+    权限设计：
+    - 用户角色：只能看自身（eff_uid = user.id）
+    - 顾问角色：可看建立关联的客户（view_as 指定）
+    - 管理员角色：可看所有用户（未传 view_as → eff_uid=None 表示聚合全部；
+      传 view_as=X → eff_uid=X 看指定用户）
     """
     u = getattr(request.state, "user", None)
     view_as_raw = request.query_params.get("view_as")
@@ -93,6 +99,9 @@ def _resolve_eff_from_request(request: Request, db: Session) -> tuple[User, int]
             view_as_id = int(view_as_raw)
         except (TypeError, ValueError):
             view_as_id = None
+    # 管理员未传 view_as → eff_uid=None（聚合所有用户，管理员全局视图）
+    if u and u.is_admin and not view_as_id:
+        return u, None
     eff_uid = get_effective_user_id(request, view_as_id, u, db) if u else None
     return u, eff_uid
 
@@ -100,12 +109,16 @@ def _resolve_eff_from_request(request: Request, db: Session) -> tuple[User, int]
 def user_scope_query(query, model, request: Request, db: Session):
     """给 query 加上 user_id == eff_uid 过滤。用于按 user 隔离的个人数据表。
 
+    管理员未传 view_as 时 eff_uid=None，不过滤 user_id（聚合所有用户）。
+
     用法:
         rows = user_scope_query(
             db.query(PenetrationResult), PenetrationResult, request, db
         ).order_by(...).all()
     """
     _u, eff_uid = _resolve_eff_from_request(request, db)
+    if eff_uid is None:
+        return query  # 管理员全局视图：不过滤 user_id
     return query.filter(model.user_id == eff_uid)
 
 

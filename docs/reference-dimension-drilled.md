@@ -15,14 +15,14 @@ Returns bucketed portfolio and CSI300 rows for one dimension, plus per-bucket st
 | Name | Type | Required | Default | Constraint | Description |
 |------|------|----------|---------|------------|-------------|
 | `dim` | string | yes | — | one of `swy1`, `swy2`, `swy3`, `swy4`, `csi1`, `csi2`, `csi3`, `csi4`, `se1`, `se2`, `se3`, `se4`, `l1`, `l2`, `chain`, `growth_tier`, `competition` | Classification dimension to aggregate by. |
-| `as_of_date` | ISO date (`YYYY-MM-DD`) | yes | — | — | Business date used for holdings, snapshots, and CSI300 weights. |
+| `as_of_date` | ISO date (`YYYY-MM-DD`) | yes | — | — | Business date used for holdings, snapshots, and CSI300 weights. (See [reference-data-business-date.md](./reference-data-business-date.md) for the definition of the data business date.) |
 | `market` | string | no | `A+H` | `^(A\+H|A|H)$` | Restrict stocks by market. `A` = A-share only (`.SH`, `.SZ`, or 6-digit codes), `H` = HK only (`.HK` or 5-digit codes), `A+H` = no restriction. |
 
 #### Response schema
 
 ```json
 {
-  "as_of_date": "2026-06-18",
+  "as_of_date": "2026-05-29",
   "dim": "swy1",
   "portfolio": [
     {
@@ -200,7 +200,7 @@ The `dim` query parameter maps to a database column as follows:
 ## Example: cURL request
 
 ```bash
-curl -s "http://localhost:8015/api/penetration/dimension-drilled?dim=swy1&as_of_date=2026-06-18&market=A+H" \
+curl -s "http://localhost:8015/api/penetration/dimension-drilled?dim=swy1&as_of_date=2026-05-29&market=A+H" \
   -H "x-session-token: $PORTFOLIOM_SESSION"
 ```
 

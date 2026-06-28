@@ -15,7 +15,10 @@ import { postImport } from '../api'
  */
 
 // 交易类型中文映射
-const TRADE_TYPE_LABELS = { buy: '申购', sell: '赎回', dividend: '分红', others: '其他' }
+const TRADE_TYPE_LABELS = {
+  buy: '申购', sell: '赎回', dividend: '分红',
+  split: '拆分', rights: '配售', conversion: '转换', others: '其他',
+}
 
 // 证券状态中文映射
 const SECURITY_STATUS_LABELS = {
@@ -137,7 +140,7 @@ export default function TradingPanel() {
     setParsedTrades(prev => prev.map((t, i) => i === idx ? { ...t, [field]: value } : t))
   }
 
-  // ---- 提交交易 ----
+  // ---- 提交交易（部分成功语义）----
   const handleConfirm = async () => {
     if (!parsedTrades.length) {
       alert('无交易可提交')
@@ -146,11 +149,35 @@ export default function TradingPanel() {
     setConfirming(true)
     try {
       const result = await api.confirmTrades(parsedTrades)
-      alert(`提交成功：确认 ${result.confirmed_count} 笔交易，已重算持仓`)
-      setRawText('')
-      setParsedTrades([])
-      setParseError(null)
-      loadHistory()
+      // 成功的条目从显示中移除；失败的保留并标注错误
+      const successIndices = new Set((result.confirmed || []).map(c => c.index))
+      const failedList = result.failed || []
+      const failedTrades = parsedTrades
+        .map((t, idx) => ({ ...t, _origIdx: idx }))
+        .filter(t => !successIndices.has(t._origIdx))
+        .map(t => {
+          const failInfo = failedList.find(f => f.index === t._origIdx)
+          return {
+            ...t,
+            security_status: 'failed',
+            security_message: failInfo?.error || '名称或代码可能有误',
+          }
+        })
+      setParsedTrades(failedTrades)
+      if (result.confirmed_count > 0) {
+        const msg = result.failed_count > 0
+          ? `提交成功：确认 ${result.confirmed_count} 笔，失败 ${result.failed_count} 笔需修改，已重算持仓`
+          : `提交成功：确认 ${result.confirmed_count} 笔交易，已重算持仓`
+        alert(msg)
+        loadHistory()
+      } else {
+        alert(`提交失败：${result.failed_count} 笔交易名称或代码可能有误，请修改后重试`)
+      }
+      // 全部成功时清空输入
+      if (failedTrades.length === 0) {
+        setRawText('')
+        setParseError(null)
+      }
     } catch (e) {
       alert(`提交失败：${e?.response?.data?.detail || e.message}`)
     } finally {

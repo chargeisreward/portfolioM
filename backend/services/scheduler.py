@@ -295,12 +295,19 @@ def job_fetch_realtime_prices(force: bool = False, user_id: int | None = None):
                     if quote_info:
                         price = quote_info.get("price")
 
-                # 场外基金（.OF后缀）：通过akshare获取最新净值
+                # 场外基金（.OF后缀）：优先查 FundDailyNav 表（由 job_pull_fund_nav 写入），
+                # fallback 到 akshare（Py3.14 下可能失效）
                 if not price and code.endswith(".OF"):
-                    fund_code = code.replace(".OF", "")
-                    nav = _fetch_fund_nav(fund_code)
+                    from services.price_cache import _get_fund_nav_from_db
+                    nav, _, status = _get_fund_nav_from_db(db, code)
                     if nav and nav > 0:
                         price = nav
+                    if not price:
+                        # akshare fallback（可能因 Py3.14 py_mini_racer 失效）
+                        fund_code = code.replace(".OF", "")
+                        nav = _fetch_fund_nav(fund_code)
+                        if nav and nav > 0:
+                            price = nav
 
                 # A股ETF（.SZ/.SH后缀）及未获取到价格的场外基金：通过腾讯API获取
                 if not price and (
@@ -1188,21 +1195,33 @@ def start_scheduler():
         misfire_grace_time=60,
     )
 
-    # 任务12：.OF 基金净值定时拉取 — 每日 6:40 / 20:40（增量补缺，直连东财 lsjz）
+    # 任务12：.OF 基金净值定时拉取 — 每日 7:00 / 20:30（增量补缺，直连东财 lsjz）
     # 解决 job_backfill_gaps 对 .OF 代码无效（腾讯 API 不支持场外基金）的问题
+    # 7:00 和 20:30 的 minute 不同（0 vs 30），需拆成两条 add_job
     scheduler.add_job(
         job_pull_fund_nav,
         "cron",
-        hour="6,20",
-        minute=40,
-        id="pull_fund_nav",
-        name=".OF基金净值拉取",
+        hour=7,
+        minute=0,
+        id="pull_fund_nav_morning",
+        name=".OF基金净值拉取(晨)",
+        max_instances=1,
+        misfire_grace_time=600,
+        kwargs={"days": 30},
+    )
+    scheduler.add_job(
+        job_pull_fund_nav,
+        "cron",
+        hour=20,
+        minute=30,
+        id="pull_fund_nav_evening",
+        name=".OF基金净值拉取(晚)",
         max_instances=1,
         misfire_grace_time=600,
         kwargs={"days": 30},
     )
 
-    # 任务13：估值表日截面重算 — 每日 20:45（在 pull_fund_nav 20:40 之后，价格已就位）
+    # 任务13：估值表日截面重算 — 每日 20:45（在 pull_fund_nav 20:30 之后，价格已就位）
     # 为所有 user 重算估值截面（含未锁定的也重跑 + 检查锁定条件，符合则锁定）
     scheduler.add_job(
         job_valuation_snapshot,

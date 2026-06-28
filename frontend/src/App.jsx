@@ -32,7 +32,7 @@ const TABS = [
   { id: 'analyst',   label: '分析师',  icon: ICONS.analyst,  visibility: ['user','advisor','admin'] },
   { id: 'watch',     label: '关注',    icon: ICONS.watch,    visibility: ['user','advisor','admin'] },
   { id: 'trading',   label: '交易',    icon: ICONS.trading,  visibility: ['user'] },
-  { id: 'valuation', label: '估值表',  icon: 'M9 17v-2m3 2v-4m3 4v-6m2 10H7a2 2 0 01-2-2V5a2 2 0 012-2h5.586a1 1 0 01.707.293l5.414 5.414a1 1 0 01.293.707V19a2 2 0 01-2 2z', visibility: ['user'] },
+  { id: 'valuation', label: '估值表',  icon: 'M9 17v-2m3 2v-4m3 4v-6m2 10H7a2 2 0 01-2-2V5a2 2 0 012-2h5.586a1 1 0 01.707.293l5.414 5.414a1 1 0 01.293.707V19a2 2 0 01-2 2z', visibility: ['user','advisor','admin'] },
   { id: 'relation',  label: '关联',    icon: 'M17 20h5v-2a4 4 0 00-3-3.87M9 20H4v-2a3 3 0 015.36-1.87M15 7a3 3 0 11-6 0 3 3 0 016 0zm6 7a2 2 0 11-4 0 2 2 0 014 0z', visibility: ['user','advisor'] },
   { id: 'settings',  label: '设置',    icon: ICONS.settings, visibility: ['user','advisor','admin'] },
   // --- 分割线（仅 admin 可见） ---
@@ -57,6 +57,8 @@ export default function App() {
   const [allUsers, setAllUsers] = useState([])
   const [relations, setRelations] = useState({ as_advisor: [], as_client: [] })
   const [activeTab, setActiveTab] = useState('overview')
+  // 主数据页"缺指数构成"卡片跳转到内容上传页时预选的指数代码
+  const [pendingIndexUpload, setPendingIndexUpload] = useState(null)
   const [loading, setLoading] = useState(false)
   // 启动时总是验证 cookie（不再读 localStorage 判断是否需要验证）
   const [validating, setValidating] = useState(true)
@@ -217,9 +219,12 @@ export default function App() {
       case 'watch': return <WatchPanel />
       case 'relation': return <RelationPanel currentUser={currentUser} />
       case 'settings': return <SettingsPanel />
-      case 'masterData': return <MasterDataPanel />
+      case 'masterData': return <MasterDataPanel onMissingConstituents={(idx) => {
+        setPendingIndexUpload(idx)
+        setActiveTab('contentUpload')
+      }} />
       case 'dataSource': return <DataSourcePanel />
-      case 'contentUpload': return <ContentUploadPanel />
+      case 'contentUpload': return <ContentUploadPanel preSelectIndex={pendingIndexUpload} />
       default: return null
     }
   }

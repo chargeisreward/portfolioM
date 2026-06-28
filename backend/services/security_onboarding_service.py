@@ -23,7 +23,9 @@ import logging
 from sqlalchemy.orm import Session
 
 from models import SecurityMaster
-from services.llm_service import classify_market_with_llm, verify_security_name_with_llm
+from services.llm_service import (
+    classify_market_with_llm, verify_security_name_with_llm, verify_security_with_llm,
+)
 from services.security_master_service import (
     _derive_market, _derive_security_type, _derive_fund_type,
 )
@@ -275,4 +277,68 @@ def onboard_new_security(db: Session, security_code: str, security_name: str,
         result["error"] = f"创建 SecurityMaster 失败: {e}"
         logger.error("onboard_new_security: 创建 SM 失败 %s: %s", security_code, e)
 
+    return result
+
+
+def verify_security_for_confirm(db: Session, security_code: str,
+                                security_name: str) -> dict:
+    """confirm 阶段证券校验 + 新证券入库。
+
+    流程：
+    1. 查 SecurityMaster：
+       - 存在 → 调 verify_security_with_llm(code, name, sm.security_name) 校验
+       - 不存在 → 调 onboard_new_security 拉取数据构建主数据 + api_code_map
+    2. onboard 后再次查 SecurityMaster，调 verify_security_with_llm 校验
+    3. 返回校验结果
+
+    Args:
+        db: 数据库 session
+        security_code: 证券代码
+        security_name: 用户/LLM 提供的名称
+
+    Returns:
+        {"verified": bool, "reason": str, "security_code": str, "security_name": str}
+    """
+    result = {
+        "verified": False,
+        "reason": "",
+        "security_code": security_code,
+        "security_name": security_name,
+    }
+
+    if not security_code:
+        result["reason"] = "证券代码为空"
+        return result
+
+    # Step 1: 查 SecurityMaster
+    sm = db.query(SecurityMaster).filter(
+        SecurityMaster.security_code == security_code
+    ).first()
+
+    if not sm:
+        # SM 不存在 → onboard 新证券
+        try:
+            onboard_result = onboard_new_security(
+                db, security_code, security_name, context="trades/confirm"
+            )
+            if onboard_result.get("error"):
+                result["reason"] = f"入库失败: {onboard_result['error']}"
+                return result
+            # onboard 后重新查 SM
+            sm = db.query(SecurityMaster).filter(
+                SecurityMaster.security_code == security_code
+            ).first()
+        except Exception as e:
+            db.rollback()
+            result["reason"] = f"入库异常: {e}"
+            logger.error("verify_security_for_confirm: onboard 异常 %s: %s", security_code, e)
+            return result
+
+    # Step 2: 用 verify_security_with_llm 校验
+    sm_name = sm.security_name if sm else None
+    verify = verify_security_with_llm(security_code, security_name, sm_name)
+    result["verified"] = verify["verified"]
+    result["reason"] = verify["reason"]
+    if sm:
+        result["security_name"] = sm.security_name or security_name
     return result

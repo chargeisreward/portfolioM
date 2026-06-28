@@ -1,5 +1,6 @@
 import React, { useEffect, useMemo, useState } from 'react'
 import { getFullHoldingTable, getLatestExchangeRates } from '../api'
+import ShareBar from './ShareBar'
 
 const fmtAmount = (v) => {
   if (v == null) return '-'
@@ -246,6 +247,7 @@ export default function FullHoldingTable({ bizDate, onTotalEstChange }) {
               <th>名称</th>
               <th style={{ textAlign: 'center', width: 60 }}>下钻</th>
               <th style={{ textAlign: 'right', width: 70 }}>权重%</th>
+              <th style={{ textAlign: 'left', width: 80 }}>占比图</th>
               <th style={{ textAlign: 'right', width: 110 }}>约当数量</th>
               <th style={{ textAlign: 'right', width: 90 }}>昨日收盘</th>
               <th style={{ textAlign: 'right', width: 70 }}>PE</th>
@@ -262,6 +264,7 @@ export default function FullHoldingTable({ bizDate, onTotalEstChange }) {
                 <td style={{ overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>{r.stock_name || '-'}</td>
                 <td style={{ textAlign: 'center', color: '#4fc3f7' }}>◻</td>
                 <td style={{ textAlign: 'right', fontFamily: '"GeistMono",monospace' }}>{fmtPct(r.weight_pct)}</td>
+                <td style={{ textAlign: 'left' }}><ShareBar pct={r.weight_pct} /></td>
                 <td style={{ textAlign: 'right', fontFamily: '"GeistMono",monospace' }}>{fmtShares(r.shares)}</td>
                 <td style={{ textAlign: 'right', fontFamily: '"GeistMono",monospace' }}>{fmtNum(r.current_price)}</td>
                 <td style={{ textAlign: 'right', fontFamily: '"GeistMono",monospace' }}>{fmtNum(r.pe_ttm)}</td>
@@ -274,7 +277,7 @@ export default function FullHoldingTable({ bizDate, onTotalEstChange }) {
 
             {showSeparator && (
               <tr>
-                <td colSpan={11} style={{
+                <td colSpan={12} style={{
                   height: 1, padding: 0,
                   background: 'var(--border-strong, #888)',
                   borderTop: '1px dashed var(--border-strong, #888)',
@@ -289,6 +292,7 @@ export default function FullHoldingTable({ bizDate, onTotalEstChange }) {
                 <td style={{ overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>{r.stock_name || '-'}</td>
                 <td style={{ textAlign: 'center', color: r.is_cash ? 'var(--text-muted)' : '#69f0ae', fontWeight: 600 }}>{r.is_cash ? '💵' : '✓'}</td>
                 <td style={{ textAlign: 'right', fontFamily: '"GeistMono",monospace' }}>{fmtPct(r.weight_pct)}</td>
+                <td style={{ textAlign: 'left' }}><ShareBar pct={r.weight_pct} /></td>
                 <td style={{ textAlign: 'right', fontFamily: '"GeistMono",monospace' }}>{r.is_cash ? '-' : fmtShares(r.shares)}</td>
                 <td style={{ textAlign: 'right', fontFamily: '"GeistMono",monospace' }}>{fmtNum(r.current_price)}</td>
                 <td style={{ textAlign: 'right', fontFamily: '"GeistMono",monospace' }}>{fmtNum(r.pe_ttm)}</td>

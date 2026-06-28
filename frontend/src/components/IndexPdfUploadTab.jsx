@@ -4,8 +4,11 @@ import { rawApi as api } from '../api'
 /**
  * 指数构成 PDF 上传 tab。
  * 选择指数 → 上传 PDF → 预览解析结果 → 确认写入。
+ *
+ * Props:
+ *   preSelectIndex: string  从主数据页"缺指数构成"卡片跳转过来时预选的指数代码
  */
-export default function IndexPdfUploadTab() {
+export default function IndexPdfUploadTab({ preSelectIndex }) {
   const [indexList, setIndexList] = useState([])
   const [selectedIndex, setSelectedIndex] = useState('')
   const [asOfDate, setAsOfDate] = useState(new Date().toISOString().slice(0, 10))
@@ -34,6 +37,11 @@ export default function IndexPdfUploadTab() {
   }, [])
 
   useEffect(() => { loadIndexList() }, [loadIndexList])
+
+  /** 从主数据页跳转过来时预选指数。 */
+  useEffect(() => {
+    if (preSelectIndex) setSelectedIndex(preSelectIndex)
+  }, [preSelectIndex])
 
   /** 上传 PDF。 */
   const handleUpload = async () => {

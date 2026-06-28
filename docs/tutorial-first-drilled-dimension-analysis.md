@@ -8,7 +8,7 @@ In this tutorial you will open the drilled-dimension analysis panel, compare you
 
 - PortfolioM backend and frontend running locally.
 - Holdings imported and penetration calculation completed (so that drillable funds have been expanded into stocks).
-- A business date with snapshot data (for example `2026-06-18`).
+- A business date with snapshot data (for example `2026-05-29` — the business date, see [reference-data-business-date.md](./reference-data-business-date.md)).
 
 ---
 
@@ -29,7 +29,7 @@ If the panel shows "暂无下钻证券数据", verify that:
 
 - Holdings have been imported.
 - `FundIndexMap` has mappings for the business date.
-- `FundDailyNav` has NAV data for 2026-05-29 and 2026-06-18.
+- `FundDailyNav` has NAV data for the business date (`2026-05-29`) and the latest trading day on or before today.
 
 ---
 

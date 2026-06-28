@@ -1,5 +1,6 @@
 import React, { useEffect, useState } from 'react'
 import { getDataVersion } from '../api'
+import ShareBar from './ShareBar'
 
 const fmtNum = (v, d = 1) => (v == null ? '-' : Number(v).toFixed(d))
 const fmtPct = (v, d = 1) => (v == null ? '-' : Number(v).toFixed(d))
@@ -173,6 +174,7 @@ export default function DrillableFundsPage() {
                 <div className="drill-stat drill-stat-secondary"><span className="lbl">股票数</span><span className="val">{card.stock_count}</span></div>
                 <div className="drill-stat drill-stat-secondary"><span className="lbl">金额(CNY)</span><span className="val">{fmtAmount(card.static_amount_cny)}</span></div>
                 <div className="drill-stat drill-stat-secondary"><span className="lbl">占比%</span><span className="val" style={{ color: '#ffd54f', fontWeight: 600 }}>{fmtPct(card.weight_pct)}</span></div>
+                <div className="drill-stat drill-stat-secondary"><span className="lbl">占比图</span><span className="val" style={{ display: 'flex', alignItems: 'center', minHeight: 14 }}><ShareBar pct={card.weight_pct} /></span></div>
                 <div className="drill-stat drill-stat-secondary"><span className="lbl">偏差%</span>
                   <span className="val" style={{ color: devColor, fontWeight: 600 }}>
                     {dev != null && dev !== 0 ? (dev > 0 ? '+' : '') + dev.toFixed(2) + '%' : '-'}
@@ -197,6 +199,7 @@ export default function DrillableFundsPage() {
                             <th>代码</th>
                             <th>名称</th>
                             <th style={{ textAlign: 'right' }}>权重%</th>
+                            <th style={{ textAlign: 'left' }}>占比图</th>
                             <th style={{ textAlign: 'right' }}>约当数量</th>
                             <th style={{ textAlign: 'right' }}>昨日收盘·原币</th>
                             <th style={{ textAlign: 'right' }}>昨日收盘·本币</th>
@@ -213,6 +216,7 @@ export default function DrillableFundsPage() {
                               <td>{r.stock_code}</td>
                               <td>{r.stock_name}</td>
                               <td style={{ textAlign: 'right', fontFamily: '"GeistMono",monospace' }}>{fmtPct(r.weight_at_baseline_pct)}</td>
+                              <td style={{ textAlign: 'left' }}><ShareBar pct={r.weight_at_baseline_pct} /></td>
                               <td style={{ textAlign: 'right', fontFamily: '"GeistMono",monospace' }}>
                                 {r.shares_equivalent != null ? Math.round(r.shares_equivalent).toLocaleString() : '-'}
                               </td>
@@ -234,6 +238,7 @@ export default function DrillableFundsPage() {
                           <tr style={{ fontWeight: 600, borderTop: '1px solid var(--border-strong)' }}>
                             <td colSpan={2} style={{ color: 'var(--text-muted)', fontSize: 11 }}>合计 · {detail.constituents.filter(r => !r.is_cash).length} 只股票 + 现金</td>
                             <td style={{ textAlign: 'right', fontFamily: '"GeistMono",monospace' }}>100.00</td>
+                            <td style={{ textAlign: 'left' }}><ShareBar pct={100} /></td>
                             <td colSpan={7}></td>
                             <td style={{ textAlign: 'right', fontFamily: '"GeistMono",monospace' }}>
                               {fmtAmount(detail.constituents.reduce((s, r) => s + (r.est_market_value_cny || 0), 0))}

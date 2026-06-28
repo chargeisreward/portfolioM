@@ -156,7 +156,7 @@ WITH expected AS (
   WHERE market = 'CN'
     AND is_trading = 1
     AND date >= '2025-12-18'
-    AND date <= '2026-06-18'
+    AND date <= '<today>'  -- 替换为当天日期，例如 2026-06-28
 )
 SELECT e.date
 FROM expected e

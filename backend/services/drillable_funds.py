@@ -33,6 +33,7 @@ import logging
 from collections import defaultdict
 from datetime import date as _date
 
+from sqlalchemy import func as _func
 from sqlalchemy.orm import Session
 
 from models import (
@@ -77,25 +78,40 @@ def _aggregate_holdings_by_fund(db: Session, user_id: int | None = None) -> dict
     return out
 
 
-def _load_fund_navs(db: Session, fund_codes: list[str]) -> dict[str, dict]:
-    """保留原 FundDailyNav 读取逻辑（用户最新算法已不再用 1.z，但保留以备 debug）。
-    基础数据基准期5月29日：nav_529=基准日净值, nav_618=6/18最新净值日。
-    返回 {fund_code: {nav_529, cumnav_529, nav_618, cumnav_618}}。"""
+def _load_fund_navs(db: Session, fund_codes: list[str], baseline_date: _date | None = None, latest_date: _date | None = None) -> dict[str, dict]:
+    """[DEPRECATED] 保留原 FundDailyNav 读取逻辑以备 debug。
+
+    基期 = baseline_date（来自 current_business_date，即数据业务日期，目前 2026-05-29）
+    最新日 = latest_date（≤ today 的最新 FundDailyNav.trade_date，动态）
+
+    返回 {fund_code: {nav_baseline, cumnav_baseline, nav_latest, cumnav_latest}}。
+
+    注意：6/18 不是特殊日期，仅为当时查询时的最新净值日。详见 docs/reference-data-business-date.md。
+    """
     if not fund_codes:
         return {}
+    if baseline_date is None or latest_date is None:
+        # 兜底：未传日期时用 today 推断
+        from services.data_version import current_business_date
+        if baseline_date is None:
+            baseline_date = current_business_date(latest_date or _date.today())
+        if latest_date is None:
+            latest_date = db.query(_func.max(FundDailyNav.trade_date)).filter(
+                FundDailyNav.trade_date <= _date.today(),
+            ).scalar() or _date.today()
     rows = db.query(FundDailyNav).filter(
         FundDailyNav.fund_code.in_(fund_codes),
-        FundDailyNav.trade_date.in_([_date(2026, 5, 29), _date(2026, 6, 18)]),
+        FundDailyNav.trade_date.in_([baseline_date, latest_date]),
     ).all()
     fund_navs: dict[str, dict] = {}
     for r in rows:
         fund_navs.setdefault(r.fund_code, {})
-        if r.trade_date == _date(2026, 5, 29):
-            fund_navs[r.fund_code]["nav_529"] = r.nav
-            fund_navs[r.fund_code]["cumnav_529"] = r.accumulated_nav
-        elif r.trade_date == _date(2026, 6, 18):
-            fund_navs[r.fund_code]["nav_618"] = r.nav
-            fund_navs[r.fund_code]["cumnav_618"] = r.accumulated_nav
+        if r.trade_date == baseline_date:
+            fund_navs[r.fund_code]["nav_baseline"] = r.nav
+            fund_navs[r.fund_code]["cumnav_baseline"] = r.accumulated_nav
+        elif r.trade_date == latest_date:
+            fund_navs[r.fund_code]["nav_latest"] = r.nav
+            fund_navs[r.fund_code]["cumnav_latest"] = r.accumulated_nav
     for fc in fund_codes:
         if fc not in fund_navs:
             fund_navs[fc] = {}

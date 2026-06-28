@@ -1,5 +1,6 @@
 import React, { useState, useEffect, useCallback } from 'react'
 import * as api from '../api'
+import ShareBar from './ShareBar'
 
 /**
  * 估值表面板（独立页面）— 2026-06-27 整体优化。
@@ -46,9 +47,27 @@ const fmtPrice = (v) => {
   if (v == null || isNaN(v)) return '—'
   return Number(v).toFixed(4)
 }
+// 当日交易专用：强制2位小数（带千分位）
+const fmtQty2 = (v) => {
+  if (v == null || isNaN(v)) return '—'
+  return Number(v).toLocaleString('zh-CN', { minimumFractionDigits: 2, maximumFractionDigits: 2 })
+}
+const fmtAmount2 = (v, symbol = '¥') => {
+  if (v == null || isNaN(v)) return '—'
+  return symbol + Number(v).toLocaleString('zh-CN', { minimumFractionDigits: 2, maximumFractionDigits: 2 })
+}
 
 // 数字右对齐样式（GeistMono 字体，项目约定）
 const numStyle = { textAlign: 'right', fontFamily: '"GeistMono",monospace' }
+
+// 占比可视化柱状条：使用共享组件 ./ShareBar（连续渲染，5 格 × 2%，>10% 显示 +）
+
+// 组汇总行整行字体色（浅金色）— App.css .data-table td { color: var(--text) } 会覆盖 tr 继承，
+// 故需在每个 td 上显式设置 color
+const GROUP_COLOR = '#ffd54f'
+const groupRowStyle = { color: GROUP_COLOR }
+const groupTdStyle = { color: GROUP_COLOR }
+const groupNumStyle = { ...numStyle, color: GROUP_COLOR }
 
 export default function ValuationPanel() {
   const [snapshotRange, setSnapshotRange] = useState({ start_date: null, end_date: null })
@@ -70,17 +89,15 @@ export default function ValuationPanel() {
   }, [])
 
   // ---- 选中日期变化时加载估值截面 + 当日交易 + KPI ----
-  // KPI 调 /api/penetration/kpi（口径与 OverviewPanel 一致）：
-  //   PE/涨跌幅/科技占比/CSI300PE 从 Holding+PriceCache+drill_orchestration 实时计算（不依赖 FullHoldingSnapshot）
-  //   total_amount_cny/drilled_stock_count 从 FullHoldingSnapshot 读取 — 若该日无穿透快照则为 0，
-  //   用估值截面本地计算值覆盖（见下方 effectiveKpi）
+  // KPI 调 /api/valuation/kpi：基于历史持仓 snapshot(as_of_date) + 历史公共数据 + 当前证券主数据
+  //   反映 as_of_date 当日真实情况（不再用当前 Holding + 实时 PriceCache）
   const loadData = useCallback((asOf) => {
     if (!asOf) return
     setLoading(true)
     Promise.all([
       api.getValuationSnapshot({ as_of: asOf }),
       api.getDailyTrades({ as_of: asOf }),
-      api.getKpi(asOf).catch(() => null),
+      api.getValuationKpi(asOf).catch(() => null),
     ]).then(([snap, trades, kpiData]) => {
       setSnapshot(snap)
       setDailyTrades(trades || [])
@@ -99,20 +116,10 @@ export default function ValuationPanel() {
   // ---- 估值表合计 ----
   const holdings = snapshot?.holdings || []
   const totalAmountCny = holdings.reduce((s, r) => s + (r.amount_cny || 0), 0)
-  const localDrilledCount = holdings.filter(h => !h.is_cash).length
 
-  // ---- 有效 KPI：后端 KPI + 本地覆盖 total_amount_cny/drilled_stock_count ----
-  // 后端 /api/penetration/kpi 的 total_amount_cny/drilled_stock_count 从 FullHoldingSnapshot 读取，
-  // 若该日无穿透快照则返回 0；用估值截面（ValuationDailySnapshot）的本地计算值覆盖，
-  // 保证 KPI 卡片与估值表数据源一致（总额/持仓数来自估值截面，PE/涨跌幅/科技占比来自后端口径）。
-  const effectiveKpi = React.useMemo(() => {
-    if (!kpi && !holdings.length) return null
-    return {
-      ...(kpi || {}),
-      total_amount_cny: totalAmountCny > 0 ? totalAmountCny : (kpi?.total_amount_cny || 0),
-      drilled_stock_count: localDrilledCount > 0 ? localDrilledCount : (kpi?.drilled_stock_count || 0),
-    }
-  }, [kpi, holdings, totalAmountCny, localDrilledCount])
+  // KPI 数据来源：/api/valuation/kpi 端点（基于历史持仓 snapshot + 历史公共数据 + 当前证券主数据）
+  // 反映 as_of_date 当日真实情况，返回字段：total_amount_cny / drilled_stock_count /
+  // drilled_available / portfolio_pe_weighted / daily_change_pct / intraday_change_pct / tech_weight_pct
 
   // 现金行单独提取（永远第一行）
   const cashRow = holdings.find(h => h.is_cash) || null
@@ -131,6 +138,11 @@ export default function ValuationPanel() {
     if (!groups[key]) groups[key] = { rows: [], total: 0 }
     groups[key].rows.push(h)
     groups[key].total += (h.amount_cny || 0)
+  })
+
+  // 组内按权重（金额·本）降序排列
+  Object.values(groups).forEach(g => {
+    g.rows.sort((a, b) => (b.amount_cny || 0) - (a.amount_cny || 0))
   })
 
   // 组全名（用于组汇总行的名称列）
@@ -161,21 +173,27 @@ export default function ValuationPanel() {
         )}
       </div>
 
-      {/* KPI 卡片（同总览第一排卡片，计算口径相同） */}
+      {/* KPI 卡片（基于历史持仓 snapshot + 历史公共数据 + 当前证券主数据）*/}
       <div className="kpi-grid" style={{ marginBottom: 16 }}>
         <div className="kpi-card">
           <div className="kpi-label">总资产</div>
-          <div className="kpi-value">{effectiveKpi?.total_amount_cny != null ? fmtAmount(effectiveKpi.total_amount_cny) : '—'}</div>
+          <div className="kpi-value">{kpi?.total_amount_cny != null ? fmtAmount(kpi.total_amount_cny) : '—'}</div>
           <div className="kpi-sub">CNY</div>
         </div>
         <div className="kpi-card">
           <div className="kpi-label">穿透股票</div>
-          <div className="kpi-value">{effectiveKpi?.drilled_stock_count != null ? effectiveKpi.drilled_stock_count : '—'}</div>
+          <div className="kpi-value">{
+            kpi?.drilled_available
+              ? (kpi.drilled_stock_count != null && kpi.drilled_stock_count > 0
+                  ? kpi.drilled_stock_count
+                  : '缺指数构成和权重')
+              : '缺指数构成和权重'
+          }</div>
           <div className="kpi-sub">{kpi?.fund_count != null ? `${kpi.fund_count}基金` : '—'}</div>
         </div>
         <div className="kpi-card">
           <div className="kpi-label">组合PE</div>
-          <div className="kpi-value">{kpi?.portfolio_pe_weighted != null ? kpi.portfolio_pe_weighted.toFixed(1) : '—'}</div>
+          <div className="kpi-value">{kpi?.portfolio_pe_weighted != null ? kpi.portfolio_pe_weighted.toFixed(1) : '缺指数构成和权重'}</div>
           <div className="kpi-sub">300: {kpi?.csi300_pe != null ? kpi.csi300_pe.toFixed(1) : '—'}</div>
         </div>
         <div className="kpi-card">
@@ -188,12 +206,12 @@ export default function ValuationPanel() {
           }}>
             {kpi?.daily_change_pct != null
               ? (kpi.daily_change_pct > 0 ? '+' : '') + kpi.daily_change_pct.toFixed(2) + '%'
-              : '—'}
+              : '缺历史数据'}
           </div>
           <div className="kpi-sub" style={{ fontSize: 10 }}>
             {kpi?.daily_change_breakdown?.latest_trade_date && kpi?.daily_change_breakdown?.prev_trade_date
               ? `${kpi.daily_change_breakdown.latest_trade_date} vs ${kpi.daily_change_breakdown.prev_trade_date}`
-              : '未加载'}
+              : '—'}
           </div>
         </div>
         <div className="kpi-card">
@@ -206,12 +224,12 @@ export default function ValuationPanel() {
           }}>
             {kpi?.intraday_change_pct != null
               ? (kpi.intraday_change_pct > 0 ? '+' : '') + kpi.intraday_change_pct.toFixed(2) + '%'
-              : '—'}
+              : '缺历史数据'}
           </div>
           <div className="kpi-sub" style={{ fontSize: 10 }}>
-            {kpi?.intraday_breakdown?.covered_count > 0
-              ? `覆盖 ${kpi.intraday_breakdown.covered_count} 只`
-              : '盘中实时'}
+            {kpi?.intraday_breakdown?.latest_trade_date && kpi?.intraday_breakdown?.prev_trade_date
+              ? `${kpi.intraday_breakdown.latest_trade_date} vs ${kpi.intraday_breakdown.prev_trade_date}`
+              : '—'}
           </div>
         </div>
         <div className="kpi-card">
@@ -220,7 +238,7 @@ export default function ValuationPanel() {
           <div className="kpi-sub" style={{ fontSize: 10 }}>
             {kpi?.tech_weight_breakdown
               ? `新兴 ${(kpi.tech_weight_breakdown.emerging_cny/10000).toFixed(0)}w + 美科 ${(kpi.tech_weight_breakdown.us_tech_cny/10000).toFixed(0)}w`
-              : '未加载'}
+              : '—'}
           </div>
         </div>
       </div>
@@ -250,8 +268,8 @@ export default function ValuationPanel() {
                     <td>{t.security_code}</td>
                     <td>{t.security_name || '—'}</td>
                     <td>{TRADE_TYPE_LABELS[t.trade_type] || t.trade_type}</td>
-                    <td style={numStyle}>{fmtQty(t.confirmed_shares)}</td>
-                    <td style={numStyle}>{fmtAmount(t.confirmed_amount)}</td>
+                    <td style={numStyle}>{fmtQty2(t.confirmed_shares)}</td>
+                    <td style={numStyle}>{fmtAmount2(t.confirmed_amount)}</td>
                   </tr>
                 ))}
               </tbody>
@@ -312,6 +330,7 @@ export default function ValuationPanel() {
                   <th style={{ width: 90, ...numStyle }}>单价·本</th>
                   <th style={{ width: 110, ...numStyle }}>金额·本</th>
                   <th style={{ width: 70, ...numStyle }}>占比</th>
+                  <th style={{ width: 90, textAlign: 'left' }}>占比图</th>
                 </tr>
               </thead>
               <tbody>
@@ -325,21 +344,23 @@ export default function ValuationPanel() {
                     <td style={numStyle}>—</td>
                     <td style={numStyle}>{fmtAmount(cashRow.amount_cny)}</td>
                     <td style={numStyle}>{fmtPct(totalAmountCny > 0 ? cashRow.amount_cny / totalAmountCny * 100 : 0)}</td>
+                    <td style={{textAlign: 'left'}}><ShareBar pct={totalAmountCny > 0 ? cashRow.amount_cny / totalAmountCny * 100 : 0} /></td>
                   </tr>
                 )}
 
                 {/* 分组渲染：组汇总行 + 组内证券行（缩进 2 格） */}
                 {Object.entries(groups).map(([groupName, g]) => (
                   <React.Fragment key={groupName}>
-                    {/* 组汇总行 */}
-                    <tr style={{ fontWeight: 600, background: 'var(--bg-raised, rgba(0,0,0,0.02))' }}>
-                      <td>{groupName}</td>
-                      <td>{groupFullName(groupName)}</td>
-                      <td style={numStyle}>—</td>
-                      <td style={numStyle}>—</td>
-                      <td style={numStyle}>—</td>
-                      <td style={numStyle}>{fmtAmount(g.total)}</td>
-                      <td style={numStyle}>{fmtPct(totalAmountCny > 0 ? g.total / totalAmountCny * 100 : 0)}</td>
+                    {/* 组汇总行 — 浅金色字体（每个 td 显式设置 color，覆盖 .data-table td 的 color） */}
+                    <tr style={{ fontWeight: 600, background: 'var(--bg-raised, rgba(0,0,0,0.02))', ...groupRowStyle }}>
+                      <td style={groupTdStyle}>{groupName}</td>
+                      <td style={groupTdStyle}>{groupFullName(groupName)}</td>
+                      <td style={groupNumStyle}>—</td>
+                      <td style={groupNumStyle}>—</td>
+                      <td style={groupNumStyle}>—</td>
+                      <td style={groupNumStyle}>{fmtAmount(g.total)}</td>
+                      <td style={groupNumStyle}>{fmtPct(totalAmountCny > 0 ? g.total / totalAmountCny * 100 : 0)}</td>
+                      <td style={{textAlign: 'left'}}><ShareBar pct={totalAmountCny > 0 ? g.total / totalAmountCny * 100 : 0} /></td>
                     </tr>
                     {/* 组内证券行（缩进 2 字符 = paddingLeft: 16px） */}
                     {g.rows.map((h, idx) => (
@@ -351,6 +372,7 @@ export default function ValuationPanel() {
                         <td style={numStyle}>{fmtPrice(h.price_cny)}</td>
                         <td style={numStyle}>{fmtAmount(h.amount_cny)}</td>
                         <td style={numStyle}>{fmtPct(totalAmountCny > 0 ? h.amount_cny / totalAmountCny * 100 : 0)}</td>
+                        <td style={{textAlign: 'left'}}><ShareBar pct={totalAmountCny > 0 ? h.amount_cny / totalAmountCny * 100 : 0} /></td>
                       </tr>
                     ))}
                   </React.Fragment>
@@ -361,6 +383,7 @@ export default function ValuationPanel() {
                   <td colSpan={5}>合计</td>
                   <td style={numStyle}>{fmtAmount(totalAmountCny)}</td>
                   <td style={numStyle}>100%</td>
+                  <td style={{textAlign: 'left'}}><ShareBar pct={100} /></td>
                 </tr>
               </tfoot>
             </table>

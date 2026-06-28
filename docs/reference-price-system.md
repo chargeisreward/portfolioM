@@ -227,7 +227,7 @@ GET /api/prices?codes=NVDA,GOOGL&days=90
 
 ```http
 GET /api/calendar?market=CN&start=2026-05-01&end=2026-05-31
-GET /api/calendar/is-trading?market=US&date=2026-06-18
+GET /api/calendar/is-trading?market=US&date=2026-05-29
 GET /api/calendar/month?market=HK&year=2026&month=6
 GET /api/calendar/summary?market=CN&year=2026
 ```
@@ -240,7 +240,7 @@ GET /api/calendar/summary?market=CN&year=2026
 
 | 场景 | 是否视为缺数据 | 例子 |
 |------|----------------|------|
-| 交易日没有价格 | 是，需要补 | 2026-06-18 是交易日但某股票未返回数据 |
+| 交易日没有价格 | 是，需要补 | 2026-05-29 是交易日但某股票未返回数据 |
 | 非交易日没有价格 | 否，正常 | 2026-06-14 周日没有价格 |
 
 这个区分被用在：

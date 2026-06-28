@@ -196,3 +196,74 @@ def _get_fund_nav_from_db(db: Session, code: str) -> tuple:
         return row.accumulated_nav, "fund_daily_nav", "nav"
     logger.warning(f"price_cache: {code} no nav in FundDailyNav")
     return None, None, "miss"
+
+
+# ============================================================
+# 混合取价：交易时段用实时价，非交易时段用收盘价
+# ============================================================
+def get_latest_price(db: Session, code: str, asset_type: str, currency: str) -> tuple:
+    """获取最新价格（交易时段用实时价，非交易时段用收盘价）
+
+    解决问题：腾讯 API 在非交易时段返回 A 股盘中实时价（可能是盘中最低点），
+    而非收盘价。总览 KPI 需要在非交易时段用收盘价，交易时段用实时价。
+
+    策略：
+    - .OF 基金：直接查 FundDailyNav（同 get_realtime_price）
+    - A 股（.SH/.SZ）：
+      - 交易时段（北京时间 9:30-15:00，周一至周五）→ 调 get_realtime_price（实时价）
+      - 非交易时段 → 查 PriceCache 最新 close_px（收盘价）
+    - 其他（美股/港股）：调 get_realtime_price（保持现状）
+
+    Returns:
+        (price, source, status)
+        - status: "realtime" / "close" / "nav" / "miss"
+    """
+    # .OF 基金：直接查 FundDailyNav
+    if code.endswith(".OF"):
+        return get_realtime_price(db, code, asset_type, currency)
+
+    # A 股（.SH/.SZ）：交易时段用实时价，非交易时段用收盘价
+    if code.endswith(".SH") or code.endswith(".SZ"):
+        if _is_cn_trading_hours():
+            price, source, _ = get_realtime_price(db, code, asset_type, currency)
+            if price and price > 0:
+                return price, source, "realtime"
+            # 实时价获取失败 → 回退收盘价
+        # 非交易时段 或 实时价失败 → 查 PriceCache 最新收盘价
+        close_price = _get_close_from_price_cache(db, code)
+        if close_price:
+            return close_price, "price_cache_close", "close"
+        # 收盘价也无 → 最终回退 get_realtime_price
+        return get_realtime_price(db, code, asset_type, currency)
+
+    # 其他（美股/港股）：保持现状
+    return get_realtime_price(db, code, asset_type, currency)
+
+
+def _is_cn_trading_hours() -> bool:
+    """判断当前是否在 A 股交易时段（北京时间 9:30-15:00，周一至周五）"""
+    from datetime import datetime, timezone, timedelta
+    cn_tz = timezone(timedelta(hours=8))
+    now_cn = datetime.now(cn_tz)
+    # 周末
+    if now_cn.weekday() >= 5:
+        return False
+    # 交易时段 9:30-15:00
+    current_minutes = now_cn.hour * 60 + now_cn.minute
+    return 570 <= current_minutes <= 900  # 9:30=570, 15:00=900
+
+
+def _get_close_from_price_cache(db: Session, code: str) -> float | None:
+    """查 PriceCache 最新 close_px（跳过 close_px=NULL 的 intraday 行）"""
+    from models import PriceCache
+    row = (
+        db.query(PriceCache)
+        .filter(
+            PriceCache.stock_code == code,
+            PriceCache.close_px.isnot(None),
+            PriceCache.close_px > 0,
+        )
+        .order_by(PriceCache.trade_date.desc())
+        .first()
+    )
+    return row.close_px if row else None

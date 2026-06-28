@@ -2,6 +2,7 @@ import React, { useState, useEffect, useRef, useMemo, useCallback } from 'react'
 import * as echarts from 'echarts'
 import * as api from '../api'
 import { rawApi } from '../api'
+import ShareBar from './ShareBar'
 
 const CAT_LABELS = { a_share_equity:'A股基金', a_share_etf:'A股ETF', bond:'债券', gold:'黄金', hk_equity:'港股', qdii_equity:'QDII', us_stock:'美股', us_etf:'美股ETF' }
 const CAT_SHORT = { a_share_equity:'A基主动', a_share_etf:'A基指数', bond:'债券', gold:'黄金', hk_equity:'港股', qdii_equity:'QDI', us_stock:'美股', us_etf:'美股E' }
@@ -36,6 +37,8 @@ export default function OverviewPanel() {
   const [trendDays, setTrendDays] = useState(90)
   const [trendView, setTrendView] = useState('return')  // 'return' = 收益率%, 'value' = 资产净值
   const [trendReturn, setTrendReturn] = useState(null)  // {pct, abs} over the window
+  const [trendSource, setTrendSource] = useState('security')  // 'security' | 'valuation'
+  const [valuationTrendData, setValuationTrendData] = useState([])  // [{date, total, is_locked}]
   const [sortKey, setSortKey] = useState('amount')
   const [sortDir, setSortDir] = useState('desc')
   const [currency, setCurrency] = useState('CNY')
@@ -67,10 +70,13 @@ export default function OverviewPanel() {
     api.getHoldingsConverted(currency).then(setHoldingsLocal).catch(()=>{})
   }, [currency])
 
-  // KPI bar from /api/penetration/kpi (real numbers; replaces hardcoded fallback)
+  // KPI bar from /api/valuation/kpi（基于 ValuationDailySnapshot，口径与 ValuationPanel 一致）
+  // 2026-06-28 修订：从 /api/penetration/kpi 切换到 /api/valuation/kpi
+  //   原因：/api/penetration/kpi 读 FullHoldingSnapshot，某些用户特定日期无数据 → drilled_stock_count=0
+  //   /api/valuation/kpi 读 ValuationDailySnapshot + 内置 fund_count（基于 SecurityMaster.is_drillable）
   useEffect(() => {
     if (!bizDate) return
-    api.getKpi(bizDate).then(d => setKpi(d?.values || null)).catch(() => setKpi(null))
+    api.getValuationKpi(bizDate).then(d => setKpi(d?.values || null)).catch(() => setKpi(null))
   }, [bizDate])
 
   // Holdings data for table — always prefer converted API.
@@ -144,9 +150,20 @@ export default function OverviewPanel() {
     }).catch(() => { setTrendData([]); setTrendTotal(null); setTrendReturn(null) })
   }, [])
 
+  // 估值表走势（供【估值】标签使用）
+  const fetchValuationTrend = useCallback((days) => {
+    return api.getValuationTrend(days).then(d => {
+      setValuationTrendData(d?.series || [])
+    }).catch(() => { setValuationTrendData([]) })
+  }, [])
+
   useEffect(() => {
+    // trend 数据始终加载（估值模式下 5天以内未锁定日需要 trend 同日值替代）
     fetchTrend(trendDays, currency)
-  }, [fetchTrend, currency, trendDays])
+    if (trendSource === 'valuation') {
+      fetchValuationTrend(trendDays)
+    }
+  }, [fetchTrend, fetchValuationTrend, currency, trendDays, trendSource])
 
   // 监听右上角刷新触发的 trend 自愈完成事件，重新拉取走势图
   useEffect(() => {
@@ -213,23 +230,105 @@ export default function OverviewPanel() {
     })
   }, [currency, trendData, trendView])
 
-  // trend chart 独立渲染：只依赖 trendData / trendReturn / trendView / currency，立即生效
+  // 估值模式汇总（最后一个有效点的 total + 累计收益率%），供右上角显示区使用
+  const valuationSummary = React.useMemo(() => {
+    if (valuationTrendData.length === 0) return null
+    const today = new Date()
+    const fiveDaysAgo = new Date(today)
+    fiveDaysAgo.setDate(fiveDaysAgo.getDate() - 5)
+    const points = valuationTrendData.map(p => {
+      if (p.is_locked) return { value: p.total }
+      const pd = new Date(p.date)
+      if (pd >= fiveDaysAgo) {
+        const tp = trendData.find(t => t.date === p.date)
+        return tp ? { value: tp.value } : null
+      }
+      return null
+    })
+    const firstValid = points.find(p => p !== null)
+    const lastValid = [...points].reverse().find(p => p !== null)
+    if (!firstValid || !lastValid) return null
+    const baseline = firstValid.value
+    const pct = baseline ? ((lastValid.value - baseline) / baseline * 100) : 0
+    return { total: lastValid.value, pct }
+  }, [valuationTrendData, trendData])
+
+  // 右上角显示值：根据 trendSource 切换数据源
+  const displayPct = trendSource === 'valuation' ? valuationSummary?.pct : trendReturn?.pct
+  const displayTotal = trendSource === 'valuation' ? valuationSummary?.total : trendTotal
+
+  // trend chart 独立渲染：依赖 trendData / trendReturn / trendView / currency / trendSource / valuationTrendData
+  // 【证券】模式用 trend 数据；【估值】模式用估值表资产合计（5天规则处理未锁定日）
   useEffect(() => {
-    if (!trendRef.current || trendData.length === 0 || !trendReturn) return
-    const pctSeries = trendReturn.returnPctSeries || []
-    const valueSeries = trendData.map(p => p.value)
-    const lastPct = pctSeries.length ? pctSeries[pctSeries.length - 1] : 0
-    const lineColor = trendView === 'return'
-      ? (lastPct >= 0 ? '#4caf7c' : '#e45a5a')
-      : '#4a7cf7'
-    const chartData = trendView === 'return'
-      ? pctSeries.map(v => Number(v.toFixed(3)))
-      : valueSeries.map(v => Math.round(v))
-    const yFormatter = trendView === 'return'
-      ? v => (v >= 0 ? '+' : '') + v.toFixed(1) + '%'
-      : v => (v / 10000).toFixed(0) + '万'
+    if (!trendRef.current) return
+
+    let chartDates = []
+    let chartData = []
+    let yFormatter = null
+    let lineColor = '#4a7cf7'
+    let connectNulls = false
+    let tooltipCtx = null  // 供 tooltip 回调使用
+
+    if (trendSource === 'valuation') {
+      // ---- 估值模式 ----
+      if (valuationTrendData.length === 0) return
+      const today = new Date()
+      const fiveDaysAgo = new Date(today)
+      fiveDaysAgo.setDate(fiveDaysAgo.getDate() - 5)
+
+      // 5天规则：已锁定用 total；5天以内未锁定用 trend 同日值替代；5天以前未锁定跳过(null)
+      const points = valuationTrendData.map(p => {
+        if (p.is_locked) return { date: p.date, value: p.total, locked: true }
+        const pd = new Date(p.date)
+        if (pd >= fiveDaysAgo) {
+          const tp = trendData.find(t => t.date === p.date)
+          return tp ? { date: p.date, value: tp.value, locked: false, substituted: true } : null
+        }
+        return null  // 5天以前未锁定 → 跳过，echarts connectNulls 连接
+      })
+
+      const firstValid = points.find(p => p !== null)
+      const baseline = firstValid ? firstValid.value : null
+
+      chartDates = valuationTrendData.map(p => p.date)
+      connectNulls = true
+
+      if (trendView === 'value') {
+        chartData = points.map(p => p ? Math.round(p.value) : null)
+        lineColor = '#4a7cf7'
+        yFormatter = v => (v / 10000).toFixed(0) + '万'
+      } else {
+        chartData = points.map(p => {
+          if (p === null || !baseline) return null
+          return Number(((p.value - baseline) / baseline * 100).toFixed(3))
+        })
+        const lastValid = [...points].reverse().find(p => p !== null)
+        const lastPct = lastValid && baseline ? ((lastValid.value - baseline) / baseline * 100) : 0
+        lineColor = lastPct >= 0 ? '#4caf7c' : '#e45a5a'
+        yFormatter = v => (v >= 0 ? '+' : '') + v.toFixed(1) + '%'
+      }
+      tooltipCtx = { mode: 'valuation', points, baseline, view: trendView }
+    } else {
+      // ---- 证券模式（原有逻辑）----
+      if (trendData.length === 0 || !trendReturn) return
+      const pctSeries = trendReturn.returnPctSeries || []
+      const valueSeries = trendData.map(p => p.value)
+      const lastPct = pctSeries.length ? pctSeries[pctSeries.length - 1] : 0
+
+      chartDates = trendData.map(p => p.date)
+      if (trendView === 'return') {
+        chartData = pctSeries.map(v => Number(v.toFixed(3)))
+        lineColor = lastPct >= 0 ? '#4caf7c' : '#e45a5a'
+        yFormatter = v => (v >= 0 ? '+' : '') + v.toFixed(1) + '%'
+      } else {
+        chartData = valueSeries.map(v => Math.round(v))
+        lineColor = '#4a7cf7'
+        yFormatter = v => (v / 10000).toFixed(0) + '万'
+      }
+      tooltipCtx = { mode: 'security', pctSeries, valueSeries, view: trendView }
+    }
+
     const valuePrefix = getCurrencySymbol(currency)
-    // 复用已有 instance（避免每次 init）
     let c = echarts.getInstanceByDom(trendRef.current)
     if (!c) c = echarts.init(trendRef.current, null, { renderer: 'canvas' })
     c.setOption({
@@ -238,18 +337,34 @@ export default function OverviewPanel() {
         formatter: (params) => {
           const p = params[0]
           const idx = p.dataIndex
-          const abs = trendData[idx].value
-          const pct = pctSeries[idx]
-          const sign = pct >= 0 ? '+' : ''
-          return `${p.axisValue}<br/>` +
-                 `<span style="color:#4caf7c">${sign}${pct.toFixed(2)}%</span><br/>` +
-                 `<span style="color:#888">${valuePrefix}${Math.round(abs).toLocaleString('en-US')}</span>`
+          const dateStr = p.axisValue
+          if (tooltipCtx.mode === 'valuation') {
+            const pt = tooltipCtx.points[idx]
+            if (!pt) return `${dateStr}<br/><span style="color:#888">（跳过·未锁定）</span>`
+            if (tooltipCtx.view === 'value') {
+              const color = pt.locked ? '#4a7cf7' : '#ff8c00'
+              const sub = pt.substituted ? '<br/><span style="color:#888;font-size:10px">（trend替代）</span>' : ''
+              return `${dateStr}<br/><span style="color:${color}">${valuePrefix}${Math.round(pt.value).toLocaleString('en-US')}</span>${sub}`
+            } else {
+              const pct = tooltipCtx.baseline ? ((pt.value - tooltipCtx.baseline) / tooltipCtx.baseline * 100) : 0
+              const sign = pct >= 0 ? '+' : ''
+              const sub = pt.substituted ? '<br/><span style="color:#888;font-size:10px">（trend替代）</span>' : ''
+              return `${dateStr}<br/><span style="color:${pct >= 0 ? '#4caf7c' : '#e45a5a'}">${sign}${pct.toFixed(2)}%</span>${sub}`
+            }
+          } else {
+            const abs = tooltipCtx.valueSeries[idx]
+            const pct = tooltipCtx.pctSeries[idx]
+            const sign = pct >= 0 ? '+' : ''
+            return `${dateStr}<br/>` +
+                   `<span style="color:#4caf7c">${sign}${pct.toFixed(2)}%</span><br/>` +
+                   `<span style="color:#888">${valuePrefix}${Math.round(abs).toLocaleString('en-US')}</span>`
+          }
         },
       },
       grid: { left: 60, right: 16, top: 20, bottom: 30 },
       xAxis: {
         type: 'category',
-        data: trendData.map(p => p.date),
+        data: chartDates,
         axisLine: { lineStyle: { color: 'rgba(255,255,255,0.1)' } },
         axisLabel: { color: '#5a6a8a', fontSize: 10, fontFamily: '"GeistMono", monospace' },
       },
@@ -263,6 +378,7 @@ export default function OverviewPanel() {
         data: chartData,
         smooth: true,
         showSymbol: false,
+        connectNulls: connectNulls,
         lineStyle: { color: lineColor, width: 2 },
         areaStyle: { color: lineColor + '22' },
         markLine: trendView === 'return' ? {
@@ -273,12 +389,11 @@ export default function OverviewPanel() {
         } : undefined,
       }],
     })
-    // 容器尺寸变化后主动 resize，避免初始化时宽度被压缩导致只渲染左半
     requestAnimationFrame(() => c.resize())
     const ro = new ResizeObserver(() => c.resize())
     ro.observe(trendRef.current)
     return () => ro.disconnect()
-  }, [trendData, trendReturn, trendView, currency])
+  }, [trendData, trendReturn, trendView, currency, trendSource, valuationTrendData])
 
   const topHoldings = penTable.slice(0, 10)
 
@@ -342,7 +457,7 @@ export default function OverviewPanel() {
           <div className="kpi-value">{fmtAmount(totalAmtLocal, getCurrencySymbol(currency))}</div>
           <div className="kpi-sub">{currency}</div>
         </div>
-        <div className="kpi-card"><div className="kpi-label">穿透股票</div><div className="kpi-value">{kpi ? kpi.drilled_stock_count : (penTable.length || '—')}</div><div className="kpi-sub">{summary?.fund_count||0}基金</div></div>
+        <div className="kpi-card"><div className="kpi-label">穿透股票</div><div className="kpi-value">{kpi ? kpi.drilled_stock_count : (penTable.length || '—')}</div><div className="kpi-sub">{kpi?.fund_count ?? summary?.fund_count ?? 0}基金</div></div>
         <div className="kpi-card">
           <div className="kpi-label">基金下钻 PE</div>
           <div className="kpi-value">{kpi?.portfolio_pe_weighted?.toFixed(1) || '—'}</div>
@@ -435,6 +550,19 @@ export default function OverviewPanel() {
 
       {/* 资产走势 (90 / 180 / 360 天 + 资产净值/收益率 切换) */}
       <div className="raised" style={{ padding: 0, overflow: 'hidden' }}>
+        {/* 【证券】【估值】顶层切换标签 */}
+        <div style={{ display: 'flex', gap: 4, padding: '8px 12px 0', alignItems: 'center' }}>
+          <button
+            onClick={() => setTrendSource('security')}
+            className={trendSource === 'security' ? 'cur-btn on' : 'cur-btn'}
+            style={{ fontSize: 11, padding: '2px 12px' }}
+          >证券</button>
+          <button
+            onClick={() => setTrendSource('valuation')}
+            className={trendSource === 'valuation' ? 'cur-btn on' : 'cur-btn'}
+            style={{ fontSize: 11, padding: '2px 12px' }}
+          >估值</button>
+        </div>
         <div style={{ padding: '8px 12px', display: 'flex', justifyContent: 'space-between', alignItems: 'center', flexWrap: 'wrap', gap: 8 }}>
           <div style={{ display: 'flex', alignItems: 'center', gap: 8, flexWrap: 'wrap' }}>
             <div className="section-title" style={{ marginBottom: 0 }}>资产走势</div>
@@ -471,20 +599,20 @@ export default function OverviewPanel() {
             {/* 累计收益率标签（始终显示） */}
             <span style={{
               fontSize: 13, fontWeight: 700,
-              color: trendReturn
-                ? (trendReturn.pct >= 0 ? 'var(--chart-up)' : 'var(--chart-down)')
+              color: displayPct != null
+                ? (displayPct >= 0 ? 'var(--chart-up)' : 'var(--chart-down)')
                 : 'var(--text-muted)',
               minWidth: 64, textAlign: 'right',
-            }} title="累计收益率（自 t0 起）">
-              {trendReturn
-                ? `${trendReturn.pct >= 0 ? '+' : ''}${trendReturn.pct.toFixed(2)}%`
+            }} title="累计收益率（自窗口首日起）">
+              {displayPct != null
+                ? `${displayPct >= 0 ? '+' : ''}${displayPct.toFixed(2)}%`
                 : '—'}
             </span>
             <span style={{ width: 1, height: 14, background: 'var(--border)' }} />
             {/* 当前资产价值标签（始终显示） */}
             <span style={{ fontSize: 11, color: 'var(--text-muted)' }} title="当前资产价值">
-              {trendTotal != null
-                ? getCurrencySymbol(currency) + Math.round(trendTotal).toLocaleString('en-US')
+              {displayTotal != null
+                ? getCurrencySymbol(currency) + Math.round(displayTotal).toLocaleString('en-US')
                 : '—'}
             </span>
           </div>
@@ -569,6 +697,7 @@ export default function OverviewPanel() {
               <col style={{width:'46px'}}/>
               <col style={{width:'62px'}}/>
               <col style={{width:'78px'}}/>
+              <col style={{width:'78px'}}/>
               <col style={{width:'88px'}}/>
               <col style={{width:'100px'}}/>
               <col style={{width:'108px'}}/>
@@ -579,6 +708,7 @@ export default function OverviewPanel() {
                 <th style={{cursor:'pointer'}} onClick={()=>toggleSort('security_name')}>名称</th>
                 <th style={{textAlign:'center'}}>类型</th>
                 <th style={{textAlign:'right',cursor:'pointer'}} onClick={()=>toggleSort('amount_local')}>占比</th>
+                <th style={{textAlign:'left'}}>占比图</th>
                 <th style={{textAlign:'right',cursor:'pointer'}} onClick={()=>toggleSort('quantity')}>数量</th>
                 <th style={{textAlign:'right',cursor:'pointer'}} onClick={()=>toggleSort('price')}>单价·原</th>
                 <th style={{textAlign:'right',cursor:'pointer'}} onClick={()=>toggleSort('amount_original')}>金额·原</th>
@@ -607,6 +737,7 @@ export default function OverviewPanel() {
                   </td>
                   <td style={{textAlign:'center',color:'var(--text-secondary)',fontSize:11}}>{CAT_SHORT[h.asset_type]||h.asset_type||''}</td>
                   <td style={{textAlign:'right',fontFamily:'"GeistMono",monospace',color:'var(--text-secondary)'}}>{fmtPct(ratio)}</td>
+                  <td style={{textAlign:'left'}}><ShareBar pct={ratio * 100} /></td>
                   <td style={{textAlign:'right',fontFamily:'"GeistMono",monospace'}}>{fmtQty(h.quantity)}</td>
                   <td style={{textAlign:'right',fontFamily:'"GeistMono",monospace',color:'var(--text-secondary)'}}>{h.price ? h.price.toFixed(h.price_precision ?? 2) : '-'}</td>
                   <td style={{textAlign:'right',fontFamily:'"GeistMono",monospace',color:'var(--text-secondary)'}}>{amountOrig != null ? origSymbol + Math.round(amountOrig).toLocaleString('en-US') : '-'}</td>
@@ -617,6 +748,7 @@ export default function OverviewPanel() {
               <tr style={{borderTop:'1px solid var(--border-strong)',fontWeight:600}}>
                 <td colSpan={3} style={{color:'var(--text-muted)',fontSize:11}}>合计</td>
                 <td style={{textAlign:'right',fontFamily:'"GeistMono",monospace',color:'var(--text-secondary)'}}>{totalAmtLocal > 0 ? fmtPct(filteredTotal / totalAmtLocal) : '-'}</td>
+                <td style={{textAlign:'left'}}><ShareBar pct={totalAmtLocal > 0 ? filteredTotal / totalAmtLocal * 100 : 0} /></td>
                 <td></td>
                 <td></td>
                 <td></td>

@@ -120,19 +120,56 @@ _TRADE_PARSE_SYSTEM = """你是基金/股票交易记录解析助手。从用户
 - nav_date: 净值日期（YYYY-MM-DD，可选，若无则不填）
 - security_code: 证券代码（保留后缀如 .OF/.SZ/.SH/.HK；如无后缀原样返回）
 - security_name: 证券名称
-- trade_type: 交易类型。申购/buy/买入 → "buy"；赎回/sell/卖出 → "sell"；分红 → "dividend"；其他 → "others"
-- confirmed_shares: 确认份额（数字，申购为正，赎回为负）
-- confirmed_amount: 确认金额（数字，申购为负即资金流出，赎回为正即资金流入）
+- trade_type: 交易类型，取值之一："buy" / "sell" / "dividend" / "split" / "rights" / "conversion" / "others"
+- confirmed_shares: 确认份额（数字，按类型符号规则填写）
+- confirmed_amount: 确认金额（数字，按类型符号规则填写）
 - nav_price: 净值/单价（数字，可选）
 - fee: 手续费（数字，可选，若无则不填）
-- remarks: 备注（可选）
+- remarks: 备注（可选，转换类型必填以关联双条记录）
 
-规则：
-1. 申购：份额增加（正），金额减少（负，资金流出）
-2. 赎回：份额减少（负），金额增加（正，资金流入）
-3. 仅返回 JSON 数组，每元素含上述字段（可选字段可省略）
-4. 若无法识别为合法交易记录，返回空数组 []
-5. 金额、份额按原文数字，不要做单位换算"""
+【类型识别与符号规则】
+1. 申购/买入 → "buy"：份额增加（正），金额减少（负，资金流出）
+2. 赎回/卖出 → "sell"：份额减少（负），金额增加（正，资金流入）
+3. 分红/派息 → "dividend"：份额不变（0），金额增加（正，资金流入）
+4. 拆分/折算/份额变更 → "split"：份额增加（正），金额不变（0）
+5. 配股/配售 → "rights"：份额增加（正），金额减少（负，资金流出）
+6. 转换/合并/转换转入 → "conversion"：生成双条记录
+   - from 行：security_code=转出证券，confirmed_shares=负，confirmed_amount=0，remarks="转换到 {转入证券名}"
+   - to 行：security_code=转入证券，confirmed_shares=正，confirmed_amount=0，remarks="从 {转出证券名} 转入"
+7. 其他 → "others"：按描述识别金额/份额变化方向，无固定符号
+
+【类型识别优先级】
+- 描述含"分红/派息/红利再投" → dividend
+- 描述含"拆分/折算/份额变更/份额调整" → split
+- 描述含"配股/配售/认购配股" → rights
+- 描述含"转换/转换转入/转换转出/基金转换/合并" → conversion（双条）
+- 描述含"申购/买入" → buy
+- 描述含"赎回/卖出" → sell
+- 资金和份额变动方向与上述类似但关键词不同 → 按最接近的规则转换类型
+- 完全不匹配 → others
+
+【证券名称与代码校验】
+- 场外基金：6 位数字 + .OF 后缀（如 006829.OF），名称通常含"联接/A类/C类"等
+- 场内 ETF：6 位数字 + .SZ/.SH 后缀（如 510300.SH），名称通常含"ETF"
+- 同名基金的场外联接版与场内 ETF 版代码不同、价格机制差异大，必须严格区分
+- 若用户文本中代码后缀与名称特征不符（如 006829.OF 但名称含"ETF"），按代码后缀为准
+
+【输出规则】
+1. 仅返回 JSON 数组，每元素含上述字段（可选字段可省略）
+2. 若无法识别为合法交易记录，返回空数组 []
+3. 金额、份额按原文数字，不要做单位换算
+4. 不要包含 markdown 代码块标记
+
+【示例】
+输入："2025-09-01 分红 006829.OF 华泰柏瑞红利低波 100元"
+输出：[{"trade_date":"2025-09-01","security_code":"006829.OF","security_name":"华泰柏瑞红利低波","trade_type":"dividend","confirmed_shares":0,"confirmed_amount":100.0,"remarks":"分红"}]
+
+输入："2025-09-20 基金转换 006829.OF 华泰柏瑞红利低波 转到 161725.OF 招商中证白酒"
+输出：[
+  {"trade_date":"2025-09-20","security_code":"006829.OF","security_name":"华泰柏瑞红利低波","trade_type":"conversion","confirmed_shares":-1000.0,"confirmed_amount":0,"remarks":"转换到 招商中证白酒"},
+  {"trade_date":"2025-09-20","security_code":"161725.OF","security_name":"招商中证白酒","trade_type":"conversion","confirmed_shares":1000.0,"confirmed_amount":0,"remarks":"从 华泰柏瑞红利低波 转入"}
+]
+"""
 
 
 def parse_trades_with_llm(text: str) -> list[dict] | None:
@@ -240,3 +277,41 @@ def verify_security_name_with_llm(input_name: str, api_name: str) -> bool:
         return False
 
     return content.strip().lower() == "true"
+
+
+def verify_security_with_llm(code: str, name: str, sm_name: str | None) -> dict:
+    """综合校验 code/name 与 SecurityMaster.name 是否指向同一证券。
+
+    校验顺序：
+    1. 代码后缀 vs 名称特征快速校验（.OF 代码不应匹配 ETF 名称，反之亦然）
+    2. SecurityMaster 名称存在性校验
+    3. 名称语义匹配（复用 verify_security_name_with_llm）
+
+    Args:
+        code: 证券代码（含后缀如 .OF/.SZ/.SH）
+        name: 用户/LLM 提供的名称
+        sm_name: SecurityMaster 中的证券名称（None 表示主数据不存在）
+
+    Returns:
+        {"verified": bool, "reason": str}
+    """
+    code_upper = (code or "").upper()
+    name_upper = (name or "").upper()
+
+    # 1. 代码后缀 vs 名称特征快速校验
+    # 场外基金代码 .OF 但名称含 ETF（且不含"联接"）→ 不符
+    if code_upper.endswith(".OF") and "ETF" in name_upper and "联接" not in name_upper:
+        return {"verified": False, "reason": "场外基金代码与ETF名称不符"}
+    # 场内 ETF 代码 .SZ/.SH 但名称含"联接"（场外基金特征）→ 不符
+    if (code_upper.endswith(".SZ") or code_upper.endswith(".SH")) and "联接" in name_upper:
+        return {"verified": False, "reason": "场内ETF代码与场外基金名称不符"}
+
+    # 2. SecurityMaster 名称存在性
+    if not sm_name:
+        return {"verified": False, "reason": "证券主数据不存在"}
+
+    # 3. 名称语义匹配
+    name_match = verify_security_name_with_llm(name, sm_name)
+    if name_match:
+        return {"verified": True, "reason": "匹配"}
+    return {"verified": False, "reason": "名称不匹配"}

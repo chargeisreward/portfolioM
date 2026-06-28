@@ -204,6 +204,7 @@ class HoldingSnapshotOut(BaseModel):
     amount_cny: float
     asset_type: Optional[str] = None
     is_cash: bool
+    holding_uid: Optional[int] = None  # 区分同代码不同批次；NULL=CASH
     class Config:
         from_attributes = True
 
@@ -224,7 +225,20 @@ class SnapshotRangeOut(BaseModel):
     end_date: Optional[date] = None
 
 
+class TradeConfirmResultItem(BaseModel):
+    """单条交易提交结果（部分成功语义）"""
+    index: int  # 原请求 trades 数组中的索引
+    success: bool
+    trade_id: Optional[int] = None  # 成功时返回 Transaction.id
+    error: Optional[str] = None  # 失败时返回错误信息（如"名称或代码可能有误"）
+    security_code: str
+    security_name: Optional[str] = None
+
+
 class TradeConfirmResponse(BaseModel):
-    """交易确认提交响应"""
-    confirmed_count: int
-    latest_snapshot: list[HoldingSnapshotOut]
+    """交易确认提交响应（部分成功语义）"""
+    confirmed: list[TradeConfirmResultItem] = []  # 成功条目
+    failed: list[TradeConfirmResultItem] = []     # 失败条目
+    confirmed_count: int = 0                      # 成功条数（兼容前端旧逻辑）
+    failed_count: int = 0                         # 失败条数
+    latest_snapshot: list[HoldingSnapshotOut] = []

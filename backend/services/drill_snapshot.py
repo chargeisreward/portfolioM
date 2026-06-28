@@ -1,15 +1,19 @@
 """公共下钻截面快照生成器（按 fund × as_of_date — 2026-06-24）
 
-算法（按用户最终确认）:
+算法（基期固定逻辑 — 2026-06-28 修订）:
   1. 读取 fund_index_map 的所有可下钻基金（fund → index_code 映射）
   2. 对每只 fund：读取 index_constituents[最近月份] 的成分股 + 权重
   3. 取每只成分股 T 日 current_price；缺失用 T-1 价（视为停牌）
   4. 校验：获得收盘价的成分股占比 >= 95% 才生成截面
-  5. 算 shares_equivalent = fund_price × 0.95 × (weight/100) / current_price
-     其中 fund_price 从 Holding.price 取（fund 当日基金价格，所有 user 的均价也行）
+  5. shares_equivalent 基期固定:
+     - 基期日（as_of_date <= current_business_date）:
+       shares_eq = fund_price × 0.95 × (weight/100) / price_cny
+     - 非基期日（as_of_date > current_business_date）:
+       shares_eq = baseline_shares_map[stock_code]  # 继承基期，不重算
+       （基期无该股票数据时 fallback 当日计算）
   6. 追加"现金-下钻"行（stock_code="CASH"）：基金 95% 配指数 + 5% 配现金，
      指数中股票权重合计 100% 但基金中股票合计 95%，其余 5% = 现金-下钻。
-     shares_equivalent = fund_price × 0.05, current_price = 1.0
+     CASH 行同样基期固定: 基期 shares_eq = fund_price × 0.05，非基期继承。
   7. 写入 fund_drill_snapshot（公共数据）
 
 user 层：user_drill[s] = Holding.quantity × shares_equivalent[s]
@@ -17,6 +21,7 @@ user 层：user_drill[s] = Holding.quantity × shares_equivalent[s]
 
 注意：fund_price 的来源 — Holding 表每个 user 都有该 fund 的 price，
   为保证一致性，取该 fund 在 Holding 表里的「所有 user 价格均值」作为公共 fund_price。
+  TODO: 未来应改用 FundDailyNav.nav_baseline 作为 fund_price 来源。
 """
 from __future__ import annotations
 
@@ -318,6 +323,11 @@ def generate_drill_snapshot_for_date(
       "details": [...],
     }
     """
+    # 基期日期（2026-06-28 基期固定逻辑）：
+    # 非基期日（as_of_date > baseline_date）的 shares_equivalent 继承基期，不重算。
+    from services.data_version import current_business_date
+    baseline_date = current_business_date(as_of_date)
+
     fund_maps = db.query(FundIndexMap).all()
     funds_processed = 0
     funds_skipped_no_index_map = 0  # 现在 fund_index_map 没有 as_of_date，跳过此
@@ -376,6 +386,21 @@ def generate_drill_snapshot_for_date(
             details.append({"fund": fund_code, "skip": "no_fund_price", "index": idx_code})
             continue
 
+        # 基期固定逻辑（2026-06-28）：
+        # 非基期日（as_of_date > baseline_date）预加载基期 shares_equivalent 映射，
+        # priced 循环中直接继承基期值，不重算。
+        # 基期无该股票数据（新上市/成分调整）→ 当日计算（见下方分支）。
+        baseline_shares_map: dict[str, float] = {}
+        if as_of_date > baseline_date:
+            baseline_rows = db.query(FundDrillSnapshot).filter(
+                FundDrillSnapshot.fund_code == fund_code,
+                FundDrillSnapshot.as_of_date == baseline_date,
+            ).all()
+            baseline_shares_map = {
+                r.stock_code: r.shares_equivalent for r in baseline_rows
+                if r.shares_equivalent is not None
+            }
+
         # === 2026-06-24 补丁 ===
         # 5/29 权重和 < 100% 时，差额 × 95% 划入下钻-现金
         # priced 是 list[(IndexConstituentSnapshot, price, stale)]
@@ -402,9 +427,17 @@ def generate_drill_snapshot_for_date(
                 baseline_price_cny = float(bp_orig) * fx_rate if fx_rate else float(bp_orig)
             else:
                 baseline_price_cny = None
-            # shares_eq 用 CNY 价算: shares = (fund_price_CNY × 0.95 × weight) / price_CNY
-            # 这样: shares_eq × current_price_cny = fund_price × 0.95 × weight / 100
-            shares_eq = fund_price * STOCK_RATIO * (weight_pct / 100.0) / price_cny
+            # shares_equivalent 基期固定逻辑（2026-06-28）：
+            # - 基期日（as_of_date <= baseline_date）→ 当日计算
+            # - 非基期日且基期有该股票数据 → 继承基期 shares_equivalent（不重算）
+            # - 非基期日但基期无该股票数据（新上市/成分调整）→ 当日计算
+            if as_of_date <= baseline_date or s.stock_code not in baseline_shares_map:
+                # 基期计算公式: shares = (fund_price × 0.95 × weight) / price_cny
+                # 这样: shares_eq × current_price_cny = fund_price × 0.95 × weight / 100
+                shares_eq = fund_price * STOCK_RATIO * (weight_pct / 100.0) / price_cny
+            else:
+                # 非基期日 → 继承基期 shares_equivalent（整个周期不变）
+                shares_eq = baseline_shares_map[s.stock_code]
             # 2026-06-25: join A/H 估值表写入 4 字段（基准日值，公共层加权时再做动态调整）
             v = valuation_snaps.get(s.stock_code) or valuation_snaps.get(s.stock_code.split(".")[0])
             fund_rows.append(FundDrillSnapshot(
@@ -441,6 +474,11 @@ def generate_drill_snapshot_for_date(
         # 其余 5% 分配给现金-下钻。现金也是资产，需计入合计。
         # shares_equivalent = fund_price × CASH_RATIO（每份基金含现金金额）
         # current_price = 1.0 → 估算市值 = shares_eq × price = fund_price × 0.05
+        # 基期固定逻辑（2026-06-28）：CASH 行同样继承基期 shares_equivalent
+        if as_of_date <= baseline_date or "CASH" not in baseline_shares_map:
+            cash_shares = fund_price * CASH_RATIO
+        else:
+            cash_shares = baseline_shares_map["CASH"]
         fund_rows.append(FundDrillSnapshot(
             fund_code=fund_code,
             as_of_date=as_of_date,
@@ -449,7 +487,7 @@ def generate_drill_snapshot_for_date(
             weight_pct=CASH_RATIO * 100.0,  # 5.0
             baseline_price=1.0,
             current_price=1.0,
-            shares_equivalent=float(fund_price * CASH_RATIO),
+            shares_equivalent=float(cash_shares),
             is_stale_price=False,
             currency="CNY",
             current_price_cny=1.0,

@@ -101,7 +101,7 @@ const DIM_LABELS = {
 Start the backend and call the new dimension:
 
 ```bash
-curl -s "http://localhost:8015/api/penetration/dimension-drilled?dim=sector&as_of_date=2026-06-18&market=A+H" \
+curl -s "http://localhost:8015/api/penetration/dimension-drilled?dim=sector&as_of_date=2026-05-29&market=A+H" \
   -H "x-session-token: $PORTFOLIOM_SESSION" | jq '.portfolio[:3]'
 ```
 

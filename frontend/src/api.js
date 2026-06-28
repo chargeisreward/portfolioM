@@ -215,6 +215,15 @@ export const getValuationSnapshot = (params) =>
 export const getValuationRange = () =>
   api.get('/valuation/snapshot-range').then(r => r.data)
 
+// 估值表资产合计走势（批量，供走势图【估值】标签使用）
+export const getValuationTrend = (days = 90) =>
+  api.get('/valuation/trend', { params: { days } }).then(r => r.data)
+
+// 估值表 KPI 卡片（基于历史持仓 snapshot + 历史公共数据 + 当前证券主数据）
+// 用于 ValuationPanel 6 张 KPI 卡片，反映 as_of_date 当日真实情况
+export const getValuationKpi = (asOfDate) =>
+  api.get('/valuation/kpi', { params: { as_of_date: asOfDate } }).then(r => r.data)
+
 export const postValuationRebuild = (data = {}) =>
   api.post('/valuation/rebuild', data).then(r => r.data)
 

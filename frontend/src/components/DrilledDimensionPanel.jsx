@@ -1,5 +1,6 @@
 import React, { useEffect, useState } from 'react'
 import { getDimensionDrilled } from '../api'
+import ShareBar from './ShareBar'
 
 const fmtAmount = (v) => {
   if (v == null) return '-'
@@ -70,6 +71,7 @@ export default function DrilledDimensionPanel({ dim, bizDate, market = 'A+H', la
               <th style={{ textAlign: 'right' }}>只数</th>
               <th style={{ textAlign: 'right' }}>金额(CNY)</th>
               <th style={{ textAlign: 'right' }}>权重%</th>
+              <th style={{ textAlign: 'left' }}>占比图</th>
               <th style={{ textAlign: 'right' }}>组合PE</th>
               <th style={{ textAlign: 'right' }}>CSI300权重%</th>
               <th style={{ textAlign: 'right' }}>CSI300 PE</th>
@@ -116,6 +118,7 @@ export default function DrilledDimensionPanel({ dim, bizDate, market = 'A+H', la
                     <td style={{ textAlign: 'right', fontFamily: '"GeistMono",monospace', color: weightColor }}>
                       {fmtPct(row.weight_pct, 1)}
                     </td>
+                    <td style={{ textAlign: 'left' }}><ShareBar pct={row.weight_pct} /></td>
                     <td style={{ textAlign: 'right', fontFamily: '"GeistMono",monospace', color: peColor }}>
                       {fmtNum(row.pe_weighted, 1)}
                     </td>
@@ -135,7 +138,7 @@ export default function DrilledDimensionPanel({ dim, bizDate, market = 'A+H', la
 
                   {isOpen && (
                     <tr>
-                      <td colSpan={9} style={{ padding: 0, background: 'rgba(0,0,0,0.15)' }}>
+                      <td colSpan={10} style={{ padding: 0, background: 'rgba(0,0,0,0.15)' }}>
                         <DrilledStockDetailTable stocks={data.stock_details?.[row.key] || []} />
                       </td>
                     </tr>
@@ -152,6 +155,7 @@ export default function DrilledDimensionPanel({ dim, bizDate, market = 'A+H', la
                 {fmtAmount(data.totals?.portfolio?.amount_cny)}
               </td>
               <td style={{ textAlign: 'right', fontFamily: '"GeistMono",monospace' }}>100.0%</td>
+              <td style={{ textAlign: 'left' }}><ShareBar pct={100} /></td>
               <td style={{ textAlign: 'right', fontFamily: '"GeistMono",monospace' }}>
                 {fmtNum(data.totals?.portfolio?.pe_weighted, 1)}
               </td>
@@ -194,6 +198,7 @@ function DrilledStockDetailTable({ stocks }) {
             <th style={{ textAlign: 'right' }}>最近收盘价</th>
             <th style={{ textAlign: 'right' }}>资产值</th>
             <th style={{ textAlign: 'right' }}>权重%</th>
+            <th style={{ textAlign: 'left' }}>占比图</th>
             <th style={{ textAlign: 'right' }}>PE</th>
             <th style={{ textAlign: 'right' }}>PS</th>
             <th style={{ textAlign: 'right' }}>PB</th>
@@ -212,6 +217,7 @@ function DrilledStockDetailTable({ stocks }) {
                 <td style={{ textAlign: 'right', fontFamily: '"GeistMono",monospace', color: 'var(--text-secondary)' }}>
                   {fmtPct(s.weight_pct, 2)}
                 </td>
+                <td style={{ textAlign: 'left' }}><ShareBar pct={s.weight_pct} /></td>
                 <td style={{ textAlign: 'right', fontFamily: '"GeistMono",monospace' }}>{fmtNum(s.pe_ttm, 1)}</td>
                 <td style={{ textAlign: 'right', fontFamily: '"GeistMono",monospace' }}>{fmtNum(s.ps_ttm, 1)}</td>
                 <td style={{ textAlign: 'right', fontFamily: '"GeistMono",monospace' }}>{fmtNum(s.pb_mrq, 1)}</td>

@@ -681,3 +681,169 @@ def test_get_trades_for_date_multiple(fresh_db):
     assert len(trades) == 2
     codes = {t["security_code"] for t in trades}
     assert codes == {"510300.SH", "159919.SZ"}
+
+
+# ---------- 新增 trade_type 测试（dividend/split/rights/conversion/others/unknown）----------
+
+def test_rebuild_dividend_increases_cash(fresh_db):
+    """dividend：份额不变，金额+ → 加现金。"""
+    _setup_initial_holding(fresh_db, qty=10000, price=4.5)
+
+    fresh_db.add(Transaction(
+        user_id=1, trade_date=date(2025, 7, 20),
+        security_code="510300.SH", security_name="沪深300ETF",
+        trade_type="dividend", confirmed_shares=0, confirmed_amount=500,
+    ))
+    fresh_db.commit()
+
+    rebuild_holdings_to_date(fresh_db, 1, date(2025, 7, 20))
+
+    snap = get_snapshot_for_date(fresh_db, 1, date(2025, 7, 20))
+    etf_rows = [s for s in snap if s["security_code"] == "510300.SH"]
+    cash = next(s for s in snap if s["is_cash"])
+
+    # 份额不变（仍 10000），现金增加 500
+    assert len(etf_rows) == 1  # 无新建行
+    assert etf_rows[0]["quantity"] == 10000
+    assert cash["quantity"] == 500  # 0 + 500
+
+
+def test_rebuild_split_increases_shares(fresh_db):
+    """split：份额+，金额不变 → 新建持仓行，不扣现金。"""
+    _setup_initial_holding(fresh_db, qty=10000, price=4.5)
+
+    fresh_db.add(Transaction(
+        user_id=1, trade_date=date(2025, 7, 20),
+        security_code="510300.SH", security_name="沪深300ETF",
+        trade_type="split", confirmed_shares=2000, confirmed_amount=0,
+    ))
+    fresh_db.commit()
+
+    rebuild_holdings_to_date(fresh_db, 1, date(2025, 7, 20))
+
+    snap = get_snapshot_for_date(fresh_db, 1, date(2025, 7, 20))
+    etf_rows = [s for s in snap if s["security_code"] == "510300.SH"]
+    cash = next(s for s in snap if s["is_cash"])
+
+    # 新建一行 qty=2000，总份额 = 12000，现金不变
+    assert len(etf_rows) == 2  # 原始行 + 新建行
+    assert sum(r["quantity"] for r in etf_rows) == 12000  # 10000 + 2000
+    assert cash["quantity"] == 0  # 不扣现金
+
+
+def test_rebuild_rights_like_buy(fresh_db):
+    """rights：与 buy 行为一致（份额+，现金-）。"""
+    _setup_initial_holding(fresh_db, qty=10000, price=4.5)
+
+    fresh_db.add(Transaction(
+        user_id=1, trade_date=date(2025, 7, 20),
+        security_code="510300.SH", security_name="沪深300ETF",
+        trade_type="rights", confirmed_shares=1000, confirmed_amount=4500,
+    ))
+    fresh_db.commit()
+
+    rebuild_holdings_to_date(fresh_db, 1, date(2025, 7, 20))
+
+    snap = get_snapshot_for_date(fresh_db, 1, date(2025, 7, 20))
+    etf_rows = [s for s in snap if s["security_code"] == "510300.SH"]
+    cash = next(s for s in snap if s["is_cash"])
+
+    # 新建一行 qty=1000，总份额 = 11000，现金减少 4500
+    assert len(etf_rows) == 2  # 原始行 + 新建行
+    assert sum(r["quantity"] for r in etf_rows) == 11000  # 10000 + 1000
+    assert cash["quantity"] == -4500  # 0 - 4500
+
+
+def test_rebuild_conversion_transfers_shares(fresh_db):
+    """conversion：双条记录，from 扣份额不扣现金，to 新建不扣现金。"""
+    _setup_initial_holding(fresh_db, qty=10000, price=4.5)
+
+    # conversion from 行：510300.SH shares=-3000（扣份额）
+    fresh_db.add(Transaction(
+        user_id=1, trade_date=date(2025, 7, 20),
+        security_code="510300.SH", security_name="沪深300ETF",
+        trade_type="conversion", confirmed_shares=-3000, confirmed_amount=0,
+        remarks="convert_to_510500",
+    ))
+    # conversion to 行：510500.SH shares=+3000（新建持仓）
+    fresh_db.add(Transaction(
+        user_id=1, trade_date=date(2025, 7, 20),
+        security_code="510500.SH", security_name="中证500ETF",
+        trade_type="conversion", confirmed_shares=3000, confirmed_amount=0,
+        remarks="convert_from_510300",
+    ))
+    fresh_db.commit()
+
+    rebuild_holdings_to_date(fresh_db, 1, date(2025, 7, 20))
+
+    snap = get_snapshot_for_date(fresh_db, 1, date(2025, 7, 20))
+    etf300_rows = [s for s in snap if s["security_code"] == "510300.SH"]
+    etf500_rows = [s for s in snap if s["security_code"] == "510500.SH"]
+    cash = next(s for s in snap if s["is_cash"])
+
+    # 510300.SH 份额 = 7000（10000 - 3000），无新建行
+    assert len(etf300_rows) == 1  # 只有原始行
+    assert etf300_rows[0]["quantity"] == 7000
+
+    # 510500.SH 新建一行 qty=3000
+    assert len(etf500_rows) == 1
+    assert etf500_rows[0]["quantity"] == 3000
+
+    # CASH 不变
+    assert cash["quantity"] == 0
+
+
+def test_rebuild_others_generic_sign_handling(fresh_db):
+    """others：按符号通用处理（shares- 扣份额，amount+ 加现金）。"""
+    _setup_initial_holding(fresh_db, qty=10000, price=4.5)
+
+    fresh_db.add(Transaction(
+        user_id=1, trade_date=date(2025, 7, 20),
+        security_code="510300.SH", security_name="沪深300ETF",
+        trade_type="others", confirmed_shares=-500, confirmed_amount=2000,
+    ))
+    fresh_db.commit()
+
+    rebuild_holdings_to_date(fresh_db, 1, date(2025, 7, 20))
+
+    snap = get_snapshot_for_date(fresh_db, 1, date(2025, 7, 20))
+    etf_rows = [s for s in snap if s["security_code"] == "510300.SH"]
+    cash = next(s for s in snap if s["is_cash"])
+
+    # 份额减少 500，现金增加 2000
+    assert len(etf_rows) == 1  # 无新建行（shares<0 只扣）
+    assert etf_rows[0]["quantity"] == 9500  # 10000 - 500
+    assert cash["quantity"] == 2000  # 0 + 2000
+
+
+def test_rebuild_unknown_type_logs_warning(fresh_db, caplog):
+    """未知 trade_type：不崩溃，记录 warning，当日快照无新持仓行。"""
+    import logging
+    _setup_initial_holding(fresh_db, qty=10000, price=4.5)
+
+    fresh_db.add(Transaction(
+        user_id=1, trade_date=date(2025, 7, 20),
+        security_code="510300.SH", security_name="沪深300ETF",
+        trade_type="unknown_type", confirmed_shares=1000, confirmed_amount=0,
+    ))
+    fresh_db.commit()
+
+    with caplog.at_level(logging.WARNING, logger="services.trading_rebuild_service"):
+        result = rebuild_holdings_to_date(fresh_db, 1, date(2025, 7, 20))
+
+    # 不抛异常
+    assert result is not None
+
+    # 捕获 WARNING 日志含 "未知 trade_type: unknown_type"
+    assert any(
+        "未知 trade_type: unknown_type" in r.message
+        for r in caplog.records
+    ), f"未捕获到未知 trade_type warning，records={[r.message for r in caplog.records]}"
+
+    # 当日快照：无新持仓行，份额不变，CASH 不变
+    snap = get_snapshot_for_date(fresh_db, 1, date(2025, 7, 20))
+    etf_rows = [s for s in snap if s["security_code"] == "510300.SH"]
+    cash = next(s for s in snap if s["is_cash"])
+    assert len(etf_rows) == 1  # 只有原始行，无新建
+    assert etf_rows[0]["quantity"] == 10000  # 份额不变
+    assert cash["quantity"] == 0  # CASH 不变

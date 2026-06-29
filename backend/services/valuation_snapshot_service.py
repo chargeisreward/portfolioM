@@ -16,7 +16,7 @@ import logging
 from datetime import date as _date, datetime, timedelta
 from typing import Optional
 
-from sqlalchemy import or_, text
+from sqlalchemy import func, or_, text
 from sqlalchemy.orm import Session
 
 from models import (
@@ -47,13 +47,25 @@ def _resolve_public_metrics(db: Session, stock_code: str, as_of_date: _date) -> 
     is_hk = stock_code.upper().endswith(".HK")
     is_overseas = not (stock_code.endswith(".SH") or stock_code.endswith(".SZ") or is_hk)
 
-    # A 股
+    # A 股 — 取 <= as_of_date 的最新批次（与 drill_snapshot.py 一致）
     if not is_hk and not is_overseas:
         for suffix in (".SZ", ".SH"):
+            latest_date = (
+                db.query(func.max(AShareFinancialSnapshot.as_of_date))
+                .filter(
+                    AShareFinancialSnapshot.as_of_date <= as_of_date,
+                    AShareFinancialSnapshot.stock_code == f"{code_norm}{suffix}",
+                )
+                .scalar()
+            )
+            if not latest_date:
+                continue
             snap = (
                 db.query(AShareFinancialSnapshot)
-                .filter(AShareFinancialSnapshot.as_of_date == as_of_date)
-                .filter(AShareFinancialSnapshot.stock_code == f"{code_norm}{suffix}")
+                .filter(
+                    AShareFinancialSnapshot.as_of_date == latest_date,
+                    AShareFinancialSnapshot.stock_code == f"{code_norm}{suffix}",
+                )
                 .first()
             )
             if snap:
@@ -66,37 +78,44 @@ def _resolve_public_metrics(db: Session, stock_code: str, as_of_date: _date) -> 
                 }
         return _empty_metrics()
 
-    # 港股
+    # 港股 — 取 <= as_of_date 的最新批次
     if is_hk:
-        snap = (
-            db.query(HKShareFinancialSnapshot)
-            .filter(HKShareFinancialSnapshot.as_of_date == as_of_date)
-            .filter(HKShareFinancialSnapshot.stock_code == stock_code)
-            .first()
-        )
-        if not snap:
-            # 试 padded code
-            padded = code_norm.zfill(5)
+        for code_variant in (stock_code, f"{code_norm.zfill(5)}.HK"):
+            latest_date = (
+                db.query(func.max(HKShareFinancialSnapshot.as_of_date))
+                .filter(
+                    HKShareFinancialSnapshot.as_of_date <= as_of_date,
+                    HKShareFinancialSnapshot.stock_code == code_variant,
+                )
+                .scalar()
+            )
+            if not latest_date:
+                continue
             snap = (
                 db.query(HKShareFinancialSnapshot)
-                .filter(HKShareFinancialSnapshot.as_of_date == as_of_date)
-                .filter(HKShareFinancialSnapshot.stock_code == f"{padded}.HK")
+                .filter(
+                    HKShareFinancialSnapshot.as_of_date == latest_date,
+                    HKShareFinancialSnapshot.stock_code == code_variant,
+                )
                 .first()
             )
-        if snap:
-            return {
-                "pe_ttm": snap.pe_ttm,
-                "pb_mrq": snap.pb_mrq,
-                "ps_ttm": snap.ps_ttm,
-                "dividend_yield": snap.dividend_yield,
-                "market_cap": snap.market_cap,
-            }
+            if snap:
+                return {
+                    "pe_ttm": snap.pe_ttm,
+                    "pb_mrq": snap.pb_mrq,
+                    "ps_ttm": snap.ps_ttm,
+                    "dividend_yield": snap.dividend_yield,
+                    "market_cap": snap.market_cap,
+                }
         return _empty_metrics()
 
-    # 海外
+    # 海外 — 取 <= as_of_date 的最新批次
     snap = (
         db.query(OverseasShareFinancialSnapshot)
-        .filter(OverseasShareFinancialSnapshot.stock_code == stock_code)
+        .filter(
+            OverseasShareFinancialSnapshot.stock_code == stock_code,
+            OverseasShareFinancialSnapshot.as_of_date <= as_of_date,
+        )
         .order_by(OverseasShareFinancialSnapshot.as_of_date.desc())
         .first()
     )

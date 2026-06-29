@@ -3370,11 +3370,16 @@ def get_dimension_drilled(
     as_of_date = min(as_of_date, get_confirmed_as_of(db))
 
     DIM_COL_DRILLED = {
+        # 短键（原有）
         "swy1": "swy_l1", "swy2": "swy_l2", "swy3": "swy_l3", "swy4": "swy_l4",
         "csi1": "csi_l1", "csi2": "csi_l2", "csi3": "csi_l3", "csi4": "csi_l4",
         "se1": "se_l1", "se2": "se_l2", "se3": "se_l3", "se4": "se_l4",
         "l1": "swy_l1", "l2": "swy_l2",
         "chain": "chain_position", "growth_tier": "growth_tier", "competition": "competition",
+        # 列名别名（新增 — 向后兼容）
+        "swy_l1": "swy_l1", "swy_l2": "swy_l2", "swy_l3": "swy_l3", "swy_l4": "swy_l4",
+        "csi_l1": "csi_l1", "csi_l2": "csi_l2", "csi_l3": "csi_l3", "csi_l4": "csi_l4",
+        "se_l1": "se_l1", "se_l2": "se_l2", "se_l3": "se_l3", "se_l4": "se_l4",
     }
     if dim not in DIM_COL_DRILLED:
         raise HTTPException(status_code=400, detail=f"Unsupported dim: {dim}")

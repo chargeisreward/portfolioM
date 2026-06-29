@@ -525,7 +525,6 @@ def job_update_financial_fundamentals():
     db: Session = SessionLocal()
     try:
         from crawlers.price_data import get_stock_info, fetch_yfinance_info
-        from services.penetration import PenetrationEngine
 
         today = date.today()
 
@@ -610,13 +609,16 @@ def job_update_financial_fundamentals():
             logger.info("海外财务数据更新：fetched=%d, stored=%d, errors=%d",
                        result["fetched"], result["stored"], len(result["errors"]))
 
-        # 基本面更新后运行穿透计算
+        # 基本面更新后运行穿透计算（v2 — 写 full_holding_snapshot + penetration_snapshot）
         try:
-            engine = PenetrationEngine(db)
-            results = engine.calculate()
-            logger.info("穿透计算完成，生成 %d 条结果", len(results))
+            from services.penetration_v2 import run_penetration_all_users
+            rep = run_penetration_all_users(db, today)
+            logger.info(
+                "穿透计算完成(v2): as_of_date=%s, holdings_seen=%s, holdings_drilled=%s",
+                rep.as_of_date, rep.holdings_seen, rep.holdings_drilled,
+            )
         except Exception as e:
-            logger.error("穿透计算异常: %s", e, exc_info=True)
+            logger.error("穿透计算异常(v2): %s", e, exc_info=True)
 
     except Exception as e:
         logger.error("基本面数据更新任务异常: %s", e, exc_info=True)

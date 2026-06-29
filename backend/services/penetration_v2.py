@@ -19,7 +19,7 @@ from dataclasses import dataclass, field
 from datetime import date as _date
 from typing import Iterable
 
-from sqlalchemy import delete
+from sqlalchemy import delete, func
 from sqlalchemy.orm import Session
 
 from models import (
@@ -148,10 +148,23 @@ def _resolve_snapshot_for_code(stock_code: str, as_of_date, db):
 
 
 def _get_constituents(db: Session, index_code: str, as_of_date: _date) -> list[IndexConstituentSnapshot]:
+    # 取 <= as_of_date 的最新批次（与 drill_snapshot.py 一致）
+    latest_date = (
+        db.query(func.max(IndexConstituentSnapshot.as_of_date))
+        .filter(
+            IndexConstituentSnapshot.index_code == index_code,
+            IndexConstituentSnapshot.as_of_date <= as_of_date,
+        )
+        .scalar()
+    )
+    if not latest_date:
+        return []
     return (
         db.query(IndexConstituentSnapshot)
-        .filter(IndexConstituentSnapshot.index_code == index_code)
-        .filter(IndexConstituentSnapshot.as_of_date == as_of_date)
+        .filter(
+            IndexConstituentSnapshot.index_code == index_code,
+            IndexConstituentSnapshot.as_of_date == latest_date,
+        )
         .all()
     )
 
@@ -320,10 +333,25 @@ def run_penetration(db: Session, as_of_date: _date, user_id: int) -> Penetration
             report.holdings_skipped.append(f"{h_code}({asset_type})")
             continue
 
-        fund_map = db.query(FundIndexMap).filter(
-            FundIndexMap.fund_code == h_code,
-            FundIndexMap.as_of_date == as_of_date,
-        ).first()
+        # 取 <= as_of_date 的最新 fund_index_map
+        latest_map_date = (
+            db.query(func.max(FundIndexMap.as_of_date))
+            .filter(
+                FundIndexMap.fund_code == h_code,
+                FundIndexMap.as_of_date <= as_of_date,
+            )
+            .scalar()
+        )
+        fund_map = (
+            db.query(FundIndexMap)
+            .filter(
+                FundIndexMap.fund_code == h_code,
+                FundIndexMap.as_of_date == latest_map_date,
+            )
+            .first()
+            if latest_map_date
+            else None
+        )
         if not fund_map:
             report.holdings_skipped.append(f"{h_code}(no fund_index_map)")
             fh_rows.append(FullHoldingSnapshot(

@@ -266,22 +266,32 @@ function DrillBaseDetail({ detail }) {
             </tr>
           </thead>
           <tbody>
-            {stockRows.map((s, i) => (
-              <tr key={s.stock_code + i}>
-                <td style={{ fontFamily: 'GeistMono, monospace' }}>{s.stock_code}</td>
-                <td>{s.stock_name}</td>
-                <DetailCells row={s.baseline} isBaseline={true} />
-                <DetailCells row={s.latest} isBaseline={false} />
-              </tr>
-            ))}
-            {cashRow && (
-              <tr style={{ background: 'var(--bg-raised)', fontStyle: 'italic' }}>
-                <td>CASH</td>
-                <td>现金</td>
-                <DetailCells row={cashRow.baseline} isBaseline={true} />
-                <DetailCells row={cashRow.latest} isBaseline={false} />
-              </tr>
-            )}
+            {stockRows.map((s, i) => {
+              const bw = s.baseline?.weight_pct
+              const lw = s.latest?.effective_weight_pct ?? s.latest?.weight_pct
+              const cmp = (bw != null && lw != null) ? (bw === lw ? 0 : (bw > lw ? 1 : -1)) : 0
+              return (
+                <tr key={s.stock_code + i}>
+                  <td style={{ fontFamily: 'GeistMono, monospace' }}>{s.stock_code}</td>
+                  <td>{s.stock_name}</td>
+                  <DetailCells row={s.baseline} isBaseline={true} highlightWeight={cmp > 0} />
+                  <DetailCells row={s.latest} isBaseline={false} highlightWeight={cmp < 0} />
+                </tr>
+              )
+            })}
+            {cashRow && (() => {
+              const bw = cashRow.baseline?.weight_pct
+              const lw = cashRow.latest?.effective_weight_pct ?? cashRow.latest?.weight_pct
+              const cmp = (bw != null && lw != null) ? (bw === lw ? 0 : (bw > lw ? 1 : -1)) : 0
+              return (
+                <tr style={{ background: 'var(--bg-raised)', fontStyle: 'italic' }}>
+                  <td>CASH</td>
+                  <td>现金</td>
+                  <DetailCells row={cashRow.baseline} isBaseline={true} highlightWeight={cmp > 0} />
+                  <DetailCells row={cashRow.latest} isBaseline={false} highlightWeight={cmp < 0} />
+                </tr>
+              )
+            })()}
           </tbody>
           <tfoot>
             <tr style={{ fontWeight: 600, borderTop: '1px solid var(--border-strong)' }}>
@@ -307,8 +317,9 @@ function DrillBaseDetail({ detail }) {
 /** 渲染单日 9 列数据（权重/约当数量/股价原币/股价本币/PE/PB/PS/股息率/估算市值）。
  * isBaseline=true：基期，权重列显示 weight_pct（官方权重）
  * isBaseline=false：最新日，权重列显示 effective_weight_pct（实际权重，反映股价漂移）
+ * highlightWeight=true：本日权重为两者中较大值，用红色加粗高亮（适合深色背景）
  */
-function DetailCells({ row, isBaseline = true }) {
+function DetailCells({ row, isBaseline = true, highlightWeight = false }) {
   if (!row) {
     return (
       <>
@@ -328,7 +339,12 @@ function DetailCells({ row, isBaseline = true }) {
   const weightVal = isBaseline ? row.weight_pct : (row.effective_weight_pct ?? row.weight_pct)
   return (
     <>
-      <td style={{ textAlign: 'right', fontFamily: 'GeistMono, monospace' }}>{fmtNum(weightVal)}</td>
+      <td style={{
+        textAlign: 'right',
+        fontFamily: 'GeistMono, monospace',
+        color: highlightWeight ? 'var(--chart-down, #ff5252)' : undefined,
+        fontWeight: highlightWeight ? 700 : undefined,
+      }}>{fmtNum(weightVal)}</td>
       <td style={{ textAlign: 'right', fontFamily: 'GeistMono, monospace' }}>
         {row.user_shares != null ? Math.round(row.user_shares).toLocaleString() : '-'}
       </td>

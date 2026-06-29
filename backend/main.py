@@ -5580,7 +5580,7 @@ def admin_index_drill_base(
     """
     from middleware.auth import _resolve_eff_from_request
     _u, eff_uid = _resolve_eff_from_request(request, db)
-    if not eff_uid:
+    if not _u:
         raise HTTPException(401, "请登录")
 
     baseline_date, latest_nav_date = _get_baseline_and_latest_nav_dates(db)
@@ -5602,7 +5602,7 @@ def admin_index_drill_base_detail(
     """
     from middleware.auth import _resolve_eff_from_request
     _u, eff_uid = _resolve_eff_from_request(request, db)
-    if not eff_uid:
+    if not _u:
         raise HTTPException(401, "请登录")
 
     baseline_date, latest_nav_date = _get_baseline_and_latest_nav_dates(db)

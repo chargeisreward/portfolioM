@@ -5577,20 +5577,19 @@ def admin_index_drill_base(
     request: Request = None,
     db: Session = Depends(get_db),
 ):
-    """列出所有 is_drillable=True 基金的卡片数据（每基金一张卡片）。
+    """列出所有 is_drillable=True 基金的卡片数据（每基金一张卡片，per-fund latest）。
 
-    模拟基金概念：固定 95% 股票 + 5% 现金，假设持有 10000 份。
-    卡片本身不计算占比/偏差，金额 = nav × 10000。
-    返回 {cards: [...], baseline_date, latest_date}。
+    v3 重构（2026-06-30）：每只 fund 用自己最新 nav day 计算下钻，
+    严格 same-day basis（分子分母同日）。返回 {cards: [...], as_of: "..."}。
     """
     from middleware.auth import _resolve_eff_from_request
     _u, eff_uid = _resolve_eff_from_request(request, db)
     if not _u:
         raise HTTPException(401, "请登录")
 
-    baseline_date, latest_nav_date = _get_baseline_and_latest_nav_dates(db)
+    from datetime import date as _date
     from services.index_drill_base_service import list_drill_base_cards
-    return list_drill_base_cards(db, baseline_date, latest_nav_date)
+    return list_drill_base_cards(db, _date.today())
 
 
 @app.get("/api/admin/index-drill-base-detail")
@@ -6619,6 +6618,34 @@ def get_valuation_kpi_endpoint(
             "fund_count": fund_count,
         },
     }
+
+
+@app.get("/api/overview/intraday-change")
+def get_overview_intraday_change(
+    as_of_date: date = Query(..., description="业务日期 (YYYY-MM-DD)"),
+    request: Request = None,
+    user: User = Depends(require_user),
+    db: Session = Depends(get_db),
+):
+    """总览「当日涨跌幅」— 按全持仓（市值加权）口径（2026-06-30 用户反馈）。
+
+    与 /api/valuation/kpi 的 intraday_change_pct 区别：
+      - 旧版用 PriceCache.change_pct（盘中实时字段），.OF 基金 / 下钻成分股排除
+      - 新版按「分析 → 全持仓」页口径，undrilled (.OF / direct) + drilled 全覆盖
+        - undrilled_fund:    FundDailyNav vs prev
+        - direct_stock:      PriceCache.close_px vs prev
+        - drilled 成分股:    FundDrillSnapshot.current_price_cny vs prev (多 fund 取均值)
+        - cash:              跳过
+      - 公式：Σ(emv × dcp/100) / Σ(emv) × 100
+
+    返回 breakdown.top_contributions 可帮助追溯异常波动。
+    """
+    from middleware.auth import _resolve_eff_from_request
+    from services.intraday_change_service import compute_intraday_change_pct
+    _u, eff_uid = _resolve_eff_from_request(request, db)
+    if not eff_uid:
+        raise HTTPException(400, "管理员未指定 view_as 时无法计算个人当日涨跌幅")
+    return compute_intraday_change_pct(db, as_of_date, eff_uid)
 
 
 @app.get("/api/valuation/snapshot-range")

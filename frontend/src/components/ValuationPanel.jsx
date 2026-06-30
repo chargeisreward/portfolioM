@@ -123,8 +123,63 @@ export default function ValuationPanel() {
 
   // 现金行单独提取（永远第一行）
   const cashRow = holdings.find(h => h.is_cash) || null
-  // 非现金持仓
-  const nonCashHoldings = holdings.filter(h => !h.is_cash)
+  // 非现金持仓 — 按 security_code 聚合（groupby code — 2026-06-30 用户反馈）
+  // 底层持仓不动（holding_daily_snapshot 表保持原样），仅 UI 显示聚类
+  //   - 数量：求和
+  //   - 单价·原 / 单价·本：按数量加权平均
+  //   - 金额·本：求和
+  //   - 名称/类型/主题：取首个非空
+  const mergedByCode = new Map()
+  for (const h of holdings) {
+    if (h.is_cash) continue
+    const code = h.security_code
+    if (!code) continue
+    const acc = mergedByCode.get(code) || {
+      security_code: code,
+      security_name: h.security_name,
+      asset_type: h.asset_type,
+      type2: h.type2,
+      currency: h.currency,
+      is_cash: false,
+      _qty_sum: 0,
+      _price_num: 0,         // Σ(qty × price) 用于加权均价
+      _price_cny_num: 0,     // Σ(qty × price_cny) 用于加权均价
+      _amount_cny_sum: 0,
+      _price_set: false,     // 是否有任何 qty>0
+      _holding_uids: [],     // 保留来源 holding_uid 列表，便于追溯
+    }
+    if (!acc.security_name && h.security_name) acc.security_name = h.security_name
+    if (!acc.asset_type && h.asset_type) acc.asset_type = h.asset_type
+    if (!acc.type2 && h.type2) acc.type2 = h.type2
+    if (!acc.currency && h.currency) acc.currency = h.currency
+    const qty = Number(h.quantity || 0)
+    const price = Number(h.price || 0)
+    const priceCny = Number(h.price_cny || 0)
+    acc._qty_sum += qty
+    if (qty > 0) {
+      acc._price_num += qty * price
+      acc._price_cny_num += qty * priceCny
+      acc._price_set = true
+    }
+    acc._amount_cny_sum += Number(h.amount_cny || 0)
+    if (h.holding_uid) acc._holding_uids.push(h.holding_uid)
+    mergedByCode.set(code, acc)
+  }
+  // 转回普通数组，标准化字段名（脱去 _ 前缀的累加器字段）
+  const nonCashHoldings = Array.from(mergedByCode.values()).map(acc => ({
+    security_code: acc.security_code,
+    security_name: acc.security_name,
+    asset_type: acc.asset_type,
+    type2: acc.type2,
+    currency: acc.currency,
+    is_cash: false,
+    quantity: acc._qty_sum,
+    price: acc._price_set && acc._qty_sum > 0 ? acc._price_num / acc._qty_sum : null,
+    price_cny: acc._price_set && acc._qty_sum > 0 ? acc._price_cny_num / acc._qty_sum : null,
+    amount_cny: acc._amount_cny_sum,
+    holding_uids: acc._holding_uids,
+    holding_count: acc._holding_uids.length,
+  }))
 
   // 按 viewMode 分组
   const groups = {}
@@ -365,7 +420,19 @@ export default function ValuationPanel() {
                     {/* 组内证券行（缩进 2 字符 = paddingLeft: 16px） */}
                     {g.rows.map((h, idx) => (
                       <tr key={`${h.security_code}#${idx}`}>
-                        <td style={{ paddingLeft: 16 }}>{h.security_code}</td>
+                        <td style={{ paddingLeft: 16 }}>
+                          {h.security_code}
+                          {h.holding_count > 1 && (
+                            <span
+                              title={`合并自 ${h.holding_count} 条持仓批次（底层数据未变）`}
+                              style={{
+                                marginLeft: 6, fontSize: 9, padding: '1px 5px',
+                                borderRadius: 8, background: 'var(--bg-raised)',
+                                color: 'var(--text-muted)', cursor: 'help',
+                              }}
+                            >×{h.holding_count}</span>
+                          )}
+                        </td>
                         <td style={{ paddingLeft: 16 }}>{h.security_name || '—'}</td>
                         <td style={numStyle}>{fmtQty(h.quantity)}</td>
                         <td style={numStyle}>{fmtPrice(h.price)}</td>

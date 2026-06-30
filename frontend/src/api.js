@@ -175,6 +175,11 @@ export const getDrillableIndices = (asOfDate) => api.get('/penetration/drillable
 export const getIndexDrill = (indexCode, asOfDate) => api.get('/penetration/index-drill', { params: { index_code: indexCode, as_of_date: asOfDate } }).then(r => r.data)
 export const getAllDrilledStocks = (asOfDate) => api.get('/penetration/all-drilled-stocks', { params: { as_of_date: asOfDate } }).then(r => r.data)
 export const getFullHoldingTable = (asOfDate) => api.get('/penetration/full-holding-table', { params: { as_of_date: asOfDate } }).then(r => r.data)
+export const getOverviewIntradayChange = (asOfDate, viewAs = null) => {
+  const params = { as_of_date: asOfDate }
+  if (viewAs) params.view_as = viewAs
+  return api.get('/overview/intraday-change', { params }).then(r => r.data)
+}
 export const getTop10Holdings = (asOfDate, limit = 10) => api.get('/penetration/top10-holdings', { params: { as_of_date: asOfDate, limit } }).then(r => r.data)
 export const getDimensionDrilled = (dim, asOfDate, market = 'A+H') => api.get('/penetration/dimension-drilled', { params: { dim, as_of_date: asOfDate, market } }).then(r => r.data)
 export const getLatestExchangeRates = () => api.get('/exchange-rates/latest').then(r => r.data)

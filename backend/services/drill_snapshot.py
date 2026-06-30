@@ -34,6 +34,7 @@ from sqlalchemy.orm import Session
 from models import (
     AShareFinancialSnapshot,
     ExchangeRate,
+    FundDailyNav,
     FundDrillSnapshot,
     FundIndexMap,
     HKShareFinancialSnapshot,
@@ -295,8 +296,25 @@ def _get_fx_rate(
     return None
 
 
-def _get_fund_price(db: Session, fund_code: str) -> float | None:
-    """取该 fund 在 Holding 表里所有 user 价格的均值；若无任何 holding，返回 None。"""
+def _get_fund_price(
+    db: Session, fund_code: str, as_of_date: date | None = None
+) -> float | None:
+    """取该 fund 在 as_of_date 的真实 NAV（FundDailyNav.nav）。
+
+    修复（2026-06-30）：原实现用 avg(holdings.price)（用户买入价/盘中估值），
+    与真实 NAV 系统性偏离（最高 +29%），导致 shares_eq 计算误差 → 跟踪误差漂移。
+    现在优先从 FundDailyNav 拿 as_of_date 当天的 NAV；缺失时 fallback 到 holdings 平均价。
+
+    as_of_date=None 时直接走 holdings fallback（向后兼容非 drill 场景）。
+    """
+    if as_of_date is not None:
+        nav_row = db.query(FundDailyNav.nav).filter(
+            FundDailyNav.fund_code == fund_code,
+            FundDailyNav.trade_date == as_of_date,
+        ).first()
+        if nav_row and nav_row[0] and nav_row[0] > 0:
+            return float(nav_row[0])
+    # Fallback: avg(holdings.price)（旧行为）
     rows = db.query(Holding.price).filter(Holding.security_code == fund_code).all()
     prices = [r[0] for r in rows if r[0] is not None and r[0] > 0]
     if not prices:
@@ -380,8 +398,8 @@ def generate_drill_snapshot_for_date(
             )
             continue
 
-        # 取基金价格
-        fund_price = _get_fund_price(db, fund_code)
+        # 取基金价格（修复 2026-06-30：传 as_of_date 取真实 NAV 而非 holdings 均价）
+        fund_price = _get_fund_price(db, fund_code, as_of_date)
         if fund_price is None or fund_price <= 0:
             details.append({"fund": fund_code, "skip": "no_fund_price", "index": idx_code})
             continue

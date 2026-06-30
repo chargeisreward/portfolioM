@@ -1,37 +1,27 @@
-# PortfolioM 2.0 — 独立部署 docker-compose
-# 与原版 portfoliom 完全隔离：独立容器名 + 端口 + PG volume
-# 用法: docker compose -f docker-compose-2.0.yml up -d --build
+# PortfolioM 2.0 — 独立部署 docker-compose (LOCAL variant)
+#
+# 本文件已改造为本地恢复场景：
+#   - PG 服务已被手动 docker run 起好 (portfoliom2-pg) 并已从云端 dump 还原
+#   - 不再让 docker compose 创建 pg 服务，避免与现有容器冲突 / 覆盖数据
+#   - backend 直接连接主机名 portfoliom2-pg
+#
+# 启动方式：
+#   docker compose -f docker-compose-2.0.yml up -d --build backend frontend
 
 services:
-  # ─── PostgreSQL（独立 volume，与原版 pg_data 隔离）───
-  pg:
-    image: postgres:16-alpine
-    container_name: portfoliom2-pg
-    restart: unless-stopped
-    environment:
-      POSTGRES_USER: portfoliom
-      POSTGRES_PASSWORD: ${PG_PASSWORD:-portfoliom2_prod}
-      POSTGRES_DB: portfoliom
-    volumes:
-      - pg2_data:/var/lib/postgresql/data
-    healthcheck:
-      test: ["CMD-SHELL", "pg_isready -U portfoliom"]
-      interval: 10s
-      timeout: 5s
-      retries: 5
-
-  # ─── Backend (FastAPI) ───
+  # ─── Backend (FastAPI) ───────────────────────────────────────────
   backend:
     build: ./backend
     container_name: portfoliom2-backend
     restart: unless-stopped
-    depends_on:
-      pg:
-        condition: service_healthy
     environment:
-      DATABASE_URL: "postgresql+psycopg://portfoliom:${PG_PASSWORD:-portfoliom2_prod}@pg:5432/portfoliom"
+      # 直接连已存在的 portfoliom2-pg 容器 (在 host network bridge 中按容器名解析)
+      DATABASE_URL: "postgresql+psycopg://portfoliom:${PG_PASSWORD:-portfoliom2_prod}@portfoliom2-pg:5432/portfoliom"
       LLM_API_KEY: ${LLM_API_KEY}
       LLM_API_BASE: ${LLM_API_BASE}
+      # CORS 允许前端 origin（用 comma 分割追加到 _ALLOWED_ORIGINS）
+      # 用户实际访问 origin 可能是 localhost:3001 / 127.0.0.1:3001
+      CORS_ALLOW_ORIGINS: "http://localhost:3001,http://127.0.0.1:3001,http://localhost,http://127.0.0.1"
       LLM_MODEL: ${LLM_MODEL}
     ports:
       - "127.0.0.1:8011:8000"
@@ -39,18 +29,18 @@ services:
       - ./backend/data:/app/data
       - ./sourceData:/app/sourceData
 
-  # ─── Frontend (Vite build → Nginx serve) ───
+  # ─── Frontend (Vite build → Nginx serve) ─────────────────────────
   frontend:
     build:
       context: ./frontend
       args:
         VITE_BASE: "/portfoliom2.0/"
+        # VITE_API_URL 必须显式设为空字符串 — 否则 build 时会注入 zeabur 云端 URL
+        # (来自前一个 zeabur 部署 build 的缓存 .env),导致浏览器绕过 localhost 直接调云端
+        VITE_API_URL: ""
     container_name: portfoliom2-frontend
     restart: unless-stopped
     ports:
       - "127.0.0.1:3001:80"
     depends_on:
       - backend
-
-volumes:
-  pg2_data:

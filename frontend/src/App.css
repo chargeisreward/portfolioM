@@ -797,6 +797,7 @@
 .drill-fund-code { font-family: "GeistMono", monospace; font-weight: 600; font-size: 12px; }
 .drill-fund-name { font-size: 12px; flex: 1; }
 .drill-card-toggle { color: var(--text-muted); font-size: 10px; }
+.drill-card-subtitle { font-size: 10px; color: var(--text-muted); margin-bottom: 4px; font-family: "GeistMono", monospace; }
 .drill-card-meta { font-size: 11px; color: var(--text-muted); }
 .drill-card-stats {
   display: grid;

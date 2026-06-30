@@ -40,7 +40,12 @@ export default function DrillableFundsPage() {
     setLoading(true)
     import('../api').then(api => {
       api.getDrillableIndices(today)
-        .then(d => { setIndices(d?.indices || []); setLoading(false); })
+        .then(d => {
+          // v3 重构 2026-06-30：endpoint 改返 cards (per-fund 而非 by-index)
+          const cards = d?.cards || d?.indices || []
+          setIndices(cards)
+          setLoading(false)
+        })
         .catch(e => { setErr(e?.message || 'load failed'); setLoading(false); })
     })
   }, [today])
@@ -141,16 +146,20 @@ export default function DrillableFundsPage() {
       )}
       <div className="drill-grid">
         {indices.map(card => {
-          const isOpen = expanded === card.index_code
-          const dev = card.est_deviation_pct
+          const cardKey = card.fund_code || card.index_code
+          const isOpen = expanded === cardKey
+          const dev = card.deviation_pct ?? card.est_deviation_pct
           const devColor = dev > 0 ? 'var(--chart-up)' : dev < 0 ? 'var(--chart-down)' : 'var(--text-secondary)'
           return (
-            <div key={card.index_code} className={`drill-card ${isOpen ? 'drill-card-open' : ''}`}>
-              <div className="drill-card-header" onClick={() => toggle(card.index_code)}>
+            <div key={cardKey} className={`drill-card ${isOpen ? 'drill-card-open' : ''}`}>
+              <div className="drill-card-header" onClick={() => toggle(cardKey)}>
                 <div className="drill-card-title-row">
-                  <span className="drill-fund-code">{card.index_code}</span>
-                  <span className="drill-fund-name">{card.index_name || card.index_code}</span>
+                  <span className="drill-fund-code">{card.fund_code || card.index_code}</span>
+                  <span className="drill-fund-name">{card.fund_name || card.index_name || cardKey}</span>
                   <span className="drill-card-toggle">{isOpen ? '▼' : '▸'}</span>
+                </div>
+                <div className="drill-card-subtitle">
+                  每 10 万份 · {card.nav_date || '—'}
                 </div>
                 <div className="drill-card-meta">
                   <span style={{ marginRight: 10 }}>

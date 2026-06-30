@@ -22,8 +22,7 @@ export default function IndexDrillBaseTab({ onMissingConstituents, onMissingInde
   const [cards, setCards] = useState([])
   const [loading, setLoading] = useState(true)
   const [err, setErr] = useState(null)
-  const [baselineDate, setBaselineDate] = useState(null)
-  const [latestDate, setLatestDate] = useState(null)
+  const [asOf, setAsOf] = useState(null)
   const [expanded, setExpanded] = useState(null)
   const [detail, setDetail] = useState(null)
   const [detailLoading, setDetailLoading] = useState(false)
@@ -34,8 +33,7 @@ export default function IndexDrillBaseTab({ onMissingConstituents, onMissingInde
     try {
       const res = await api.get('/admin/index-drill-base')
       setCards(res.data.cards || [])
-      setBaselineDate(res.data.baseline_date)
-      setLatestDate(res.data.latest_date)
+      setAsOf(res.data.as_of)
     } catch (e) {
       console.error('加载指数下钻基础数据失败', e)
       setErr(e.response?.data?.detail || e.message)
@@ -89,7 +87,7 @@ export default function IndexDrillBaseTab({ onMissingConstituents, onMissingInde
       <div className="drill-header">
         <span className="drill-title">指数下钻基础数据 — {cards.length} 只基金</span>
         <span style={{ fontSize: 11, color: 'var(--text-muted)' }}>
-          模拟基金（10000 份） · 基期: {baselineDate || '—'} · 最新日: {latestDate || '—'} · 点击卡片展开双日并排明细
+          模拟基金（每 10 万份） · as_of: {asOf || '—'} · 点击卡片展开明细
         </span>
       </div>
       <div className="drill-grid">
@@ -120,7 +118,7 @@ function DrillBaseCard({ card, expanded, detail, detailLoading, onToggle }) {
         <div className="drill-card-header" onClick={onToggle} style={{ cursor: 'pointer' }}>
           <div className="drill-card-title-row">
             <span className="drill-fund-code">{card.fund_code}</span>
-            <span className="drill-fund-name">{card.fund_name || card.fund_code} · 每十万份</span>
+            <span className="drill-fund-name">{card.fund_name || card.fund_code} · 每 10 万份</span>
             <span className="drill-card-toggle">⚠</span>
           </div>
           <div className="drill-card-meta">
@@ -144,7 +142,7 @@ function DrillBaseCard({ card, expanded, detail, detailLoading, onToggle }) {
         <div className="drill-card-header" onClick={onToggle} style={{ cursor: 'pointer' }}>
           <div className="drill-card-title-row">
             <span className="drill-fund-code">{card.fund_code}</span>
-            <span className="drill-fund-name">{card.fund_name || card.fund_code} · 每十万份</span>
+            <span className="drill-fund-name">{card.fund_name || card.fund_code} · 每 10 万份</span>
             <span className="drill-card-toggle">⚠</span>
           </div>
           <div className="drill-card-meta">
@@ -162,17 +160,19 @@ function DrillBaseCard({ card, expanded, detail, detailLoading, onToggle }) {
     )
   }
 
-  const latest = card.latest || {}
   return (
     <div className={`drill-card ${expanded ? 'drill-card-open' : ''}`}>
       <div className="drill-card-header" onClick={onToggle} style={{ cursor: 'pointer' }}>
         <div className="drill-card-title-row">
           <span className="drill-fund-code">{card.fund_code}</span>
-          <span className="drill-fund-name">{card.fund_name || card.fund_code} · 每十万份</span>
+          <span className="drill-fund-name">{card.fund_name || card.fund_code}</span>
           <span className="drill-card-toggle">{expanded ? '▼' : '▸'}</span>
         </div>
+        <div className="drill-card-subtitle">
+          每 10 万份 · {card.nav_date || '—'}
+        </div>
         <div className="drill-card-meta">
-          <span style={{ marginRight: 10 }}>
+          <span>
             <span style={{ color: 'var(--text-muted)' }}>指数</span>
             <span style={{ color: 'var(--accent)', fontWeight: 600, marginLeft: 4 }}>
               {card.index_code || '—'}
@@ -181,19 +181,19 @@ function DrillBaseCard({ card, expanded, detail, detailLoading, onToggle }) {
           </span>
           <span>
             <span style={{ color: 'var(--text-muted)' }}>股票数</span>
-            <span style={{ color: 'var(--text-secondary)', fontWeight: 600, marginLeft: 4 }}>{latest.stock_count ?? 0}</span>
+            <span style={{ color: 'var(--text-secondary)', fontWeight: 600, marginLeft: 4 }}>{card.stock_count ?? 0}</span>
           </span>
         </div>
       </div>
       <div className="drill-card-stats">
-        <div className="drill-stat"><span className="lbl">PE</span><span className="val">{fmtNum(latest.pe)}</span></div>
-        <div className="drill-stat"><span className="lbl">PB</span><span className="val">{fmtNum(latest.pb)}</span></div>
-        <div className="drill-stat"><span className="lbl">PS</span><span className="val">{fmtNum(latest.ps)}</span></div>
-        <div className="drill-stat"><span className="lbl">股息率%</span><span className="val">{fmtNum(latest.dividend_yield)}</span></div>
-        <div className="drill-stat drill-stat-secondary"><span className="lbl">股票数</span><span className="val">{latest.stock_count ?? 0}</span></div>
-        <div className="drill-stat drill-stat-secondary"><span className="lbl">金额(CNY)</span><span className="val">{fmtAmount(latest.amount)}</span></div>
+        <div className="drill-stat"><span className="lbl">PE</span><span className="val">{fmtNum(card.weighted_pe)}</span></div>
+        <div className="drill-stat"><span className="lbl">PB</span><span className="val">{fmtNum(card.weighted_pb)}</span></div>
+        <div className="drill-stat"><span className="lbl">PS</span><span className="val">{fmtNum(card.weighted_ps)}</span></div>
+        <div className="drill-stat"><span className="lbl">股息率%</span><span className="val">{fmtNum(card.weighted_dividend_yield)}</span></div>
+        <div className="drill-stat drill-stat-secondary"><span className="lbl">股票数</span><span className="val">{card.stock_count ?? 0}</span></div>
+        <div className="drill-stat drill-stat-secondary"><span className="lbl">金额(CNY)</span><span className="val">{fmtAmount(card.per_10k_value)}</span></div>
         <div className="drill-stat drill-stat-secondary"><span className="lbl">占比%</span><span className="val" style={{ color: 'var(--text-muted)' }}>-</span></div>
-        <div className="drill-stat drill-stat-secondary"><span className="lbl">偏差%</span><span className="val" style={{ color: 'var(--text-muted)' }}>-</span></div>
+        <div className="drill-stat drill-stat-secondary"><span className="lbl">偏差%</span><span className="val">{fmtNum(card.deviation_pct, 2)}</span></div>
       </div>
 
       {expanded && (
@@ -298,11 +298,19 @@ function DrillBaseDetail({ detail }) {
               <td colSpan="2" style={{ color: 'var(--text-muted)', fontSize: 11 }}>
                 合计 · {stockRows.length} 只股票 + 现金
               </td>
+              {/* 基期 9 列（1 权重 + 7 中 + 1 估算市值）汇总 */}
+              <td style={{ textAlign: 'right', fontFamily: 'GeistMono, monospace', color: 'var(--accent)' }}>
+                {fmtNum(detail.totals?.sum_weight_baseline, 2)}
+              </td>
               <td colSpan="7"></td>
               <td style={{ textAlign: 'right', fontFamily: 'GeistMono, monospace' }}>
                 {fmtAmount(sumEstMv(stockRows, 'baseline'))}
               </td>
-              <td colSpan="8"></td>
+              {/* 最新日 9 列（1 权重 + 7 中 + 1 估算市值）汇总 */}
+              <td style={{ textAlign: 'right', fontFamily: 'GeistMono, monospace', color: 'var(--accent)' }}>
+                {fmtNum(detail.totals?.sum_weight_latest, 2)}
+              </td>
+              <td colSpan="7"></td>
               <td style={{ textAlign: 'right', fontFamily: 'GeistMono, monospace' }}>
                 {fmtAmount(sumEstMv(stockRows, 'latest'))}
               </td>

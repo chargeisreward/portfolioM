@@ -47,6 +47,7 @@ export default function OverviewPanel() {
   const [type2Filter, setType2Filter] = useState('all')
   const [kpi, setKpi] = useState(null)        // spec §4.8: real KPI from /api/penetration/kpi
   const [bizDate, setBizDate] = useState(null) // for KPI fetch param
+  const [intradayChg, setIntradayChg] = useState(null)  // 2026-06-30 改用全持仓加权算法（/api/overview/intraday-change）
   const [marketIndices, setMarketIndices] = useState([])
   const [drillableCodes, setDrillableCodes] = useState(new Set())  // 可下钻基金代码集合
 
@@ -77,6 +78,15 @@ export default function OverviewPanel() {
   useEffect(() => {
     if (!bizDate) return
     api.getValuationKpi(bizDate).then(d => setKpi(d?.values || null)).catch(() => setKpi(null))
+  }, [bizDate])
+
+  // 当日涨跌幅 — 2026-06-30 改用全持仓加权算法
+  // 取代 kpi.intraday_change_pct（旧版只取 PriceCache.change_pct，缺 .OF + drilled）
+  useEffect(() => {
+    if (!bizDate) return
+    api.getOverviewIntradayChange(bizDate)
+      .then(d => setIntradayChg(d))
+      .catch(() => setIntradayChg(null))
   }, [bizDate])
 
   // Holdings data for table — always prefer converted API.
@@ -484,19 +494,23 @@ export default function OverviewPanel() {
         <div className="kpi-card">
           <div className="kpi-label">当日涨跌幅</div>
           <div className="kpi-value" style={{
-            color: kpi?.intraday_change_pct == null ? undefined
-                   : (kpi.intraday_change_pct > 0 ? 'var(--up)'
-                   : kpi.intraday_change_pct < 0 ? 'var(--down)' : undefined),
+            color: intradayChg?.intraday_change_pct == null ? undefined
+                   : (intradayChg.intraday_change_pct > 0 ? 'var(--up)'
+                   : intradayChg.intraday_change_pct < 0 ? 'var(--down)' : undefined),
             fontWeight: 600,
           }}>
-            {kpi?.intraday_change_pct != null
-              ? (kpi.intraday_change_pct > 0 ? '+' : '') + kpi.intraday_change_pct.toFixed(2) + '%'
+            {intradayChg?.intraday_change_pct != null
+              ? (intradayChg.intraday_change_pct > 0 ? '+' : '') + intradayChg.intraday_change_pct.toFixed(2) + '%'
               : '—'}
           </div>
-          <div className="kpi-sub" style={{ fontSize: 10 }}>
-            {kpi?.intraday_breakdown?.covered_count > 0
-              ? `覆盖 ${kpi.intraday_breakdown.covered_count} 只`
-              : '盘中实时'}
+          <div className="kpi-sub" style={{ fontSize: 10 }} title={
+            intradayChg?.breakdown
+              ? `覆盖 ${intradayChg.breakdown.covered_count}/${intradayChg.breakdown.total_count} 只 (${intradayChg.breakdown.coverage_rate}%)\n${intradayChg.breakdown.covered_emv_cny.toLocaleString()} / ${intradayChg.breakdown.total_emv_cny.toLocaleString()} CNY`
+              : ''
+          }>
+            {intradayChg?.prev_trade_date
+              ? `vs ${intradayChg.prev_trade_date} · 覆盖 ${intradayChg.breakdown.covered_count}/${intradayChg.breakdown.total_count}`
+              : '加载中…'}
           </div>
         </div>
         <div className="kpi-card">

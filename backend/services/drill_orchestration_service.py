@@ -15,125 +15,117 @@ join 公式：
 from __future__ import annotations
 
 import logging
-from datetime import date as _date
+from datetime import date as _date, timedelta
 
 from sqlalchemy.orm import Session
 
-from models import FundDrillSnapshot
+from models import FundDailyNav, FundDrillSnapshot, SecurityMaster
 from services import drill_public_service as public_service
 from services import drill_user_service as user_service
+from services.overseas_fund_nav import is_overseas_fund
 
 logger = logging.getLogger(__name__)
 
 
-def list_drillable_cards(db: Session, as_of: _date, user_id: int) -> list[dict]:
-    """返回用户可见的下钻卡片列表。
+def _get_fund_nav_with_lookback(
+    db: Session, fund_code: str, fund_name: str, target_date: _date
+) -> tuple[float | None, _date | None]:
+    """取基金最新 NAV。QDII 净值 T+2 公布，缺失时回退到 T-1/T-2。
+    工作日回退窗口统一扩到 T-5，覆盖周末/短假期场景。
 
-    join 逻辑：
-    1. public.get_public_cards(as_of) → 所有公共卡片
-    2. user.get_user_fund_codes(user_id) → 用户基金代码集合
-    3. if not user_fund_codes → return []
-    4. 过滤：只保留 fund_codes ∩ user_fund_codes 非空的卡片
-    5. 计算 est_market_value_cny / static_amount_cny / est_deviation_pct / weight_pct
+    返回 (nav, actual_date_used)。nav=None 表示目标日及回退窗口内均无 NAV。
     """
-    public_cards = public_service.get_public_cards(db, as_of)
-    user_fund_codes = user_service.get_user_fund_codes(db, user_id)
+    # 候选日期窗口：目标日 + 前 5 天（含周末）。基金 NAV 即使周末没数据，
+    # T+5 工作日窗口足够覆盖短假期（春节/国庆）；不够时上层 fallback 到 holding.amount_cny。
+    candidates: list[_date] = [target_date - timedelta(days=i) for i in range(0, 6)]
+    for d in candidates:
+        row = db.query(FundDailyNav).filter_by(
+            fund_code=fund_code, trade_date=d
+        ).first()
+        if row and row.nav and row.nav > 0:
+            return (float(row.nav), d)
+    return (None, None)
 
+
+def list_drillable_cards(db: Session, as_of: _date, user_id: int) -> list[dict]:
+    """返回用户可见的下钻卡片列表（v3 重构 2026-06-30：消费 admin 完整数据）。
+
+    流程：
+    1. list_drill_base_cards(db, today) → admin 算好的 per-fund cards（含 constituents breakdown）
+    2. user.get_user_fund_holdings(user_id, fund_codes) → 用户持仓
+    3. 过滤：只保留 user 持有且 admin has_constituents=True 的 fund
+    4. 对每只 fund：
+       - per_share_est = admin.per_10k_value / 10000
+       - card_est_cny = user_quantity × per_share_est
+       - card_fund_value_cny = user_quantity × admin.fund_nav
+       - deviation_pct = admin.deviation_pct (与 admin 完全相同)
+    5. 算 weight_pct (per card 在 user 组合中的占比)
+    """
+    from services.index_drill_base_service import list_drill_base_cards
+
+    admin_response = list_drill_base_cards(db, as_of)
+    admin_cards = admin_response.get("cards", [])
+
+    user_fund_codes = user_service.get_user_fund_codes(db, user_id)
     if not user_fund_codes:
         return []
 
-    if not public_cards:
-        return []
-
-    # 获取用户持仓明细（用于计算 card_fund_value = 基金份额 × 基金净值）
     user_holdings = user_service.get_user_fund_holdings(
         db, user_id, list(user_fund_codes)
     )
 
-    # 拉所有 public_card 涉及 fund 的 drill snapshot 行
-    # 按 fund_code 累加 per_fund_static (Σ shares_eq×baseline) 和 per_fund_est (Σ shares_eq×current)
-    all_fund_codes: set[str] = set()
-    for card in public_cards:
-        all_fund_codes.update(card["fund_codes"])
-    # 仅查用户持有的 fund
-    relevant_fund_codes = all_fund_codes & user_fund_codes
+    # 用 admin_card 做 fund_code → card 索引
+    admin_card_by_code: dict[str, dict] = {
+        c["fund_code"]: c for c in admin_cards
+        if c.get("has_constituents")
+    }
 
-    per_fund_static: dict[str, float] = {}   # fund_code → Σ shares_eq × baseline_price_cny (CNY)
-    per_fund_est: dict[str, float] = {}      # fund_code → Σ shares_eq × current_price_cny (CNY)
-    if relevant_fund_codes:
-        from sqlalchemy import func as sa_func
-        # public_cards[0]["as_of"] 是 ISO 字符串（来自 effective_date.isoformat()）
-        effective_date = _date.fromisoformat(public_cards[0]["as_of"])
-        # 双币种规则 (2026-06-25)：聚合用本币(CNY)字段，保证 A 股/H 股量纲一致。
-        # 本币字段在公共数据层算好存入表，此处直接取 baseline_price_cny / current_price_cny。
-        rows = db.query(
-            FundDrillSnapshot.fund_code,
-            sa_func.sum(FundDrillSnapshot.shares_equivalent * FundDrillSnapshot.baseline_price_cny).label("static_sum"),
-            sa_func.sum(FundDrillSnapshot.shares_equivalent * FundDrillSnapshot.current_price_cny).label("est_sum"),
-        ).filter(
-            FundDrillSnapshot.as_of_date == effective_date,
-            FundDrillSnapshot.fund_code.in_(list(relevant_fund_codes)),
-        ).group_by(FundDrillSnapshot.fund_code).all()
-        for r in rows:
-            per_fund_static[r.fund_code] = float(r.static_sum or 0.0)
-            per_fund_est[r.fund_code] = float(r.est_sum or 0.0)
-
-    # 先计算每张卡片的 card_est（用于稍后算 weight_pct = card_est / user_total_est）
-    cards_with_est: list[dict] = []
-    user_total_est = 0.0
-    for card in public_cards:
-        overlap = set(card["fund_codes"]) & user_fund_codes
-        if not overlap:
+    cards: list[dict] = []
+    for f in user_fund_codes:
+        admin_card = admin_card_by_code.get(f)
+        if not admin_card:
+            continue  # 该 fund 不在 admin 可下钻列表里
+        h = user_holdings.get(f)
+        if not h:
             continue
-        # card_est = Σ (user_quantity × per_fund_est[f]) for f in overlap（成分股+现金估算市值）
-        # card_fund_value = Σ (user_holdings[f].amount_cny) for f in overlap（基金份额 × 基金净值）
-        # card_static = Σ (user_quantity × per_fund_static[f]) for f in overlap（用户实际基准日金额）
-        # 注意：per_fund_est / per_fund_static 已包含 CASH 行（来自 FundDrillSnapshot），
-        # 故 card_est 自动包含 5% 现金部分，无需额外加 card_cash。
-        card_est = 0.0
-        card_fund_value = 0.0
-        card_static = 0.0
-        for f in overlap:
-            h = user_holdings.get(f)
-            if not h:
-                continue
-            quantity = h["quantity"]
-            card_est += quantity * per_fund_est.get(f, 0.0)
-            card_fund_value += h["amount_cny"]
-            card_static += quantity * per_fund_static.get(f, 0.0)
+        qty = h["quantity"]
+        per_10k = admin_card.get("per_10k_value")
+        fund_nav = admin_card.get("fund_nav")
+        if per_10k is None or fund_nav is None:
+            continue
+        per_share_est = per_10k / 10000.0
+        card_est = qty * per_share_est
+        card_fund_value = qty * fund_nav
+        cards.append({
+            "user_fund_codes": [f],
+            "fund_code": f,
+            "fund_name": admin_card.get("fund_name"),
+            "index_code": admin_card.get("index_code"),
+            "index_name": admin_card.get("index_name"),
+            "nav_date": admin_card.get("nav_date"),
+            "fund_nav": fund_nav,
+            "per_10k_value": per_10k,
+            "per_share_est": per_share_est,
+            "est_market_value_cny": round(card_est, 4),
+            "card_fund_value_cny": round(card_fund_value, 4),
+            "deviation_pct": admin_card.get("deviation_pct"),
+            "weighted_pe": admin_card.get("weighted_pe"),
+            "weighted_pb": admin_card.get("weighted_pb"),
+            "weighted_ps": admin_card.get("weighted_ps"),
+            "weighted_dividend_yield": admin_card.get("weighted_dividend_yield"),
+            "stock_count": admin_card.get("stock_count"),
+            "constituents": admin_card.get("constituents", []),  # 完整 per-stock 给"下钻全持仓"用
+            "weight_pct": None,  # 累加后算
+        })
 
-        # est_deviation_pct = (估算市值 / 基金市值 - 1) × 100
-        # card_est 已含 5% 现金，理论上 ≈ card_fund_value → deviation ≈ 0
-        if card_fund_value > 0:
-            est_deviation_pct = round(
-                (card_est / card_fund_value - 1) * 100, 4
-            )
-        else:
-            est_deviation_pct = None
+    # 算 weight_pct
+    total_est = sum(c["est_market_value_cny"] for c in cards)
+    for c in cards:
+        c["weight_pct"] = round(c["est_market_value_cny"] / total_est * 100, 4) if total_est > 0 else 0.0
 
-        merged = {
-            **card,
-            "user_fund_codes": sorted(overlap),
-            "static_amount_cny": round(card_static, 4),       # 覆盖公共层值（用户实际金额）
-            "est_market_value_cny": round(card_est, 4),       # 估算市值
-            "est_deviation_pct": est_deviation_pct,
-            "card_fund_value_cny": round(card_fund_value, 4), # 基金市值（debug 用）
-        }
-        cards_with_est.append(merged)
-        user_total_est += card_est
-
-    # 计算 weight_pct 并组装最终结果
-    result = []
-    for merged in cards_with_est:
-        card_est = merged["est_market_value_cny"]
-        weight_pct = round(card_est / user_total_est * 100, 4) if user_total_est > 0 else 0.0
-        merged["weight_pct"] = weight_pct
-        result.append(merged)
-
-    # 卡片按 weighted_pe 从高到低排序（无 PE 数据的卡片排末尾）
-    # 前端 grid 布局：数组顺序 = 从左到右、从上到下的视觉顺序
-    result.sort(key=lambda c: (c.get("weighted_pe") is None, -(c.get("weighted_pe") or 0)))
-    return result
+    # 按 weighted_pe 降序
+    cards.sort(key=lambda c: (c.get("weighted_pe") is None, -(c.get("weighted_pe") or 0)))
+    return cards
 
 
 def get_drill_detail(

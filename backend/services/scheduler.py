@@ -15,7 +15,7 @@ from apscheduler.schedulers.background import BackgroundScheduler
 from sqlalchemy.orm import Session
 
 from database import SessionLocal
-from models import Holding, PriceCache, StockInfoCache, AssetType, FullHoldingSnapshot, FundDailyNav, TradingCalendar
+from models import Holding, PriceCache, StockInfoCache, AssetType, FullHoldingSnapshot, FundDailyNav, TradingCalendar, IndexConstituentSnapshot, SecurityMaster, FundIndexMap
 from services.data_pull_task_service import record_task_start, record_task_finish
 from services.fund_nav_fetcher import fetch_nav_all as _raw_fetch_nav_all, parse_nav_row as _parse_nav_row
 
@@ -903,6 +903,149 @@ def job_pull_fund_nav(days: int = 30):
 
 
 @track_run("valuation_snapshot")
+@track_run("constituent_prices")
+def job_pull_constituent_prices(days_back: int = 14, max_codes: int = 1000, sleep_between: float = 0.05) -> dict:
+    """每日 21:00 跑 — 增量拉所有可下钻指数成分股的最近 N 天收盘价到 price_cache。
+
+    背景（2026-06-30 用户反馈）：
+      - 023.OF 6/29 股价显示 1323.40（实为 6/25 的真实收盘价），
+        因为 price_cache 6/24 后无任何 constituent 数据，
+        drill_snapshot strict_mode=False T→T-7 回退到 6/25。
+      - 根因：job_backfill_gaps / job_fetch_realtime_prices 都只看 holdings（33 unique codes），
+        不主动拉指数成分股（836 只）。
+
+    修复（本 job）：
+      1. 找所有 is_drillable 基金关联的指数 → IndexConstituentSnapshot 取最新成分股并集（去重）
+      2. 调 fetch_tencent_kline(ticker, days=days_back) 拉每个 constituent 最近 N 天 K 线
+      3. 按 trade_date 增量写入 price_cache（已存在则跳过），source='constituent_daily_pull'
+      4. 单次最多 max_codes 只（防 API 超时），分批触发可调小
+
+    时机：每日 21:00 跑（在 pull_fund_nav 20:30 + valuation_snapshot 20:45 之后，
+         给 drill_snapshot 09:00 留出充足时间生成用真价，不回退 stale）
+
+    返回 dict（供 track_run 提取覆盖率）：
+      planned_count: 计划处理的 constituent 数
+      success_count: 成功拉取并写入的 constituent 数
+      coverage_rate: 拉取成功率
+      details: 每个 constituent 的处理状态
+    """
+    import time as _t
+    from datetime import date as _date, timedelta as _td
+    from crawlers.price_data import fetch_tencent_kline
+    from services.code_map import transform_code
+
+    db: Session = SessionLocal()
+    try:
+        # 1. 找所有 is_drillable 基金关联的指数代码（兼容带/不带后缀）
+        drillable_idx_codes: set[str] = set()
+        for sm in db.query(SecurityMaster).filter(SecurityMaster.is_drillable.is_(True)).all():
+            if sm.index_code:
+                drillable_idx_codes.add(sm.index_code.split(".")[0])
+        for fm in db.query(FundIndexMap).all():
+            if fm.index_code:
+                drillable_idx_codes.add(fm.index_code.split(".")[0])
+
+        # 后缀变体（SH/SZ/CSI），让 IndexConstituentSnapshot 能命中
+        all_idx_variants: set[str] = set()
+        for ic in drillable_idx_codes:
+            all_idx_variants.add(ic)
+            all_idx_variants.add(f"{ic}.SH")
+            all_idx_variants.add(f"{ic}.SZ")
+            all_idx_variants.add(f"{ic}.CSI")
+
+        # 2. 取所有成分股 stock_code 去重
+        rows = (
+            db.query(IndexConstituentSnapshot.stock_code)
+            .filter(IndexConstituentSnapshot.index_code.in_(list(all_idx_variants)))
+            .distinct()
+            .all()
+        )
+        codes = sorted({r[0] for r in rows if r[0]})
+        if not codes:
+            logger.info("constituent_prices: 无成分股，跳过")
+            return {"planned_count": 0, "success_count": 0, "coverage_rate": None, "details": []}
+
+        planned = len(codes)
+        logger.info("constituent_prices: %d 只成分股开始拉取", planned)
+
+        # 3. 仅补"最近 days_back 天"的缺口（避免首次跑把全表重写）
+        cutoff = _date.today() - _td(days=days_back)
+
+        success_count = 0
+        details: list[dict] = []
+        for i, code in enumerate(codes[:max_codes], 1):
+            try:
+                transformed = transform_code(code, "tencent_kline", db)
+                ticker = transformed or code
+                history = fetch_tencent_kline(ticker, days=days_back + 5)
+                if not history:
+                    details.append({"code": code, "status": "no_data"})
+                    continue
+
+                # 已有日期集合（避免重复写）
+                existing_dates = {
+                    row[0] for row in
+                    db.query(PriceCache.trade_date)
+                    .filter(PriceCache.stock_code == code)
+                    .filter(PriceCache.trade_date >= cutoff)
+                    .all()
+                }
+
+                written = 0
+                for p in history:
+                    try:
+                        d = _date.fromisoformat(p["date"])
+                    except (ValueError, TypeError):
+                        continue
+                    if d < cutoff:
+                        continue
+                    if d in existing_dates:
+                        continue
+                    db.add(PriceCache(
+                        stock_code=code,
+                        trade_date=d,
+                        open_px=p.get("open"),
+                        close_px=p.get("close"),
+                        high_px=p.get("high"),
+                        low_px=p.get("low"),
+                        volume=p.get("volume"),
+                        source="const_daily",   # ≤ 20 chars (varchar(20) constraint)
+                    ))
+                    written += 1
+
+                if written:
+                    db.commit()
+                    success_count += 1
+                    details.append({"code": code, "status": "ok", "written": written})
+                else:
+                    success_count += 1  # 已存在也算成功（无缺口）
+                    details.append({"code": code, "status": "complete"})
+
+                if i % 50 == 0:
+                    logger.info("constituent_prices progress: %d/%d", i, planned)
+
+                if sleep_between > 0:
+                    _t.sleep(sleep_between)
+            except Exception as e:
+                logger.warning("constituent_prices %s failed: %s", code, e)
+                details.append({"code": code, "status": "error", "error": str(e)[:100]})
+                continue
+
+        coverage = (success_count / planned) if planned > 0 else None
+        logger.info("constituent_prices: 成功 %d/%d (%.2f%%)", success_count, planned, (coverage or 0) * 100)
+        return {
+            "planned_count": planned,
+            "success_count": success_count,
+            "coverage_rate": coverage,
+            "details_len": len(details),
+        }
+    except Exception as e:
+        logger.error("job_pull_constituent_prices failed: %s", e, exc_info=True)
+        return {"status": "error", "message": str(e)[:500]}
+    finally:
+        db.close()
+
+
 def job_valuation_snapshot():
     """每日 20:45 执行 — 为所有 user 重算估值截面（含未锁定的也重跑 + 检查锁定）。
 
@@ -1234,6 +1377,20 @@ def start_scheduler():
         name="估值表日截面重算",
         max_instances=1,
         misfire_grace_time=600,
+    )
+
+    # 任务14：可下钻指数全成分股收盘价拉取 — 每日 21:00
+    # 修复（2026-06-30）：023.OF 6/29 价错（实为 6/25 stale），因 holdings-only 拉价缺 constituents
+    # 现在每天增量拉所有 836+ constituents，确保 drill_snapshot 不再用 stale fallback
+    scheduler.add_job(
+        job_pull_constituent_prices,
+        "cron",
+        hour=21,
+        minute=0,
+        id="constituent_prices",
+        name="指数成分股收盘价拉取",
+        max_instances=1,
+        misfire_grace_time=1800,
     )
 
     scheduler.start()

@@ -52,7 +52,19 @@ frontend/.env*
 # Temp/debug scripts (one-off, not core code)
 backend/_*.py
 backend/backup_*.sql
+backend/scripts/_*.py
 backend/scripts/verify_*.py
-backend/scripts/check_fund_nav.py
-backend/scripts/pull_all_of_nav.py
+backend/scripts/check_*.py
 backend/scripts/regenerate_*.py
+backend/scripts/pull_all_of_nav.py
+
+# Auth credentials / response dumps (do NOT commit)
+cookies_*.txt
+cookies_*.json
+converted_resp.json
+summary_resp.json
+session.xml
+*.cookies
+
+# One-off SQL debug queries
+_check_*.sql

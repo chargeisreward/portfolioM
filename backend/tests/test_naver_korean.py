@@ -25,8 +25,13 @@ def test_fetch_naver_korean_info_returns_pe_and_market_cap():
     fake_resp.status_code = 200
     fake_resp.json.return_value = fake_body
 
-    with patch.object(price_data, "naver_get", return_value=fake_resp):
+    with patch.object(price_data, "naver_get", return_value=fake_resp) as mock_naver_get:
         out = price_data._fetch_naver_korean_info("005930")
+
+    mock_naver_get.assert_called_once_with(
+        "https://m.stock.naver.com/api/stock/005930/integration",
+        timeout=5.0,
+    )
 
     assert out is not None
     assert out["source"] == "naver"

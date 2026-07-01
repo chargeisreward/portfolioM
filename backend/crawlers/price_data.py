@@ -549,7 +549,8 @@ def _fetch_naver_korean_info(code: str) -> dict | None:
     url = f"https://m.stock.naver.com/api/stock/{raw}/integration"
     try:
         resp = naver_get(url, timeout=5.0)
-    except Exception:
+    except Exception as e:
+        logger.warning("Naver Korean info: HTTP call failed for %s: %s", code, e)
         return None
 
     if not resp or resp.status_code != 200:
@@ -557,7 +558,8 @@ def _fetch_naver_korean_info(code: str) -> dict | None:
 
     try:
         body = resp.json()
-    except Exception:
+    except Exception as e:
+        logger.warning("Naver Korean info: JSON parse failed for %s: %s", code, e)
         return None
 
     info = body.get("stockInfo", {}) if isinstance(body, dict) else {}

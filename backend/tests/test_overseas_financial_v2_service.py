@@ -164,3 +164,50 @@ def test_fetch_tencent_group_escalates_rate_limited():
                       side_effect=FakePvTooError("pvtoo.match captcha required")):
         with pytest.raises(RateLimitedError):
             _fetch_tencent_group(["NVDA"])
+
+
+def test_top_level_entry_writes_to_both_tables():
+    """顶层入口：fetch+upsert 双写 OverseasShareFinancialSnapshot + StockInfoCache。"""
+    from services.overseas_financial_v2_service import fetch_overseas_financials_three_source
+    from unittest.mock import MagicMock, patch
+    from datetime import date
+
+    db = MagicMock()
+
+    with patch("services.overseas_financial_v2_service.collect_codes",
+               return_value=({"NVDA"}, 49)) as m_collect, \
+         patch("services.overseas_financial_v2_service._partition_codes_by_source",
+               return_value={"tencent_quote": ["NVDA"], "naver_quote": [], "yfinance": []}) as m_part, \
+         patch("services.overseas_financial_v2_service._fetch_in_batches",
+               return_value=({"NVDA": {"pe_ttm": 30.0, "source": "tencent"}}, [], False)) as m_fetch, \
+         patch("services.overseas_financial_v2_service.upsert_overseas_financial",
+               return_value={"status": "ok"}) as m_upsert, \
+         patch("services.overseas_financial_v2_service._dual_write_stock_info_cache") as m_dual:
+        result = fetch_overseas_financials_three_source(db, date(2026, 6, 29))
+
+    m_collect.assert_called_once()
+    m_upsert.assert_called_once()
+    m_dual.assert_called_once_with(db, "NVDA", {"pe_ttm": 30.0, "source": "tencent"})
+    assert result["fetched"] == 1
+    assert result["stored"] == 1
+    assert result["skipped_cached"] == 49
+    assert result["rate_limited"] is False
+
+
+def test_top_level_entry_skipped_all_returns_empty():
+    """全部 code 当日已落库 → 早返回，不调 fetch。"""
+    from services.overseas_financial_v2_service import fetch_overseas_financials_three_source
+    from unittest.mock import MagicMock, patch
+    from datetime import date
+
+    db = MagicMock()
+
+    with patch("services.overseas_financial_v2_service.collect_codes",
+               return_value=(set(), 50)), \
+         patch("services.overseas_financial_v2_service._fetch_in_batches") as m_fetch:
+        result = fetch_overseas_financials_three_source(db, date(2026, 6, 29))
+
+    m_fetch.assert_not_called()
+    assert result["fetched"] == 0
+    assert result["stored"] == 0
+    assert result["skipped_cached"] == 50

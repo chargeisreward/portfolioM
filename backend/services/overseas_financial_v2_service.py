@@ -413,3 +413,136 @@ def _is_tencent_rate_limited(e: Exception) -> bool:
     return any(s in msg for s in [
         "pvtoo", "captcha", "sorry/index", "verify", "too frequent", "rate limit"
     ])
+
+
+# ---------- 顶层入口（hourly job 调用） ----------
+
+
+def fetch_overseas_financials_three_source(db, as_of_date: date) -> dict:
+    """三源顶层入口：collect → route → fetch → upsert + 双写 StockInfoCache。
+
+    Returns: {
+        'status': 'ok' | 'rate_limited' | 'error',
+        'fetched': int, 'stored': int,
+        'errors': list[str],
+        'skipped_cached': int,
+        'rate_limited': bool,
+        'llm_calls': int,
+    }
+    """
+    todo, skipped_cached = collect_codes(db, as_of_date)
+    if not todo:
+        return {
+            "status": "ok", "fetched": 0, "stored": 0, "errors": [],
+            "skipped_cached": skipped_cached, "rate_limited": False,
+            "llm_calls": 0,
+        }
+
+    partitioned = _partition_codes_by_source(list(todo))
+
+    try:
+        results, errors, _rate_limited = _fetch_in_batches(db, partitioned, as_of_date)
+    except RateLimitedError as e:
+        logger.warning("overseas_hourly_v2 整批被限流，放弃本次: %s", e)
+        return {
+            "status": "rate_limited", "fetched": 0, "stored": 0,
+            "errors": [str(e)], "skipped_cached": skipped_cached,
+            "rate_limited": True, "llm_calls": 0,
+        }
+    except Exception as e:
+        logger.error("overseas_hourly_v2 异常: %s", e, exc_info=True)
+        return {
+            "status": "error", "fetched": 0, "stored": 0,
+            "errors": [str(e)], "skipped_cached": skipped_cached,
+            "rate_limited": False, "llm_calls": 0,
+        }
+
+    # Upsert: 复用 sub-project 3 的 overseas_financial_service
+    stored = 0
+    for code, metrics in results.items():
+        try:
+            data = {
+                "stock_code": code,
+                "stock_name": metrics.get("name", ""),
+                "market": metrics.get("market", _infer_market(code)),
+                "pe_ttm": metrics.get("pe_ttm"),
+                "pb_mrq": metrics.get("pb_mrq"),
+                "ps_ttm": metrics.get("ps_ttm"),
+                "dividend_yield": metrics.get("dividend_yield"),
+                "market_cap": metrics.get("market_cap"),
+                "eps_fy1": metrics.get("eps_fy1"),
+                "sector": metrics.get("sector"),
+                "industry": metrics.get("industry"),
+                "as_of_date": as_of_date,
+                "source": metrics.get("source", "yfinance"),
+            }
+            upsert_overseas_financial(db, data)
+            stored += 1
+
+            # 双写 StockInfoCache（保留 sub-project 3 路径，向后兼容）
+            _dual_write_stock_info_cache(db, code, metrics)
+        except Exception as e:
+            errors.append(f"upsert [{code}]: {e}")
+            logger.warning("upsert failed for %s: %s", code, e)
+            continue
+
+    return {
+        "status": "ok",
+        "fetched": len(results), "stored": stored, "errors": errors,
+        "skipped_cached": skipped_cached, "rate_limited": False,
+        "llm_calls": 0,
+    }
+
+
+def _dual_write_stock_info_cache(db, code: str, metrics: dict) -> None:
+    """sub-project 3 上游 StockInfoCache 保留写。
+
+    复用 sub-project 3 的逻辑：从 metrics 合并到 data_json，更新 updated_at。
+    """
+    try:
+        from models import StockInfoCache
+        from datetime import datetime as _dt
+
+        existing = db.query(StockInfoCache).filter(
+            StockInfoCache.stock_code == code
+        ).first()
+
+        merged = {
+            "name": metrics.get("name"),
+            "pe_ttm": metrics.get("pe_ttm"),
+            "pb_mrq": metrics.get("pb_mrq"),
+            "ps_ttm": metrics.get("ps_ttm"),
+            "dividend_yield": metrics.get("dividend_yield"),
+            "market_cap_b": metrics.get("market_cap"),
+            "source": metrics.get("source", "yfinance"),
+        }
+        merged = {k: v for k, v in merged.items() if v is not None}
+
+        if existing:
+            current = existing.data_json or {}
+            current.update(merged)
+            existing.data_json = current
+            existing.stock_name = merged.get("name", existing.stock_name) or existing.stock_name
+            existing.updated_at = _dt.utcnow()
+        else:
+            db.add(StockInfoCache(
+                stock_code=code,
+                stock_name=merged.get("name", ""),
+                data_json=merged,
+                updated_at=_dt.utcnow(),
+            ))
+    except Exception as e:
+        logger.warning("dual_write StockInfoCache failed for %s: %s", code, e)
+
+
+def _infer_market(code: str) -> str:
+    """复用 crawlers.price_data 的 market 推断。"""
+    try:
+        from crawlers.price_data import _infer_market_from_ticker
+        return _infer_market_from_ticker(code)
+    except ImportError:
+        return "US"
+
+
+# 复用 sub-project 3 的 upsert（直接 import）
+from services.overseas_financial_service import upsert_overseas_financial  # noqa: E402

@@ -245,6 +245,7 @@ class PriceCache(Base):
     source = Column(String(20))  # tencent / yfinance / akshare / intraday
     change_pct = Column(Float, nullable=True)  # 盘中实时涨跌幅% (intraday)
     created_at = Column(DateTime, default=datetime.utcnow)
+    updated_at = Column(DateTime, nullable=True, onupdate=datetime.utcnow)  # UPSERT 时显式设置（onupdate 不触发 bulk UPSERT）
 
 
 class StockInfoCache(Base):

@@ -99,6 +99,10 @@ def init_db():
         ("data_pull_task", "planned_count", "INTEGER"),
         ("data_pull_task", "success_count", "INTEGER"),
         ("data_pull_task", "coverage_rate", "FLOAT"),
+        # === 2026-07-01 PriceCache 数据新鲜度跟踪 ===
+        # UPSERT 不更新 created_at，新增 updated_at 反映真实"最近一次 upsert 时间"
+        # _upsert_change_pct 显式设置 updated_at = datetime.utcnow()
+        ("price_cache", "updated_at", "TIMESTAMP"),
     ]
     from sqlalchemy import inspect
     insp = inspect(engine)

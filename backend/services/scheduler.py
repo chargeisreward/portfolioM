@@ -413,8 +413,11 @@ def _upsert_change_pct(
     change_pct: float,
 ):
     """UPSERT change_pct：同 (stock_code, trade_date) 已存在则 UPDATE，否则 INSERT。
-    避免一天内同一 code 插入多行（PriceCache 无 UNIQUE 约束）。"""
+    避免一天内同一 code 插入多行（PriceCache 无 UNIQUE 约束）。
+    updated_at 在 UPSERT 两路都显式设置（onupdate 不触发 bulk UPSERT）。
+    """
     try:
+        now = datetime.utcnow()
         existing = db.query(PriceCache).filter(
             PriceCache.stock_code == stock_code,
             PriceCache.trade_date == trade_date,
@@ -422,12 +425,15 @@ def _upsert_change_pct(
         if existing:
             existing.change_pct = change_pct
             existing.source = "intraday"
+            existing.updated_at = now
         else:
             db.add(PriceCache(
                 stock_code=stock_code,
                 trade_date=trade_date,
                 change_pct=change_pct,
                 source="intraday",
+                created_at=now,
+                updated_at=now,
             ))
     except Exception as e:
         logger.warning("UPSERT change_pct 失败 [%s]: %s", stock_code, e)

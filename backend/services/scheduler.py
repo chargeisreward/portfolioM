@@ -18,6 +18,10 @@ from database import SessionLocal
 from models import Holding, PriceCache, StockInfoCache, AssetType, FullHoldingSnapshot, FundDailyNav, TradingCalendar, IndexConstituentSnapshot, SecurityMaster, FundIndexMap
 from services.data_pull_task_service import record_task_start, record_task_finish
 from services.fund_nav_fetcher import fetch_nav_all as _raw_fetch_nav_all, parse_nav_row as _parse_nav_row
+from services.overseas_financial_v2_service import (
+    fetch_overseas_financials_three_source,
+    RateLimitedError,
+)
 
 
 def fetch_nav_all(fund_code: str, start: str, end: str, **kw):
@@ -1401,6 +1405,21 @@ def start_scheduler():
         misfire_grace_time=1800,
     )
 
+    # 任务15：海外财务数据 hourly v2（spec 2026-06-29）— 每小时整点后 23 分错峰
+    # 三源（腾讯/US+港 + Naver/KR + yfinance/其他 + LLM 兜底）持续刷新所有用户持有的海外证券
+    # 限流温和退化 + 个股级当日跳过；sub-project 3 的 07:00/19:00 cron 作为兜底保留
+    scheduler.add_job(
+        job_refresh_overseas_financials_hourly,
+        "cron",
+        hour="*",
+        minute=23,
+        id="overseas_financials_hourly_v2",
+        name="海外财务三源 hourly",
+        max_instances=1,
+        misfire_grace_time=600,
+        replace_existing=True,
+    )
+
     scheduler.start()
     logger.info(
         "调度器已启动，注册 %d 个定时任务",
@@ -1664,3 +1683,39 @@ def trigger_job(db: Session, job_id: str, triggered_by: str = "manual", **kwargs
         return {"status": "error", "job_id": job_id, "message": str(e)[:300]}
     finally:
         _triggered_by_ctx.reset(token)
+
+
+# ---------- 海外财务数据 hourly v2（spec 2026-06-29）----------
+
+
+@track_run("overseas_financials_hourly_v2")
+def job_refresh_overseas_financials_hourly():
+    """Hourly 触发：跨用户并集去重 + 个股级当日跳过 + 三源拉取 + 限流温和退化。
+
+    复用 sub-project 3 的 overseas_financial_service 做 upsert + StockInfoCache 双写。
+    """
+    from database import SessionLocal
+    from datetime import date as _date
+
+    db = SessionLocal()
+    try:
+        result = fetch_overseas_financials_three_source(db, _date.today())
+        logger.info(
+            "overseas_financials_hourly_v2: status=%s fetched=%d stored=%d "
+            "skipped=%d rate_limited=%s errors=%d",
+            result["status"], result["fetched"], result["stored"],
+            result["skipped_cached"], result["rate_limited"],
+            len(result["errors"]),
+        )
+        if result["errors"][:5]:
+            logger.warning("overseas_financials_hourly_v2 errors (first 5): %s",
+                           result["errors"][:5])
+        return result
+    except Exception as e:
+        logger.error("overseas_financials_hourly_v2 任务异常: %s", e, exc_info=True)
+        return {"status": "error", "error": str(e)}
+    finally:
+        try:
+            db.close()
+        except Exception:
+            pass

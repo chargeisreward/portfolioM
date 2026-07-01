@@ -69,7 +69,7 @@ def test_resolve_overseas_quote_code_llm_fallback_used_when_heuristic_fails():
         with patch("crawlers.price_data.fetch_tencent_quote", return_value={"pe_ttm": 25.0}):
             out = resolve_overseas_quote_code("META", "tencent_quote", db)
     assert out == "usMETA"
-    assert m_llm.call_count <= 1  # 单 code 至少跑了 1 次 LLM
+    assert m_llm.call_count >= 1  # 启发式失败 → LLM 必须被调用
 
 
 def test_resolve_overseas_quote_code_max_three_llm_rounds():

@@ -101,6 +101,7 @@ def collect_codes(db, today: date) -> tuple[set[str], int]:
 # ---------- LLM 兜底映射 ----------
 
 MAX_LLM_ROUNDS = 3  # 单 code 最多 3 轮 LLM 调用（spec §5.4）
+MAX_CANDIDATES_PER_ROUND = 2  # 每轮 LLM 给候选试前 2 个（限制 verification 成本）
 
 
 def resolve_overseas_quote_code(
@@ -108,10 +109,10 @@ def resolve_overseas_quote_code(
     api_strategy: str,  # 'tencent_quote' | 'naver_quote'
     db,
 ) -> str | None:
-    """三源决策后的代码解析：DB → 启发式 → raw probe → LLM 兜底（最多 3 轮）。
+    """三源决策后的代码解析：DB → 启发式 → LLM 兜底（最多 3 轮，每轮先验真）。
 
-    复用 sub-project 3 起的 code_map 服务 + 即将在 cron 卡顿修复 plan
-    落地的 resolve_tencent_quote_code 设计骨架。
+    为什么不直接复用 code_map.resolve_tencent_quote_code：本函数是 hourly v2 cron
+    专用，需要支持 api_strategy='naver_quote'（code_map 版本只覆盖 tencent_quote）。
 
     Returns: 解析后的目标代码（如 'usNVDA'）或 None（全部失败）。
     """
@@ -125,21 +126,18 @@ def resolve_overseas_quote_code(
     if heur:
         return heur
 
-    # 阶段 3: raw probe（直接调腾讯/Naver 看是否非空返回）
-    # 阶段 4: LLM 兜底（最多 3 轮）
+    # 阶段 3: LLM 兜底（最多 3 轮，每轮候选先 verifier 验真）
     verifier = _VERIFIERS.get(api_strategy)
     if verifier is None:
         logger.warning("unknown api_strategy: %s", api_strategy)
         return None
 
     for round_idx in range(MAX_LLM_ROUNDS):
-        candidates = _llm_get_candidates(code_in, api_strategy,
-                                         api_strategy_hint=api_strategy,
-                                         round_idx=round_idx)
+        candidates = _llm_get_candidates(code_in, api_strategy, round_idx=round_idx)
         if not candidates:
             break
 
-        for cand in candidates[:2]:  # 每轮 LLM 给多个候选，试前 2 个
+        for cand in candidates[:MAX_CANDIDATES_PER_ROUND]:
             try:
                 if verifier(cand):
                     # 成功 → 持久化到 api_code_map
@@ -154,7 +152,7 @@ def resolve_overseas_quote_code(
 
 
 def _llm_get_candidates(code_in: str, api_strategy: str,
-                        api_strategy_hint: str = "", round_idx: int = 0) -> list[str]:
+                        round_idx: int = 0) -> list[str]:
     """调 LLM 获取候选 ticker 列表。空 list = LLM 也不确定。"""
     try:
         # 复用 services/llm_service.py 的 OpenAI-compatible client
@@ -169,7 +167,7 @@ def _llm_get_candidates(code_in: str, api_strategy: str,
             "请只返回 JSON：{\"candidates\": [\"...\"], \"reason\": \"...\"}"
         )
         user_prompt = (
-            f'给定用户证券代码 "{code_in}"（持仓写法），已知数据源 {api_strategy_hint}。\n'
+            f'给定用户证券代码 "{code_in}"（持仓写法），已知数据源 {api_strategy}。\n'
             f'本轮（{round_idx + 1}/{MAX_LLM_ROUNDS}）请列出最可能的 ticker 候选。\n'
             f'输出纯 JSON: {{"candidates": ["..."], "reason": "..."}}'
         )

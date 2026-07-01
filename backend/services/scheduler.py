@@ -1694,7 +1694,6 @@ def job_refresh_overseas_financials_hourly():
 
     复用 sub-project 3 的 overseas_financial_service 做 upsert + StockInfoCache 双写。
     """
-    from database import SessionLocal
     from datetime import date as _date
 
     db = SessionLocal()
@@ -1719,3 +1718,10 @@ def job_refresh_overseas_financials_hourly():
             db.close()
         except Exception:
             pass
+
+
+# 注册到 JOB_DISPATCH（必须在函数定义之后）
+JOB_DISPATCH["overseas_financials_hourly_v2"] = {
+    "name": "海外财务三源 hourly",
+    "func": job_refresh_overseas_financials_hourly,
+}

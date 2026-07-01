@@ -16,7 +16,7 @@ from datetime import date, datetime
 from typing import Optional
 
 from config import TENCENT_USER_AGENT, TENCENT_QUOTE_URL, TENCENT_KLINE_URL
-from crawlers._http import tencent_get
+from crawlers._http import naver_get, tencent_get
 
 logger = logging.getLogger(__name__)
 
@@ -525,3 +525,69 @@ def _safe_float(parts: list, idx: int) -> float | None:
         return float(val.replace(",", "")) if val else None
     except (ValueError, AttributeError):
         return None
+
+
+# ---------- Naver Mobile API（韩股，主源） ----------
+
+def _fetch_naver_korean_info(code: str) -> dict | None:
+    """Naver Mobile API: 韩股单股行情 + PE。
+
+    URL: https://m.stock.naver.com/api/stock/{code}/integration
+    Returns: {code, name, price, pe_ttm, market_cap, source='naver'} 或 None（被反爬/超时）
+    """
+    # naver_get 在模块顶层 import（crawlers._http）— 测试通过 patch.object 拦截
+    # code 容错：剥离 .KS / .KQ 后缀（Naver URL 只接受纯 6 位数字）
+    raw = code.strip()
+    for suffix in (".KS", ".KQ"):
+        if raw.endswith(suffix):
+            raw = raw[:-3]
+            break
+
+    if not raw.isdigit() or len(raw) != 6:
+        return None
+
+    url = f"https://m.stock.naver.com/api/stock/{raw}/integration"
+    try:
+        resp = naver_get(url, timeout=5.0)
+    except Exception:
+        return None
+
+    if not resp or resp.status_code != 200:
+        return None
+
+    try:
+        body = resp.json()
+    except Exception:
+        return None
+
+    info = body.get("stockInfo", {}) if isinstance(body, dict) else {}
+    if not info:
+        return None
+
+    pe_raw = info.get("per")
+    try:
+        pe_ttm = float(pe_raw) if pe_raw not in (None, "", "-") else None
+    except (ValueError, TypeError):
+        pe_ttm = None
+
+    try:
+        market_cap = float(info.get("marketValueOpenShares", "") or 0)
+    except (ValueError, TypeError):
+        market_cap = None
+
+    try:
+        price = float(info.get("closePrice", "") or 0) or None
+    except (ValueError, TypeError):
+        price = None
+
+    if not any([pe_ttm, market_cap, price]):
+        return None
+
+    return {
+        "code": code,
+        "name": info.get("stockName", ""),
+        "price": price,
+        "pe_ttm": pe_ttm,
+        "market_cap": market_cap,
+        "source": "naver",
+    }

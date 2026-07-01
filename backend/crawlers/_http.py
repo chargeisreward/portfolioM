@@ -283,3 +283,46 @@ def shutdown_clients():
             except Exception:
                 pass
     _em_client = _tencent_client = _ths_client = None
+
+
+# ---------- Naver Mobile API（韩股） ----------
+
+
+def naver_get(
+    url: str,
+    params: dict | None = None,
+    timeout: float = 5.0,
+    max_retries: int = 1,
+) -> httpx.Response | None:
+    """Naver Mobile API 调用（带 Mobile UA，避开桌面版反爬）。
+
+    节流较轻（Naver Mobile 无强制节流），但仍预留 max_retries=1 防偶发断连。
+    """
+    headers = {
+        "User-Agent": "Mozilla/5.0 (Linux; Android 13) AppleWebKit/537.36 "
+                      "(KHTML, like Gecko) Chrome/120.0.0.0 Mobile Safari/537.36",
+        "Accept": "application/json",
+    }
+    last_exc: Exception | None = None
+    for attempt in range(max_retries + 1):
+        try:
+            with httpx.Client(headers=headers, timeout=httpx.Timeout(timeout, connect=3.0)) as client:
+                resp = client.get(url, params=params)
+                if resp.status_code == 200:
+                    return resp
+                if resp.status_code in (403, 429, 503):
+                    if attempt < max_retries:
+                        time.sleep(1.0)
+                        continue
+                return resp
+        except (httpx.ConnectError, httpx.ReadTimeout, httpx.ConnectTimeout) as e:
+            last_exc = e
+            if attempt < max_retries:
+                time.sleep(1.0)
+                continue
+            return None
+        except Exception as e:
+            logger.error("naver_get 异常: %s", e)
+            return None
+    logger.warning("naver_get 重试失败: %s", last_exc)
+    return None

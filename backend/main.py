@@ -6054,6 +6054,13 @@ def admin_refresh_overseas_financials(db: Session = Depends(get_db)):
     return result
 
 
+@app.post("/api/admin/overseas-financials/refresh-v2")
+def admin_refresh_overseas_financials_v2(db: Session = Depends(get_db)):
+    """手动触发海外财务数据 v2（hourly 主路径；不破坏 sub-project 3 端点）。"""
+    from services.overseas_financial_v2_service import fetch_overseas_financials_three_source
+    return fetch_overseas_financials_three_source(db, date.today())
+
+
 # ==================== 交易记录驱动的持仓重建 (2026-06-26) ====================
 
 @app.post("/api/trades/parse", response_model=TradeParseResponse)

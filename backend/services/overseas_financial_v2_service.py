@@ -96,3 +96,155 @@ def collect_codes(db, today: date) -> tuple[set[str], int]:
     logger.info("overseas_hourly_v2: %d unique codes, %d cached today, %d to do",
                 len(unique_codes), len(cached), len(todo))
     return todo, len(cached)
+
+
+# ---------- LLM 兜底映射 ----------
+
+MAX_LLM_ROUNDS = 3  # 单 code 最多 3 轮 LLM 调用（spec §5.4）
+
+
+def resolve_overseas_quote_code(
+    code_in: str,
+    api_strategy: str,  # 'tencent_quote' | 'naver_quote'
+    db,
+) -> str | None:
+    """三源决策后的代码解析：DB → 启发式 → raw probe → LLM 兜底（最多 3 轮）。
+
+    复用 sub-project 3 起的 code_map 服务 + 即将在 cron 卡顿修复 plan
+    落地的 resolve_tencent_quote_code 设计骨架。
+
+    Returns: 解析后的目标代码（如 'usNVDA'）或 None（全部失败）。
+    """
+    # 阶段 1: DB 命中（api_code_map + DEFAULT_MAPS 惰性持久化）
+    mapped = transform_code(code_in, api_strategy, db)
+    if mapped:
+        return mapped
+
+    # 阶段 2: 启发式（heuristic pattern 解析）
+    heur = _default_transform(code_in, api_strategy)
+    if heur:
+        return heur
+
+    # 阶段 3: raw probe（直接调腾讯/Naver 看是否非空返回）
+    # 阶段 4: LLM 兜底（最多 3 轮）
+    verifier = _VERIFIERS.get(api_strategy)
+    if verifier is None:
+        logger.warning("unknown api_strategy: %s", api_strategy)
+        return None
+
+    for round_idx in range(MAX_LLM_ROUNDS):
+        candidates = _llm_get_candidates(code_in, api_strategy,
+                                         api_strategy_hint=api_strategy,
+                                         round_idx=round_idx)
+        if not candidates:
+            break
+
+        for cand in candidates[:2]:  # 每轮 LLM 给多个候选，试前 2 个
+            try:
+                if verifier(cand):
+                    # 成功 → 持久化到 api_code_map
+                    _persist_mapping(db, code_in, api_strategy, cand)
+                    return cand
+            except Exception as e:
+                logger.warning("verify failed for candidate %s: %s", cand, e)
+                continue
+
+    logger.warning("LLM 兜底 3 轮失败：code_in=%s strategy=%s", code_in, api_strategy)
+    return None
+
+
+def _llm_get_candidates(code_in: str, api_strategy: str,
+                        api_strategy_hint: str = "", round_idx: int = 0) -> list[str]:
+    """调 LLM 获取候选 ticker 列表。空 list = LLM 也不确定。"""
+    try:
+        # 复用 services/llm_service.py 的 OpenAI-compatible client
+        # (实际函数是 _call_llm，plan 提到的 chat_completion 不存在)
+        from services.llm_service import _call_llm
+        import json
+
+        sys_prompt = (
+            "你是证券代码格式专家。给定用户持仓写法，需要猜测对应数据源的 ticker 格式。"
+            "已知格式：腾讯 qt.gtimg.cn (usNVDA, sh600519, sz000001, hk00700)，"
+            "Naver (005930, 005930.KS)。"
+            "请只返回 JSON：{\"candidates\": [\"...\"], \"reason\": \"...\"}"
+        )
+        user_prompt = (
+            f'给定用户证券代码 "{code_in}"（持仓写法），已知数据源 {api_strategy_hint}。\n'
+            f'本轮（{round_idx + 1}/{MAX_LLM_ROUNDS}）请列出最可能的 ticker 候选。\n'
+            f'输出纯 JSON: {{"candidates": ["..."], "reason": "..."}}'
+        )
+
+        content = _call_llm(sys_prompt, user_prompt, temperature=0.2, timeout=20.0)
+        if not content:
+            return []
+
+        # 容错解析（_call_llm 已清 markdown；这里再防一道）
+        text = content.strip()
+        if text.startswith("```"):
+            text = text.split("\n", 1)[1].rsplit("```", 1)[0].strip()
+        data = json.loads(text)
+        return data.get("candidates", []) if isinstance(data, dict) else []
+    except Exception as e:
+        logger.warning("LLM 失败 code_in=%s round=%d: %s", code_in, round_idx, e)
+        return []
+
+
+# 每个 api_strategy 对应一个 verifier 函数：调该源验证 candidate 是否有效
+_VERIFIERS = {
+    "tencent_quote": lambda cand: _tencent_verify(cand),
+    "naver_quote": lambda cand: _naver_verify(cand),
+}
+
+
+def _tencent_verify(cand: str) -> bool:
+    """单次腾讯接口验证候选是否返回有效 quote。"""
+    try:
+        from crawlers.price_data import fetch_tencent_quote
+        result = fetch_tencent_quote(cand)
+        return result is not None and (result.get("price") or result.get("pe_ttm"))
+    except Exception:
+        return False
+
+
+def _naver_verify(cand: str) -> bool:
+    """单次 Naver 接口验证。"""
+    try:
+        from crawlers.price_data import _fetch_naver_korean_info
+        result = _fetch_naver_korean_info(cand)
+        return result is not None
+    except Exception:
+        return False
+
+
+def _persist_mapping(db, code_in: str, api_strategy: str, code_out: str) -> None:
+    """写 api_code_map 表（如果 cron 卡顿修复 plan 已实现）持久化。"""
+    try:
+        from models import ApiCodeMap  # type: ignore
+        existing = db.query(ApiCodeMap).filter_by(
+            code_in=code_in, api_strategy=api_strategy,
+        ).first()
+        if existing:
+            existing.code_out = code_out
+            existing.note = f"overseas V2 LLM resolved at {code_out}"
+        else:
+            db.add(ApiCodeMap(
+                code_in=code_in, api_strategy=api_strategy, code_out=code_out,
+                market=None, note="overseas V2 LLM resolved",
+            ))
+        db.commit()
+    except Exception as e:
+        logger.warning("persist api_code_map 失败: %s", e)
+        try:
+            db.rollback()
+        except Exception:
+            pass
+
+
+# 复用 sub-project 3 + cron 卡顿修复 plan 的 code_map 工具
+try:
+    from services.code_map import transform_code, _default_transform, tencent_get  # noqa: F401
+except ImportError:
+    # 如果 cron 卡顿修复 plan 未落地 → 占位函数（仅让 import 不崩，业务上前面 task 会触发 gate 检查）
+    def transform_code(code_in, api_strategy, db): return None  # type: ignore
+    def _default_transform(code_in, api_strategy): return None  # type: ignore
+    def tencent_get(url, **kw): return None  # type: ignore

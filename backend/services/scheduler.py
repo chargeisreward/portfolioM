@@ -1351,7 +1351,8 @@ def start_scheduler():
         id="intraday_change_pct",
         name="盘中实时涨跌幅抓取",
         max_instances=1,
-        misfire_grace_time=60,
+        coalesce=True,                                       # 多次错过合并成 1 次
+        misfire_grace_time=600,                              # 容许 10 min 内追跑（避免 Tencent 慢导致误判 misfire）
     )
 
     # 任务12：.OF 基金净值定时拉取 — 每日 7:00 / 20:30（增量补缺，直连东财 lsjz）

@@ -198,7 +198,10 @@ export default function OverviewPanel() {
   useEffect(() => {
     Promise.all([
       api.getHoldingsSummary().then(setSummary),
-      rawApi.get('/holdings').then(r => setAllHoldings(r.data||[])).catch(()=>{}),
+      // 2026-07-01 修主题构成 pie "时有时无"：raw /api/holdings 不带 type2，
+      // 会让 displayHoldings 短暂走 allHoldings 分支 → 全进 '其他' 桶。
+      // 改用 /api/holdings/converted 同步 type2 字段，displayHoldings 两条来源都带 type2。
+      api.getHoldingsConverted(currency).then(r => setAllHoldings(r||[])).catch(()=>{}),
       api.getPenetrationTable().then(setPenTable).catch(()=>{}),
       api.getValuation().then(setPe).catch(()=>{}),
       api.getGrowthAnalysis().then(setGrowth).catch(()=>{}),

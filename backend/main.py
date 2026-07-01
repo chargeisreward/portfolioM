@@ -2822,9 +2822,32 @@ from services.aggregation import (
 
 
 @app.get("/api/data-version")
-def get_data_version(db: Session = Depends(get_db)):
-    """当前活跃业务日期 + 各市场最新股价日期 + 历史可用版本。"""
+def get_data_version(request: Request, db: Session = Depends(get_db)):
+    """当前活跃业务日期 + 各市场最新股价日期 + 历史可用版本。
+
+    2026-07-01：admin + view_as=X 时，覆盖 current_business_date 为 view_as 用户
+    的最新 ValuationDailySnapshot 日期，避免 admin 自己的旧版日期（5/29）
+    导致 OverviewPanel 的 KPI 卡片长期显示陈旧数据。
+    """
     biz = current_business_date()
+    # 2026-07-01：admin + view_as=X 时，覆盖 current_business_date 为 view_as 用户
+    # 的最新 ValuationDailySnapshot 日期，避免 admin 自己的旧版日期（5/29）让
+    # OverviewPanel 的 KPI 卡片长期显示陈旧数据（如科技占比卡在 40.7%）。
+    try:
+        from middleware.auth import _resolve_eff_from_request
+        from models import ValuationDailySnapshot
+        from sqlalchemy import func as _func
+        _u, eff_uid = _resolve_eff_from_request(request, db)
+        if eff_uid is not None:
+            user_max = db.query(_func.max(ValuationDailySnapshot.as_of_date)).filter(
+                ValuationDailySnapshot.user_id == eff_uid,
+            ).scalar()
+            if user_max and (biz is None or user_max > biz):
+                biz = user_max
+    except Exception as _e:
+        import logging
+        logging.getLogger(__name__).warning("data-version view_as override failed: %s", _e)
+
     versions = list_available_versions()
     # Latest price date per market from snapshots (best-effort)
     from models import AShareFinancialSnapshot, HKShareFinancialSnapshot, PriceCache

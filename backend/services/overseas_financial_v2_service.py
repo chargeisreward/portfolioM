@@ -9,7 +9,15 @@
 from __future__ import annotations
 
 import logging
+import time
 from datetime import date
+
+from crawlers.price_data import (
+    fetch_tencent_quote,
+    fetch_yfinance_info,
+    _fetch_naver_korean_info,
+    NaverRateLimited,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -102,6 +110,9 @@ def collect_codes(db, today: date) -> tuple[set[str], int]:
 
 MAX_LLM_ROUNDS = 3  # 单 code 最多 3 轮 LLM 调用（spec §5.4）
 MAX_CANDIDATES_PER_ROUND = 2  # 每轮 LLM 给候选试前 2 个（限制 verification 成本）
+
+_NAVER_THROTTLE_SEC = 0.5  # Naver Mobile API 反爬节奏
+_YFINANCE_THROTTLE_SEC = 3.0  # yfinance 3s/call 防 429
 
 
 def resolve_overseas_quote_code(
@@ -309,7 +320,6 @@ def _fetch_tencent_group(codes: list[str]) -> tuple[dict[str, dict], list[str]]:
     """
     errors: list[str] = []
     out: dict[str, dict] = {}
-    from crawlers.price_data import fetch_tencent_quote
 
     for c in codes:
         try:
@@ -342,8 +352,6 @@ def _fetch_naver_group(codes: list[str]) -> tuple[dict[str, dict], list[str]]:
     """Naver 逐个调用（韩股数量小）。"""
     errors: list[str] = []
     out: dict[str, dict] = {}
-    from crawlers.price_data import _fetch_naver_korean_info
-    import time
 
     for c in codes:
         try:
@@ -355,13 +363,13 @@ def _fetch_naver_group(codes: list[str]) -> tuple[dict[str, dict], list[str]]:
                     "name": q.get("name"),
                     "source": "naver",
                 }
+        except NaverRateLimited as e:
+            raise RateLimitedError(f"naver 503: {e}")
         except Exception as e:
-            if "503" in str(e) or "RateLimit" in type(e).__name__:
-                raise RateLimitedError(f"naver 503: {e}")
             errors.append(f"naver [{c}]: {e}")
             logger.warning("naver [%s] 拉取失败: %s", c, e)
             continue
-        time.sleep(0.5)  # Naver 反爬节奏
+        time.sleep(_NAVER_THROTTLE_SEC)  # Naver 反爬节奏
     return out, errors
 
 
@@ -369,8 +377,6 @@ def _fetch_yfinance_group(codes: list[str]) -> tuple[dict[str, dict], list[str]]
     """yfinance 逐个调用（PB/PS/股息率唯一来源）。"""
     errors: list[str] = []
     out: dict[str, dict] = {}
-    from crawlers.price_data import fetch_yfinance_info
-    import time
 
     for c in codes:
         try:
@@ -397,7 +403,7 @@ def _fetch_yfinance_group(codes: list[str]) -> tuple[dict[str, dict], list[str]]
             errors.append(f"yfinance [{c}]: {e}")
             logger.warning("yfinance [%s] 拉取失败: %s", c, e)
             continue
-        time.sleep(3)  # yfinance 3s/call 防 429
+        time.sleep(_YFINANCE_THROTTLE_SEC)  # yfinance 3s/call 防 429
     return out, errors
 
 

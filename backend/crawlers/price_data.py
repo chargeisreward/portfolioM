@@ -21,6 +21,10 @@ from crawlers._http import naver_get, tencent_get
 logger = logging.getLogger(__name__)
 
 
+class NaverRateLimited(Exception):
+    """Naver 503/429/anti-bot — caller should escalate to RateLimitedError."""
+
+
 # ---------- 腾讯财经 API（实时行情，首选） ----------
 
 def fetch_tencent_quote(ticker: str) -> dict | None:
@@ -554,6 +558,8 @@ def _fetch_naver_korean_info(code: str) -> dict | None:
         return None
 
     if not resp or resp.status_code != 200:
+        if resp is not None and resp.status_code in (403, 429, 503):
+            raise NaverRateLimited(f"naver HTTP {resp.status_code} for {code}")
         return None
 
     try:

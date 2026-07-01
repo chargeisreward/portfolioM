@@ -129,3 +129,38 @@ def test_fetch_in_batches_rate_limited_raises():
                side_effect=RateLimitedError("pvtoo.match")):
         with pytest.raises(RateLimitedError):
             _fetch_in_batches(db, partitioned, 50)
+
+
+def test_fetch_naver_group_escalates_naver_rate_limited():
+    """_fetch_naver_korean_info 抛 NaverRateLimited → _fetch_naver_group → RateLimitedError。
+
+    验证 503/429/anti-bot 路径不再是死代码。
+    """
+    import services.overseas_financial_v2_service as svc
+    from services.overseas_financial_v2_service import (
+        _fetch_naver_group, RateLimitedError,
+    )
+    from crawlers.price_data import NaverRateLimited
+    import pytest
+
+    with patch.object(svc, "_fetch_naver_korean_info",
+                      side_effect=NaverRateLimited("naver HTTP 503 for 005930.KS")):
+        with pytest.raises(RateLimitedError):
+            _fetch_naver_group(["005930.KS"])
+
+
+def test_fetch_tencent_group_escalates_rate_limited():
+    """fetch_tencent_quote 抛 rate-limit 特征异常 → _fetch_tencent_group → RateLimitedError。"""
+    import services.overseas_financial_v2_service as svc
+    from services.overseas_financial_v2_service import (
+        _fetch_tencent_group, RateLimitedError,
+    )
+    import pytest
+
+    class FakePvTooError(Exception):
+        """模拟腾讯 pvtoo.match 反爬异常。"""
+
+    with patch.object(svc, "fetch_tencent_quote",
+                      side_effect=FakePvTooError("pvtoo.match captcha required")):
+        with pytest.raises(RateLimitedError):
+            _fetch_tencent_group(["NVDA"])

@@ -266,7 +266,7 @@ def _fetch_in_batches(
     db,
     partitioned: dict[str, list[str]],
     as_of_date,  # date
-) -> tuple[dict[str, dict], list[str], bool]:
+) -> tuple[dict[str, dict], list[str]]:
     """三源并行拉取；任一组抛 RateLimitedError → 顶层抛出（退避）。
 
     Args:
@@ -274,8 +274,7 @@ def _fetch_in_batches(
         partitioned: {'tencent_quote': [...], 'naver_quote': [...], 'yfinance': [...]}
         as_of_date: 当前日期（保留接口一致；当前实现不使用）
 
-    Returns: ({user_code: metrics}, errors, rate_limited)
-        rate_limited=True 表示整批被限流（顶层决定是否退避）
+    Returns: ({user_code: metrics}, errors)
     """
     results: dict[str, dict] = {}
     errors: list[str] = []
@@ -310,7 +309,7 @@ def _fetch_in_batches(
     except RateLimitedError:
         raise
 
-    return results, errors, False
+    return results, errors
 
 
 def _fetch_tencent_group(codes: list[str]) -> tuple[dict[str, dict], list[str]]:
@@ -441,7 +440,7 @@ def fetch_overseas_financials_three_source(db, as_of_date: date) -> dict:
     partitioned = _partition_codes_by_source(list(todo))
 
     try:
-        results, errors, _rate_limited = _fetch_in_batches(db, partitioned, as_of_date)
+        results, errors = _fetch_in_batches(db, partitioned, as_of_date)
     except RateLimitedError as e:
         logger.warning("overseas_hourly_v2 整批被限流，放弃本次: %s", e)
         return {

@@ -107,9 +107,8 @@ def test_fetch_in_batches_merges_three_sources():
                return_value=({"SHEL.L": {"pe_ttm": 8.0, "pb_mrq": 1.2,
                                         "ps_ttm": 0.5, "dividend_yield": 0.04,
                                         "source": "yfinance"}}, [])) as m_y:
-        results, errors, rate_limited = _fetch_in_batches(db, partitioned, 50)
+        results, errors = _fetch_in_batches(db, partitioned, 50)
 
-    assert rate_limited is False
     assert results["NVDA"]["pe_ttm"] == 30.5
     assert results["005930.KS"]["pe_ttm"] == 12.0
     assert results["SHEL.L"]["pb_mrq"] == 1.2
@@ -179,7 +178,7 @@ def test_top_level_entry_writes_to_both_tables():
          patch("services.overseas_financial_v2_service._partition_codes_by_source",
                return_value={"tencent_quote": ["NVDA"], "naver_quote": [], "yfinance": []}) as m_part, \
          patch("services.overseas_financial_v2_service._fetch_in_batches",
-               return_value=({"NVDA": {"pe_ttm": 30.0, "source": "tencent"}}, [], False)) as m_fetch, \
+               return_value=({"NVDA": {"pe_ttm": 30.0, "source": "tencent"}}, [])) as m_fetch, \
          patch("services.overseas_financial_v2_service.upsert_overseas_financial",
                return_value={"status": "ok"}) as m_upsert, \
          patch("services.overseas_financial_v2_service._dual_write_stock_info_cache") as m_dual:

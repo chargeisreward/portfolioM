@@ -39,6 +39,13 @@ from sqlalchemy.orm import Session
 logger = logging.getLogger(__name__)
 
 
+# 已知美股 ticker（price_data.py 里 fetch_tencent_quote 用的列表；
+# 这些 ticker 没有 exchange suffix 但确实是美股）
+_KNOWN_US_TICKERS = frozenset({
+    "GOOGL", "NVDA", "INTC", "SNDK", "AMD", "AAPL", "MSFT", "AMZN", "TSLA", "QQQ",
+})
+
+
 def _classify_market(code: str | None, source_type: str | None = None) -> str:
     """按 code 后缀/前缀返回所属市场。
 
@@ -71,6 +78,12 @@ def _classify_market(code: str | None, source_type: str | None = None) -> str:
     if cl.startswith("hk"):
         return "hk"
     if cl.startswith("us"):
+        return "us"
+    # Plain alpha US tickers (price_data 已知列表 + 全大写 1-5 字母启发式)
+    if cu in _KNOWN_US_TICKERS:
+        return "us"
+    if cu.isalpha() and 1 <= len(cu) <= 5:
+        # 全字母、长度 1-5：A 股/港股不会有这种格式 → 视为美股
         return "us"
     return "unknown"
 

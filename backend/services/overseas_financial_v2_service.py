@@ -246,3 +246,164 @@ except ImportError:
     def transform_code(code_in, api_strategy, db): return None  # type: ignore
     def _default_transform(code_in, api_strategy): return None  # type: ignore
     def tencent_get(url, **kw): return None  # type: ignore
+
+
+# ---------- 三源并行 fetch（限流温和退化） ----------
+
+
+def _fetch_in_batches(
+    db,
+    partitioned: dict[str, list[str]],
+    as_of_date,  # date
+) -> tuple[dict[str, dict], list[str], bool]:
+    """三源并行拉取；任一组抛 RateLimitedError → 顶层抛出（退避）。
+
+    Args:
+        db: SQLAlchemy session（实际未使用，保留接口一致）
+        partitioned: {'tencent_quote': [...], 'naver_quote': [...], 'yfinance': [...]}
+        as_of_date: 当前日期（保留接口一致；当前实现不使用）
+
+    Returns: ({user_code: metrics}, errors, rate_limited)
+        rate_limited=True 表示整批被限流（顶层决定是否退避）
+    """
+    results: dict[str, dict] = {}
+    errors: list[str] = []
+
+    try:
+        if partitioned["tencent_quote"]:
+            tencent_results, tencent_errors = _fetch_tencent_group(
+                partitioned["tencent_quote"]
+            )
+            results.update(tencent_results)
+            errors.extend(tencent_errors)
+    except RateLimitedError:
+        raise  # 顶层捕获，整批退避
+
+    try:
+        if partitioned["naver_quote"]:
+            naver_results, naver_errors = _fetch_naver_group(
+                partitioned["naver_quote"]
+            )
+            results.update(naver_results)
+            errors.extend(naver_errors)
+    except RateLimitedError:
+        raise
+
+    try:
+        if partitioned["yfinance"]:
+            yf_results, yf_errors = _fetch_yfinance_group(
+                partitioned["yfinance"]
+            )
+            results.update(yf_results)
+            errors.extend(yf_errors)
+    except RateLimitedError:
+        raise
+
+    return results, errors, False
+
+
+def _fetch_tencent_group(codes: list[str]) -> tuple[dict[str, dict], list[str]]:
+    """腾讯逐个 quote（仅 PE 字段；批量端点无 PE）。
+
+    pe_ttm 在 fetch_tencent_quote 返回 dict 中是字符串（_safe_get），需要 float() 转换。
+    """
+    errors: list[str] = []
+    out: dict[str, dict] = {}
+    from crawlers.price_data import fetch_tencent_quote
+
+    for c in codes:
+        try:
+            q = fetch_tencent_quote(c)
+            if not q:
+                continue
+            pe_raw = q.get("pe_ttm")
+            if not pe_raw:
+                continue
+            try:
+                pe_ttm = float(pe_raw)
+            except (ValueError, TypeError):
+                continue
+            out[c] = {
+                "pe_ttm": pe_ttm,
+                "market_cap": q.get("market_cap"),
+                "name": q.get("name"),
+                "source": "tencent",
+            }
+        except Exception as e:
+            if _is_tencent_rate_limited(e):
+                raise RateLimitedError(f"tencent single quote: {e}")
+            errors.append(f"tencent [{c}]: {e}")
+            logger.warning("tencent [%s] 拉取失败: %s", c, e)
+            continue
+    return out, errors
+
+
+def _fetch_naver_group(codes: list[str]) -> tuple[dict[str, dict], list[str]]:
+    """Naver 逐个调用（韩股数量小）。"""
+    errors: list[str] = []
+    out: dict[str, dict] = {}
+    from crawlers.price_data import _fetch_naver_korean_info
+    import time
+
+    for c in codes:
+        try:
+            q = _fetch_naver_korean_info(c)
+            if q and q.get("pe_ttm"):
+                out[c] = {
+                    "pe_ttm": q["pe_ttm"],
+                    "market_cap": q.get("market_cap"),
+                    "name": q.get("name"),
+                    "source": "naver",
+                }
+        except Exception as e:
+            if "503" in str(e) or "RateLimit" in type(e).__name__:
+                raise RateLimitedError(f"naver 503: {e}")
+            errors.append(f"naver [{c}]: {e}")
+            logger.warning("naver [%s] 拉取失败: %s", c, e)
+            continue
+        time.sleep(0.5)  # Naver 反爬节奏
+    return out, errors
+
+
+def _fetch_yfinance_group(codes: list[str]) -> tuple[dict[str, dict], list[str]]:
+    """yfinance 逐个调用（PB/PS/股息率唯一来源）。"""
+    errors: list[str] = []
+    out: dict[str, dict] = {}
+    from crawlers.price_data import fetch_yfinance_info
+    import time
+
+    for c in codes:
+        try:
+            q = fetch_yfinance_info(c)
+            if not q:
+                errors.append(f"yfinance [{c}]: empty")
+                continue
+            row: dict = {"source": "yfinance"}
+            for k_in, k_out in [("pe_ttm", "pe_ttm"), ("pb_mrq", "pb_mrq"),
+                                 ("ps_ttm", "ps_ttm"),
+                                 ("dividend_yield", "dividend_yield"),
+                                 ("market_cap_b", "market_cap"),
+                                 ("eps_fy1", "eps_fy1"),
+                                 ("sector", "sector"),
+                                 ("industry", "industry"),
+                                 ("name", "name")]:
+                v = q.get(k_in)
+                if v is not None:
+                    row[k_out] = v
+            out[c] = row
+        except Exception as e:
+            if "RateLimit" in type(e).__name__ or "429" in str(e):
+                raise RateLimitedError(f"yfinance 429: {e}")
+            errors.append(f"yfinance [{c}]: {e}")
+            logger.warning("yfinance [%s] 拉取失败: %s", c, e)
+            continue
+        time.sleep(3)  # yfinance 3s/call 防 429
+    return out, errors
+
+
+def _is_tencent_rate_limited(e: Exception) -> bool:
+    """识别腾讯反爬限流特征。"""
+    msg = (str(e) + " " + type(e).__name__).lower()
+    return any(s in msg for s in [
+        "pvtoo", "captcha", "sorry/index", "verify", "too frequent", "rate limit"
+    ])

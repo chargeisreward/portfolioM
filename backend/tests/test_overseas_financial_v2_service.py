@@ -85,3 +85,47 @@ def test_resolve_overseas_quote_code_max_three_llm_rounds():
                return_value=[]):  # LLM 给空候选 / 验证失败
         out = resolve_overseas_quote_code("WEIRDCODE", "tencent_quote", db)
     assert out is None
+
+
+def test_fetch_in_batches_merges_three_sources():
+    """三源并行：tencent 提供 PE_1，naver 提供 PE_2，yfinance 提供 PB_1。"""
+    from services.overseas_financial_v2_service import _fetch_in_batches
+    db = MagicMock()
+
+    partitioned = {
+        "tencent_quote": ["NVDA", "AAPL"],
+        "naver_quote": ["005930.KS"],
+        "yfinance": ["SHEL.L"],
+    }
+
+    with patch("services.overseas_financial_v2_service._fetch_tencent_group",
+               return_value=({"NVDA": {"pe_ttm": 30.5, "source": "tencent"},
+                              "AAPL": {"pe_ttm": 25.0, "source": "tencent"}}, [])) as m_t, \
+         patch("services.overseas_financial_v2_service._fetch_naver_group",
+               return_value=({"005930.KS": {"pe_ttm": 12.0, "source": "naver"}}, [])) as m_n, \
+         patch("services.overseas_financial_v2_service._fetch_yfinance_group",
+               return_value=({"SHEL.L": {"pe_ttm": 8.0, "pb_mrq": 1.2,
+                                        "ps_ttm": 0.5, "dividend_yield": 0.04,
+                                        "source": "yfinance"}}, [])) as m_y:
+        results, errors, rate_limited = _fetch_in_batches(db, partitioned, 50)
+
+    assert rate_limited is False
+    assert results["NVDA"]["pe_ttm"] == 30.5
+    assert results["005930.KS"]["pe_ttm"] == 12.0
+    assert results["SHEL.L"]["pb_mrq"] == 1.2
+    assert m_t.called and m_n.called and m_y.called
+
+
+def test_fetch_in_batches_rate_limited_raises():
+    """任一源整批 RateLimitedError → 抛 RateLimitedError（顶层捕获并退避）。"""
+    from services.overseas_financial_v2_service import (
+        _fetch_in_batches, RateLimitedError,
+    )
+    import pytest
+    db = MagicMock()
+    partitioned = {"tencent_quote": ["NVDA"], "naver_quote": [], "yfinance": []}
+
+    with patch("services.overseas_financial_v2_service._fetch_tencent_group",
+               side_effect=RateLimitedError("pvtoo.match")):
+        with pytest.raises(RateLimitedError):
+            _fetch_in_batches(db, partitioned, 50)

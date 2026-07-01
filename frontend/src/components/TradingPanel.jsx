@@ -191,6 +191,13 @@ export default function TradingPanel() {
     try {
       const r = await postImport()
       alert(`导入完成：${r.message || r.count || ''}`)
+      // 2026-06-30 增强：导入后立即触发全站数据刷新（总览 KPI / 估值表 / 分析师）
+      // 通过 dispatching 事件让 OverviewPanel / ValuationPanel 等重新拉取 bizDate + KPIs
+      window.dispatchEvent(new CustomEvent('holdings-imported', {
+        detail: { user_id: r.user_id, count: r.count, ts: Date.now() },
+      }))
+      // 兜底：直接 reload page（任何挂载的数据都能重新加载）
+      setTimeout(() => window.location.reload(), 500)
     } catch (e) {
       alert(`导入失败：${e?.response?.data?.detail || e.message}`)
     }

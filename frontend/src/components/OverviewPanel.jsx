@@ -89,6 +89,19 @@ export default function OverviewPanel() {
       .catch(() => setIntradayChg(null))
   }, [bizDate])
 
+  // 2026-06-30：监听 holdings-imported 事件，立即重取 bizDate + KPIs（不依赖 reload）
+  useEffect(() => {
+    const handler = () => {
+      api.getDataVersion()
+        .then(d => {
+          if (d?.current_business_date) setBizDate(d.current_business_date)
+        })
+        .catch(() => {})
+    }
+    window.addEventListener('holdings-imported', handler)
+    return () => window.removeEventListener('holdings-imported', handler)
+  }, [])
+
   // Holdings data for table — always prefer converted API.
   // Must be defined before any useEffect that references it (React hook order).
   const displayHoldings = useMemo(() => {

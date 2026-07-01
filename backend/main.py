@@ -1682,14 +1682,48 @@ def import_holdings(
     user: User = Depends(require_user),
     db: Session = Depends(get_db),
 ):
-    """从Excel导入持仓（按 user 隔离；只删/只写自己 user 的）"""
+    """从Excel导入持仓（按 user 隔离；只删/只写自己 user 的）。
+
+    2026-06-30 修订：导入后自动触发对该用户：
+      1. fill_prices — 拉最新价到 holding.price / amount_cny
+      2. rebuild_valuation_to_date — 逐日重建 valuation_daily_snapshot（含 KPI 重算前置）
+      3. 数据就绪后立即可用，总览/估值表/分析师页面不用刷新页面
+    """
     xlsx_files = list(DATA_DIR.glob("*.xlsx")) + list(DATA_DIR.glob("*.xls"))
     if not xlsx_files:
         return CrawlResponse(status="error", message="No Excel files found in project root")
 
     filepath = str(xlsx_files[0])
     count = import_excel(filepath, db, user_id=user.id)
-    return CrawlResponse(status="ok", message=f"Imported {count} holdings", count=count)
+    db.commit()
+
+    # === 2026-06-30 增强：触发完整数据 pipeline ===
+    from services.importer import fill_prices
+    from services.valuation_snapshot_service import rebuild_valuation_to_date
+    from services.trading_calendar import get_confirmed_as_of
+    from crawlers.exchange_rates import update_rates_today
+
+    # 1. 更新当日汇率
+    try:
+        update_rates_today(db)
+    except Exception as e:
+        logging.getLogger(__name__).warning(f"update_rates_today 失败（不影响 import）: {e}")
+
+    # 2. 拉最新价格填充 holding.price
+    try:
+        fill_prices(db, user_id=user.id)
+    except Exception as e:
+        logging.getLogger(__name__).warning(f"fill_prices 失败（不影响 import）: {e}")
+
+    # 3. 重建估值截面（KPIs 自动重算）
+    try:
+        biz_date = get_confirmed_as_of(db, market="CN")
+        res = rebuild_valuation_to_date(db, user.id, biz_date, force_from=None)
+        logging.getLogger(__name__).info(f"rebuild_valuation_to_date for user {user.id}: {res}")
+    except Exception as e:
+        logging.getLogger(__name__).warning(f"rebuild_valuation_to_date 失败（不影响 import）: {e}", exc_info=True)
+
+    return CrawlResponse(status="ok", message=f"Imported {count} holdings, valuation rebuilt", count=count)
 
 
 @app.post("/api/holdings/fill-prices", response_model=CrawlResponse)

@@ -521,8 +521,8 @@ export default function OverviewPanel() {
               ? `覆盖 ${intradayChg.breakdown.covered_count}/${intradayChg.breakdown.total_count} 只 (${intradayChg.breakdown.coverage_rate}%)\n${intradayChg.breakdown.covered_emv_cny.toLocaleString()} / ${intradayChg.breakdown.total_emv_cny.toLocaleString()} CNY`
               : ''
           }>
-            {intradayChg?.prev_trade_date
-              ? `vs ${intradayChg.prev_trade_date} · 覆盖 ${intradayChg.breakdown.covered_count}/${intradayChg.breakdown.total_count}`
+            {intradayChg
+              ? `覆盖 ${intradayChg.breakdown.covered_count}/${intradayChg.breakdown.total_count}`
               : '加载中…'}
           </div>
         </div>

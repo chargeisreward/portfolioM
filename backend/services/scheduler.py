@@ -224,17 +224,6 @@ def _is_trading_hours(now: datetime) -> bool:
     return _is_a_share_trading_hours(now) or _is_us_trading_hours(now)
 
 
-def _is_market_open_window(now: datetime) -> bool:
-    """盘中+盘后窗口：A股 9:15-16:00 + 美股 21:30-05:00
-
-    比交易时段更宽，覆盖集合竞价到盘后，确保收盘后仍能拉到当日涨跌幅。
-    """
-    t = now.time()
-    a_share = time(9, 15) <= t <= time(16, 0)
-    us = t >= time(21, 30) or t <= time(5, 0)
-    return a_share or us
-
-
 # ---------- 任务1：实时行情抓取 ----------
 
 @track_run("realtime_prices")
@@ -453,11 +442,9 @@ def job_fetch_intraday_change_pct():
     - 使用腾讯批量端点（qt.gtimg.cn/q=c1,c2,...）1 次 HTTP 拿全部 quote（2026-07-01 改造）
     - 未映射 code 走 services.code_map.resolve_tencent_quote_code（DB→启发式→raw→LLM 兜底）
     - UPSERT 逻辑：同 (stock_code, trade_date=today) 已存在则 UPDATE change_pct
+    - 不再用 _is_market_open_window 守门：智能路由（intraday_change_service）让腾讯数据
+      当权威，非交易时段腾讯仍返回最新已知价（昨收/午休前），照常写入 PriceCache
     """
-    now = datetime.now()
-    if not _is_market_open_window(now):
-        return {"skipped": "not_market_open_window"}
-
     db: Session = SessionLocal()
     try:
         from crawlers.price_data import fetch_tencent_quotes_batch

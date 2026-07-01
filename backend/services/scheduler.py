@@ -488,18 +488,32 @@ def job_fetch_intraday_change_pct():
 
         updated = 0
         failed = 0
-        for code in codes:
-            try:
-                info = fetch_tencent_quote(code)
-                if not info or info.get("change_pct") is None:
+        # 并行抓取：824 个 code × ~1.7s 串行 ~23 min → ThreadPoolExecutor(10) ~2-3 min
+        # 让单批稳定 < 5 min interval，不再触发 max_instances=1 skip
+        from concurrent.futures import ThreadPoolExecutor, as_completed
+        results: dict[str, float] = {}
+        with ThreadPoolExecutor(max_workers=10) as pool:
+            futures = {pool.submit(fetch_tencent_quote, code): code for code in codes}
+            for fut in as_completed(futures):
+                code = futures[fut]
+                try:
+                    info = fut.result()
+                    if info and info.get("change_pct") is not None:
+                        results[code] = float(info["change_pct"])
+                    else:
+                        failed += 1
+                except Exception as e:
+                    logger.warning("盘中涨跌幅抓取失败 [%s]: %s", code, e)
                     failed += 1
-                    continue
-                _upsert_change_pct(db, code, today, float(info["change_pct"]))
+
+        # DB 写仍串行（SQLAlchemy session 非线程安全）
+        for code, change_pct in results.items():
+            try:
+                _upsert_change_pct(db, code, today, change_pct)
                 updated += 1
             except Exception as e:
-                logger.warning("盘中涨跌幅抓取失败 [%s]: %s", code, e)
+                logger.warning("UPSERT 失败 [%s]: %s", code, e)
                 failed += 1
-                continue
 
         db.commit()
         logger.info("盘中涨跌幅抓取完成：更新 %d/%d 只（失败 %d）", updated, len(codes), failed)

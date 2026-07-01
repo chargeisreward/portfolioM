@@ -450,7 +450,8 @@ def job_fetch_intraday_change_pct():
 
     - 窗口：A股 9:15-16:00 + 美股 21:30-05:00（比交易时段宽，确保盘后也能拉到当日涨跌幅）
     - 只抓非 .OF、非 CASH 品种（.OF 无实时涨跌幅）
-    - 使用腾讯接口原生 parts[32] 涨跌幅字段（非自己计算）
+    - 使用腾讯批量端点（qt.gtimg.cn/q=c1,c2,...）1 次 HTTP 拿全部 quote（2026-07-01 改造）
+    - 未映射 code 走 services.code_map.resolve_tencent_quote_code（DB→启发式→raw→LLM 兜底）
     - UPSERT 逻辑：同 (stock_code, trade_date=today) 已存在则 UPDATE change_pct
     """
     now = datetime.now()
@@ -459,7 +460,7 @@ def job_fetch_intraday_change_pct():
 
     db: Session = SessionLocal()
     try:
-        from crawlers.price_data import fetch_tencent_quote
+        from crawlers.price_data import fetch_tencent_quotes_batch
         from sqlalchemy import func as _func
 
         today = date.today()
@@ -486,41 +487,41 @@ def job_fetch_intraday_change_pct():
             logger.info("盘中涨跌幅抓取：无适用品种，跳过")
             return {"skipped": "no_codes"}
 
+        # 4. 批量请求：1 次 HTTP 拿全部 quote（842 codes 实测 ~1s）
+        t_batch_start = _time_mod.time()
+        try:
+            quotes = fetch_tencent_quotes_batch(codes, db=db)
+        except Exception as e:
+            logger.error("批量腾讯请求异常: %s", e, exc_info=True)
+            raise
+        batch_wall = _time_mod.time() - t_batch_start
+
+        # 5. UPSERT
         updated = 0
         failed = 0
-        # 并行抓取：824 个 code × ~1.7s 串行 ~23 min → ThreadPoolExecutor(10) ~2-3 min
-        # 让单批稳定 < 5 min interval，不再触发 max_instances=1 skip
-        from concurrent.futures import ThreadPoolExecutor, as_completed
-        results: dict[str, float] = {}
-        with ThreadPoolExecutor(max_workers=10) as pool:
-            futures = {pool.submit(fetch_tencent_quote, code): code for code in codes}
-            for fut in as_completed(futures):
-                code = futures[fut]
-                try:
-                    info = fut.result()
-                    if info and info.get("change_pct") is not None:
-                        results[code] = float(info["change_pct"])
-                    else:
-                        failed += 1
-                except Exception as e:
-                    logger.warning("盘中涨跌幅抓取失败 [%s]: %s", code, e)
-                    failed += 1
-
-        # DB 写仍串行（SQLAlchemy session 非线程安全）
-        for code, change_pct in results.items():
+        for code in codes:
+            info = quotes.get(code)
+            if not info or info.get("change_pct") is None:
+                failed += 1
+                continue
             try:
-                _upsert_change_pct(db, code, today, change_pct)
+                _upsert_change_pct(db, code, today, float(info["change_pct"]))
                 updated += 1
             except Exception as e:
                 logger.warning("UPSERT 失败 [%s]: %s", code, e)
                 failed += 1
+                continue
 
         db.commit()
-        logger.info("盘中涨跌幅抓取完成：更新 %d/%d 只（失败 %d）", updated, len(codes), failed)
+        logger.info(
+            "盘中涨跌幅抓取完成：更新 %d/%d 只（失败 %d，批量请求 %.2fs）",
+            updated, len(codes), failed, batch_wall,
+        )
         return {
             "codes_total": len(codes),
             "updated": updated,
             "failed": failed,
+            "batch_wall_sec": round(batch_wall, 3),
         }
 
     except Exception as e:
@@ -1351,8 +1352,7 @@ def start_scheduler():
         id="intraday_change_pct",
         name="盘中实时涨跌幅抓取",
         max_instances=1,
-        coalesce=True,                                       # 多次错过合并成 1 次
-        misfire_grace_time=600,                              # 容许 10 min 内追跑（避免 Tencent 慢导致误判 misfire）
+        misfire_grace_time=60,
     )
 
     # 任务12：.OF 基金净值定时拉取 — 每日 7:00 / 20:30（增量补缺，直连东财 lsjz）

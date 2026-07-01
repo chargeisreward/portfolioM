@@ -116,6 +116,141 @@ def _to_tencent_ticker(ticker: str) -> str | None:
     return t
 
 
+# ---------- 腾讯批量行情 API（实时，多 code 单次请求） ----------
+
+# URL 长度防御：~15KB 内浏览器/server 都接受；>17KB 多数 server 会拒
+_BATCH_URL_LIMIT = 15000
+_BASE_TENCENT_URL = "https://qt.gtimg.cn/q="
+
+
+def fetch_tencent_quotes_batch(
+    user_codes: list[str],
+    db: "Session | None" = None,
+) -> dict[str, dict]:
+    """腾讯批量端点：1 次 HTTP 拿全部 user_codes 的实时 quote。
+
+    Args:
+        user_codes: 持仓写法证券代码列表（如 ['600519.SH', 'NVDA', '00700.HK']）
+        db: SQLAlchemy Session（用于查 api_code_map）；None 时自动 new SessionLocal()
+
+    Returns:
+        {user_code: {"change_pct": float|None, "price": float|None,
+                     "prev_close": float|None}}
+        无映射 / 接口失败的 code 不在返回 dict 中。
+    """
+    import re
+    from sqlalchemy.orm import Session as _Session
+
+    if not user_codes:
+        return {}
+
+    # 1. 用 db session 解析每个 user_code → tencent_code
+    own_db = False
+    if db is None:
+        from database import SessionLocal
+        db = SessionLocal()
+        own_db = True
+
+    try:
+        from services.code_map import resolve_tencent_quote_code
+
+        user_to_tc: dict[str, str] = {}
+        unresolved: list[str] = []
+        for uc in user_codes:
+            if not uc:
+                continue
+            tc = resolve_tencent_quote_code(uc, db)
+            if tc is None:
+                unresolved.append(uc)
+                continue
+            user_to_tc[uc] = tc
+
+        if unresolved:
+            logger.warning(
+                "批量端点 %d 个 code 仍无 tencent 映射，跳过: %s",
+                len(unresolved), unresolved[:10],
+            )
+
+        if not user_to_tc:
+            return {}
+
+        tc_to_user = {v: k for k, v in user_to_tc.items()}
+        tencent_codes = list(user_to_tc.values())
+
+        # 2. URL 长度防御：>15KB 自动分块
+        out: dict[str, dict] = {}
+        chunk: list[str] = []
+        chunk_len = len(_BASE_TENCENT_URL)
+
+        for tc in tencent_codes:
+            need = len(tc) + 1  # +1 for comma separator
+            if chunk_len + need > _BATCH_URL_LIMIT and chunk:
+                out.update(_do_batch_request(chunk, tc_to_user))
+                chunk = []
+                chunk_len = len(_BASE_TENCENT_URL)
+            chunk.append(tc)
+            chunk_len += need
+        if chunk:
+            out.update(_do_batch_request(chunk, tc_to_user))
+
+        return out
+    finally:
+        if own_db:
+            db.close()
+
+
+def _do_batch_request(
+    tencent_codes: list[str],
+    tc_to_user: dict[str, str],
+) -> dict[str, dict]:
+    """单次批量请求 + 解析。"""
+    import re
+    from crawlers._http import tencent_get
+
+    if not tencent_codes:
+        return {}
+
+    url = _BASE_TENCENT_URL + ",".join(tencent_codes)
+    try:
+        resp = tencent_get(url, timeout=15.0)
+    except Exception as e:
+        logger.warning("批量腾讯请求失败 (%d codes): %s", len(tencent_codes), e)
+        return {}
+
+    if not resp or resp.status_code != 200:
+        logger.warning("批量腾讯请求非 200: %s codes=%d", resp.status_code if resp else "None", len(tencent_codes))
+        return {}
+
+    out: dict[str, dict] = {}
+    pattern = re.compile(r'v_([a-zA-Z0-9]+)="(.*?)"')
+    matched = 0
+    for m in pattern.finditer(resp.text):
+        tc = m.group(1)
+        payload = m.group(2)
+        user_code = tc_to_user.get(tc)
+        if not user_code:
+            continue
+        parts = payload.split("~")
+        # parts[3]=price, parts[4]=prev_close, parts[32]=change_pct
+        if len(parts) < 33:
+            continue
+        matched += 1
+        try:
+            change_pct = float(parts[32]) if parts[32] else None
+            price = float(parts[3]) if parts[3] else None
+            prev_close = float(parts[4]) if parts[4] else None
+        except ValueError:
+            continue
+        out[user_code] = {
+            "change_pct": change_pct,
+            "price": price,
+            "prev_close": prev_close,
+        }
+    logger.debug("批量腾讯: %d codes sent, %d matched, %d parsed",
+                 len(tencent_codes), matched, len(out))
+    return out
+
+
 # ---------- 腾讯K线 API（历史数据，首选） ----------
 
 def fetch_tencent_kline(ticker: str, days: int = 365) -> list[dict]:

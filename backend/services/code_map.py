@@ -278,3 +278,122 @@ def delete_map(db: Session, code_in: str, api_strategy: str) -> bool:
     db.commit()
     invalidate_cache()
     return True
+
+
+# ============================================================
+# 完整解析路径（DB → 启发式 → raw probe → LLM 兜底）
+# 用于 cron 等批量场景：保证每个 user_code 都返回 confirmed tencent_quote code
+# ============================================================
+
+def resolve_tencent_quote_code(code_in: str, db: Session) -> str | None:
+    """四段解析路径（带 LLM 兜底），返回唯一确认可用的 tencent_quote code。
+
+    路径：
+      1. DB hit（transform_code 已含 DEFAULT_MAPS + 历史 persist）
+      2. 启发式（_default_transform：覆盖 .SH/.SZ/.HK/纯数字）
+      3. raw probe（单次 tencent_get 直接试 user_code 原值）
+      4. LLM 候选 + 单次验证（仅 1-3 都失败时启用）
+
+    Returns: confirmed tencent code（如 'usNVDA'）；失败返回 None。
+    """
+    if not code_in:
+        return None
+
+    # ---- 路径 1：DB hit（已含 DEFAULT_MAPS）----
+    mapped = transform_code(code_in, "tencent_quote", db)
+    if mapped and mapped != code_in:
+        # transform_code 已 persist，无需再验证
+        return mapped
+
+    # ---- 路径 2：启发式（_default_transform）----
+    heur = _default_transform(code_in, "tencent_quote")
+    if heur and heur != code_in:
+        # 惰性持久化 + 直接返回（_default_transform 推断的格式与已有 _to_tencent_ticker 一致）
+        try:
+            db.add(ApiCodeMap(
+                code_in=code_in, api_strategy="tencent_quote",
+                code_out=heur, market=_market_of_code(code_in),
+                note="heuristic _default_transform",
+            ))
+            db.commit()
+        except Exception:
+            db.rollback()
+        _CACHE[(code_in, "tencent_quote")] = heur
+        return heur
+
+    # ---- 路径 3：raw probe（直接试原值）----
+    from crawlers._http import tencent_get
+    try:
+        resp = tencent_get(f"https://qt.gtimg.cn/q={code_in}", timeout=5.0)
+        if resp and resp.status_code == 200 and "=" in resp.text and '""' not in resp.text.split("\n")[0]:
+            # raw code 直接可用 → persist
+            try:
+                db.add(ApiCodeMap(
+                    code_in=code_in, api_strategy="tencent_quote",
+                    code_out=code_in, market=_market_of_code(code_in),
+                    note="raw probe",
+                ))
+                db.commit()
+            except Exception:
+                db.rollback()
+            _CACHE[(code_in, "tencent_quote")] = code_in
+            return code_in
+    except Exception:
+        pass
+
+    # ---- 路径 4：LLM 兜底 ----
+    candidates = _llm_suggest_tencent_candidates(code_in)
+    if not candidates:
+        return None
+
+    for cand in candidates:
+        if cand == code_in:
+            continue  # 已在路径 3 试过
+        try:
+            resp = tencent_get(f"https://qt.gtimg.cn/q={cand}", timeout=5.0)
+            if resp and resp.status_code == 200 and "=" in resp.text \
+                    and '""' not in resp.text.split("\n")[0]:
+                # LLM 候选验证通过
+                try:
+                    db.add(ApiCodeMap(
+                        code_in=code_in, api_strategy="tencent_quote",
+                        code_out=cand, market=_market_of_code(code_in),
+                        note="LLM resolved",
+                    ))
+                    db.commit()
+                except Exception:
+                    db.rollback()
+                _CACHE[(code_in, "tencent_quote")] = cand
+                logger.info("LLM 兜底解析: %s -> %s", code_in, cand)
+                return cand
+        except Exception:
+            continue
+
+    logger.warning("LLM 候选全部失败: code=%s candidates=%s", code_in, candidates)
+    return None
+
+
+def _llm_suggest_tencent_candidates(code_in: str) -> list[str]:
+    """调 LLM 推测 code 的 tencent_quote 候选。失败返 []。"""
+    try:
+        from services.llm_service import _call_llm
+    except ImportError:
+        return []
+    sys_prompt = (
+        "你是证券代码格式专家。给定一个未知的证券代码（持仓写法），"
+        "你需要猜测它在腾讯 qt.gtimg.cn 行情接口的格式。"
+        "已知腾讯格式：A 股带 sh/sz 前缀（sh600519），港股带 hk 前缀（hk00700），"
+        "美股带 us 前缀（usNVDA）。"
+        "请只返回 JSON：{\"candidates\": [\"usXXX\", \"XXX\", ...], \"reason\": \"简短原因\"}"
+    )
+    user_prompt = f"证券代码: {code_in}\n请列出最可能的 tencent qt.gtimg.cn 候选（按概率排序，最多 5 个）"
+    raw = _call_llm(sys_prompt, user_prompt, temperature=0.0, timeout=20.0)
+    if not raw:
+        return []
+    try:
+        import json
+        data = json.loads(raw)
+        cands = data.get("candidates", [])
+        return [c for c in cands if isinstance(c, str) and c][:5]
+    except Exception:
+        return []

@@ -10,12 +10,15 @@ import re
 import json
 import urllib3
 urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
+import logging
 import yfinance as yf
 from datetime import date, datetime
 from typing import Optional
 
 from config import TENCENT_USER_AGENT, TENCENT_QUOTE_URL, TENCENT_KLINE_URL
 from crawlers._http import tencent_get
+
+logger = logging.getLogger(__name__)
 
 
 # ---------- 腾讯财经 API（实时行情，首选） ----------

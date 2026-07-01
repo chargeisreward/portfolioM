@@ -2,10 +2,6 @@
 import os
 os.environ.setdefault("APP_PASSWORD", "")
 
-import pytest
-from unittest.mock import patch, MagicMock, call
-from datetime import date
-
 
 def test_rate_limited_error_is_exception():
     """RateLimitedError 是 Exception 子类。"""

@@ -81,16 +81,17 @@ def collect_codes(db, today: date) -> tuple[set[str], int]:
 
     unique_codes = {c for c in holdings_codes if c}
     if not unique_codes:
+        logger.info("overseas_hourly_v2: no overseas holdings found (asset_type=US_STOCK|US_ETF)")
         return set(), 0
 
-    cached_rows = db.execute(
+    cached_codes = db.execute(
         select(OverseasShareFinancialSnapshot.stock_code).where(
             OverseasShareFinancialSnapshot.as_of_date == today,
             OverseasShareFinancialSnapshot.stock_code.in_(unique_codes),
         ).distinct()
-    ).all()
+    ).scalars().all()
 
-    cached = {row[0] for row in cached_rows if row and row[0]}
+    cached = {c for c in cached_codes if c}
     todo = unique_codes - cached
     logger.info("overseas_hourly_v2: %d unique codes, %d cached today, %d to do",
                 len(unique_codes), len(cached), len(todo))

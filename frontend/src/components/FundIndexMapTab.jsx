@@ -146,6 +146,12 @@ export default function FundIndexMapTab() {
           onCancel={() => setEditing(null)}
         />
       )}
+
+      <SelectiveFundIndexDialog
+        open={showSelective}
+        onClose={() => setShowSelective(false)}
+        onSuccess={() => { setShowSelective(false); load() }}
+      />
     </div>
   )
 }

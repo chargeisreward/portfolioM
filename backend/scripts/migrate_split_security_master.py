@@ -55,6 +55,24 @@ def _normalize_type2(raw: str | None) -> tuple[str, str] | None:
     return (code, label)
 
 
+def _resolve_source_table(db: Session) -> str:
+    """返回当前应读取的源表名:优先 security_master_legacy,fallback security_master。
+
+    迁移脚本的两个使用阶段:
+    - 重命名前:只有 security_master,迁移脚本先 dry-run 验证
+    - 重命名后:security_master_legacy,后续 commit/verify 阶段
+
+    Use SQLAlchemy inspector(跨方言:PG/SQLite 都支持)
+    """
+    from sqlalchemy import inspect as _sa_inspect
+    tables = set(_sa_inspect(db.get_bind()).get_table_names())
+    if "security_master_legacy" in tables:
+        return "security_master_legacy"
+    if "security_master" in tables:
+        return "security_master"
+    raise RuntimeError("Neither security_master nor security_master_legacy exists")
+
+
 def _is_bond_to_fund(asset_type: str | None, security_code: str) -> bool:
     """bond 鉴别: qdii_bond 或 .OF 后缀 → fund_master;否则 stock_master。"""
     if asset_type == "qdii_bond":
@@ -65,10 +83,11 @@ def _is_bond_to_fund(asset_type: str | None, security_code: str) -> bool:
 
 
 def _seed_index_master_from_legacy(db: Session) -> int:
-    """从 security_master_legacy 提取 index_code + index_name。"""
-    rows = db.execute(text("""
+    """从源表 (security_master 或 security_master_legacy) 提取 index_code + index_name。"""
+    src = _resolve_source_table(db)
+    rows = db.execute(text(f"""
         SELECT DISTINCT index_code, index_name
-        FROM security_master_legacy
+        FROM {src}
         WHERE index_code IS NOT NULL AND index_code != ''
     """)).fetchall()
     inserted = 0
@@ -111,6 +130,7 @@ def _seed_classification_dict(db: Session, dimension: str, items: list[tuple[str
 
 def dry_run_report(db: Session) -> dict:
     """dry-run 模式: 不写入,只统计。"""
+    src = _resolve_source_table(db)
     report = {
         "legacy_total": 0,
         "to_stock_master": 0,
@@ -121,10 +141,10 @@ def dry_run_report(db: Session) -> dict:
         "warnings": [],
     }
 
-    rows = db.execute(text("""
+    rows = db.execute(text(f"""
         SELECT security_code, asset_type, security_type,
                type2, index_code, benchmark_formula
-        FROM security_master_legacy
+        FROM {src}
     """)).fetchall()
     report["legacy_total"] = len(rows)
 
@@ -155,16 +175,17 @@ def dry_run_report(db: Session) -> dict:
 
 def commit_migration(db: Session) -> dict:
     """真跑: 写入所有新表。需在 PG transaction 中调用。"""
+    src = _resolve_source_table(db)
     report = dry_run_report(db)
 
-    legacy_rows = db.execute(text("""
+    legacy_rows = db.execute(text(f"""
         SELECT security_code, security_name, currency, asset_type, exchange,
                is_drillable, note
-        FROM security_master_legacy
+        FROM {src}
     """)).fetchall()
     for code, name, ccy, at, ex, drill, note in legacy_rows:
         st_row = db.execute(text(
-            "SELECT security_type FROM security_master_legacy WHERE security_code=:c"
+            f"SELECT security_type FROM {src} WHERE security_code=:c"
         ), {"c": code}).first()
         sec_type = st_row[0] if st_row else None
         if sec_type == "fund" or (sec_type == "bond" and _is_bond_to_fund(at, code)):
@@ -180,7 +201,7 @@ def commit_migration(db: Session) -> dict:
 
     for code, name, ccy, at, ex, drill, note in legacy_rows:
         st_row = db.execute(text(
-            "SELECT security_type, fund_type, benchmark_formula FROM security_master_legacy WHERE security_code=:c"
+            f"SELECT security_type, fund_type, benchmark_formula FROM {src} WHERE security_code=:c"
         ), {"c": code}).first()
         if not st_row:
             continue
@@ -199,13 +220,13 @@ def commit_migration(db: Session) -> dict:
     report["index_master_added"] = _seed_index_master_from_legacy(db)
 
     asset_type_values = db.execute(text(
-        "SELECT DISTINCT asset_type FROM security_master_legacy WHERE asset_type IS NOT NULL"
+        f"SELECT DISTINCT asset_type FROM {src} WHERE asset_type IS NOT NULL"
     )).fetchall()
     asset_type_items = [(at[0], at[0]) for at in asset_type_values]
     n1 = _seed_classification_dict(db, "asset_type", asset_type_items)
 
     type2_values = db.execute(text(
-        "SELECT DISTINCT type2 FROM security_master_legacy WHERE type2 IS NOT NULL"
+        f"SELECT DISTINCT type2 FROM {src} WHERE type2 IS NOT NULL"
     )).fetchall()
     theme_items = []
     for (raw,) in type2_values:
@@ -221,9 +242,10 @@ def commit_migration(db: Session) -> dict:
 
 
 def verify_migration(db: Session) -> dict:
-    """验证: 对比 legacy 与新表的 counts。"""
+    """验证: 对比源表与新表的 counts。"""
+    src = _resolve_source_table(db)
     legacy_count = db.execute(text(
-        "SELECT COUNT(*) FROM security_master_legacy"
+        f"SELECT COUNT(*) FROM {src}"
     )).scalar()
     new_count = (
         db.query(StockMaster).count()

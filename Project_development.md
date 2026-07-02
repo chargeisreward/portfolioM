@@ -870,3 +870,70 @@ location /portfoliom2.0/ {
 | `12de386` | fix: add missing User import in main.py |
 | `0ba1cad` | fix: merge User import fix to main |
 | `0418f35` | chore: add docker-compose-2.0.yml |
+
+## 2026-07-02 公共数据主数据重构 (Spec-1)
+
+参考: docs/superpowers/specs/2026-07-02-master-data-overhaul-design.md
+
+### 改动
+
+- 3 张主表 `stock_master` / `fund_master` / `index_master` 替代单一 `security_master`
+- 2 张分类表 `classification` + `classification_assign` (asset_type + theme 双维度)
+- akshare 增量拉 A 股指数 (job_poll_index_master 每天 21:23)
+- QQQ 手动 seed 脚本 (backend/scripts/_seed_qqq.py)
+- 双向 typeahead 选择基金-指数映射 (SelectiveFundIndexDialog)
+- 旧 `security_master` 改名 `security_master_legacy`,冻结只读
+
+### 新增 admin 端点 (4 套 CRUD + 3 个工具)
+
+- `GET/POST/PUT/DELETE /api/admin/stock-master`
+- `GET/POST/PUT/DELETE /api/admin/fund-master`
+- `GET/POST/PUT/DELETE /api/admin/index-master`
+- `GET/POST/PUT/DELETE /api/admin/classification` + `/assign` + `/unassign` + `/assignments`
+- `GET /api/admin/fund-master/lookup` + `GET /api/admin/index-master/lookup` (typeahead)
+- `POST /api/admin/fund-index-map/selective` (双向选择式新增)
+- `POST /api/admin/index-master/refresh` (手动触发 akshare 轮询)
+- `POST /api/admin/index-master/seed-qqq`
+
+### 新增前端组件
+
+- `MasterDataPanel` 改 4 sub-tab (股票 / 基金 / 指数 / 分类维度)
+- `StockMasterTab` / `FundMasterTab` / `IndexMasterTab` / `ClassificationTab`
+- `SelectiveFundIndexDialog` (双向选择弹窗)
+- 删除 `SecurityMasterTab` (新表已替代)
+- `api.js` 加 10 个 client (stockMasterList / fundMasterList / indexMasterList / classificationList / fundMasterLookup / indexMasterLookup / indexMasterRefresh / classificationAssign / classificationUnassign / fundIndexMapSelective / stockMasterLookup... 等)
+
+### 部署方案 (portfoliom3.0)
+
+不修改现有 prod PG 或容器。新部署方案:
+1. 在云端起新容器 `portfoliom3.0`,跑这份代码
+2. nginx 切换路由: `https://chargeye133.duckdns.org/portfoliom3.0/` → 新容器
+3. 本地 PG 已迁移 (36 records → 7 stock + 29 fund + 12 index + 14 classification),全量 `pg_dump` 后 scp 到云端,新容器连这个 PG
+4. 现有 `portfoliom2.0` 不下线,作为回滚
+
+### 关键 Git 提交 (本轮)
+
+| commit | 说明 |
+|--------|------|
+| `9ff8372` | plan(master-data): 32-task plan |
+| `545a278` | spec(master-data): Spec-1 design |
+| `076b7e0` + `d8c99eb` | feat + fix: 5 SQLAlchemy models |
+| `3764412` | register models in models.py |
+| `e45abc9` + `2c6c7a2` + `13f0c79` + `307da65` | migration script + fallback security_type + rename |
+| `0677377` - `dc8fa4a` | 4 services + 4 API endpoint sets (Phase 2) |
+| `05e79e4` | UI 4 sub-tabs + delete SecurityMasterTab (Phase 3) |
+| `a1eb047` - `16b5e9f` | lookup endpoints + SelectiveFundIndexDialog (Phase 4) |
+| `c186b36` - `a0e677a` | akshare_index_poller + scheduler 21:23 + QQQ seed (Phase 5) |
+
+### 已知遗留
+
+1. **10 mojibake Chinese labels** in `classification.dimension='theme'`.display_label (security_master_legacy GBK 编码问题)。Admin 用新 ClassificationTab 编辑修复。
+2. **classification_assign 表为空** — 迁移脚本未自动灌关联记录,admin 通过新 UI assign 或下次迁移。
+3. **`datetime.utcnow()` deprecation warnings** — Python 3.12+ 推荐 `datetime.now(timezone.utc)`,但项目一致性保留旧 API。
+4. **`backend/scripts/_*.py` gitignore** — 已加 `!backend/scripts/_seed_qqq.py` 例外,后续 seed 脚本需类似处理。
+
+### 下一轮 (Spec-2, future)
+
+- 全市场 A 股/港股/基金/指数名称代码一次性拉取 + 增量轮询
+- 跨数据源去重 (TuShare + AKShare + EastMoney + ...)
+- 用户级自选主数据 (per-user watchlist 复用 index_master)

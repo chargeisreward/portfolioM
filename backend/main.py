@@ -5630,6 +5630,87 @@ def admin_delete_index(code: str, db: Session = Depends(get_db)):
     return {"status": "ok"}
 
 
+# ============================================================================
+# Admin: 分类维度 (2026-07-02)
+# ============================================================================
+
+@app.get("/api/admin/classification")
+def admin_list_classifications(
+    dimension: str = Query(...),
+    is_active: bool | None = None,
+    db: Session = Depends(get_db),
+):
+    from services.classification_service import list_classifications
+    return list_classifications(db, dimension=dimension, is_active=is_active)
+
+
+@app.post("/api/admin/classification")
+def admin_create_classification(body: dict = Body(...), db: Session = Depends(get_db)):
+    from services.classification_service import create_classification
+    return create_classification(db, body)
+
+
+@app.put("/api/admin/classification/{cid}")
+def admin_update_classification(cid: int, body: dict = Body(...), db: Session = Depends(get_db)):
+    from services.classification_service import update_classification
+    result = update_classification(db, cid, body)
+    if not result:
+        raise HTTPException(404, "分类值不存在")
+    return result
+
+
+@app.delete("/api/admin/classification/{cid}")
+def admin_deactivate_classification(cid: int, db: Session = Depends(get_db)):
+    """停用 (is_active=False) 而非删除。"""
+    from services.classification_service import deactivate_classification
+    ok = deactivate_classification(db, cid)
+    if not ok:
+        raise HTTPException(404, "分类值不存在")
+    return {"status": "ok"}
+
+
+@app.post("/api/admin/classification/assign")
+def admin_assign_classification(
+    body: dict = Body(...),
+    db: Session = Depends(get_db),
+):
+    """把分类赋给一个实体。"""
+    from services.classification_service import assign
+    ok = assign(
+        db,
+        entity_type=body["entity_type"],
+        entity_code=body["entity_code"],
+        classification_id=body["classification_id"],
+    )
+    return {"status": "ok", "created": ok}
+
+
+@app.post("/api/admin/classification/unassign")
+def admin_unassign_classification(
+    body: dict = Body(...),
+    db: Session = Depends(get_db),
+):
+    from services.classification_service import unassign
+    ok = unassign(
+        db,
+        entity_type=body["entity_type"],
+        entity_code=body["entity_code"],
+        classification_id=body["classification_id"],
+    )
+    return {"status": "ok", "removed": ok}
+
+
+@app.get("/api/admin/classification/assignments")
+def admin_get_assignments(
+    entity_type: str = Query(...),
+    entity_code: str = Query(...),
+    db: Session = Depends(get_db),
+):
+    """列出实体的所有分类。"""
+    from services.classification_service import get_assignments
+    return get_assignments(db, entity_type=entity_type, entity_code=entity_code)
+
+
 # ========== Admin: 基金-指数映射 ==========
 
 @app.get("/api/admin/fund-index-map")

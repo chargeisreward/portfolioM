@@ -5589,6 +5589,47 @@ def admin_delete_fund(code: str, db: Session = Depends(get_db)):
         raise HTTPException(400, str(e))
 
 
+# ============================================================================
+# Admin: 指数主数据 (2026-07-02)
+# ============================================================================
+
+@app.get("/api/admin/index-master")
+def admin_list_indices(
+    category: str | None = None,
+    is_active: bool | None = None,
+    search: str | None = None,
+    page: int = 1, page_size: int = 50,
+    db: Session = Depends(get_db),
+):
+    from services.index_master_service import list_indices
+    return list_indices(db, category=category, is_active=is_active,
+                        search=search, page=page, page_size=page_size)
+
+
+@app.post("/api/admin/index-master")
+def admin_create_index(body: dict = Body(...), db: Session = Depends(get_db)):
+    from services.index_master_service import create_index
+    return create_index(db, body)
+
+
+@app.put("/api/admin/index-master/{code}")
+def admin_update_index(code: str, body: dict = Body(...), db: Session = Depends(get_db)):
+    from services.index_master_service import update_index
+    result = update_index(db, code, body)
+    if not result:
+        raise HTTPException(404, "指数不存在")
+    return result
+
+
+@app.delete("/api/admin/index-master/{code}")
+def admin_delete_index(code: str, db: Session = Depends(get_db)):
+    from services.index_master_service import delete_index
+    ok = delete_index(db, code)
+    if not ok:
+        raise HTTPException(404, "指数不存在")
+    return {"status": "ok"}
+
+
 # ========== Admin: 基金-指数映射 ==========
 
 @app.get("/api/admin/fund-index-map")

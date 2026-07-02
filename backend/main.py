@@ -5545,6 +5545,50 @@ def admin_delete_stock(code: str, db: Session = Depends(get_db)):
         raise HTTPException(400, str(e))
 
 
+# ============================================================================
+# Admin: 基金主数据 (2026-07-02)
+# ============================================================================
+
+@app.get("/api/admin/fund-master")
+def admin_list_funds(
+    asset_type: str | None = None,
+    fund_type: str | None = None,
+    search: str | None = None,
+    page: int = 1, page_size: int = 50,
+    db: Session = Depends(get_db),
+):
+    from services.fund_master_service import list_funds
+    return list_funds(db, asset_type=asset_type, fund_type=fund_type,
+                      search=search, page=page, page_size=page_size)
+
+
+@app.post("/api/admin/fund-master")
+def admin_create_fund(body: dict = Body(...), db: Session = Depends(get_db)):
+    from services.fund_master_service import create_fund
+    return create_fund(db, body)
+
+
+@app.put("/api/admin/fund-master/{code}")
+def admin_update_fund(code: str, body: dict = Body(...), db: Session = Depends(get_db)):
+    from services.fund_master_service import update_fund
+    result = update_fund(db, code, body)
+    if not result:
+        raise HTTPException(404, "基金不存在")
+    return result
+
+
+@app.delete("/api/admin/fund-master/{code}")
+def admin_delete_fund(code: str, db: Session = Depends(get_db)):
+    from services.fund_master_service import delete_fund
+    try:
+        ok = delete_fund(db, code)
+        if not ok:
+            raise HTTPException(404, "基金不存在")
+        return {"status": "ok"}
+    except ValueError as e:
+        raise HTTPException(400, str(e))
+
+
 # ========== Admin: 基金-指数映射 ==========
 
 @app.get("/api/admin/fund-index-map")

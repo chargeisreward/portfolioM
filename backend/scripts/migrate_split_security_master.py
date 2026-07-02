@@ -92,6 +92,34 @@ def _resolve_source_table(db: Session) -> str:
     raise RuntimeError("Neither security_master nor security_master_legacy exists")
 
 
+def rename_security_master_to_legacy(db: Session) -> None:
+    """把 security_master 改名为 security_master_legacy。
+
+    PG 和 SQLite 都用同一种语法: ALTER TABLE ... RENAME TO ...
+
+    Idempotent: 如果 security_master_legacy 已存在,什么都不做。
+    """
+    from sqlalchemy import inspect as _sa_inspect
+    tables = set(_sa_inspect(db.get_bind()).get_table_names())
+    if "security_master_legacy" in tables:
+        logger.info("rename_security_master_to_legacy: already renamed, skipping")
+        return
+    if "security_master" not in tables:
+        logger.info("rename_security_master_to_legacy: security_master not present, skipping")
+        return
+
+    db.execute(text("ALTER TABLE security_master RENAME TO security_master_legacy"))
+    try:
+        db.execute(text(
+            "COMMENT ON TABLE security_master_legacy IS "
+            "'DEPRECATED 2026-07-02: 数据已迁到 stock_master + fund_master;本表冻结只读,禁止新写入'"
+        ))
+    except Exception:
+        pass  # SQLite 不支持 COMMENT
+    db.commit()
+    logger.info("renamed security_master -> security_master_legacy")
+
+
 def _is_bond_to_fund(asset_type: str | None, security_code: str) -> bool:
     """bond 鉴别: qdii_bond 或 .OF 后缀 → fund_master;否则 stock_master。"""
     if asset_type == "qdii_bond":
@@ -301,12 +329,18 @@ def main():
     try:
         MasterBase.metadata.create_all(bind=db.get_bind())
 
+        from sqlalchemy import inspect as _sa_inspect
+        existing_tables = set(_sa_inspect(db.get_bind()).get_table_names())
+
         if args.verify:
             result = verify_migration(db)
             logger.info(f"verify: {result}")
             return
 
         if args.commit:
+            # 如未改名,先改名
+            if "security_master_legacy" not in existing_tables and "security_master" in existing_tables:
+                rename_security_master_to_legacy(db)
             report = commit_migration(db)
             logger.info(f"commit done: {report}")
         else:

@@ -166,3 +166,20 @@ def test_type2_broad_index_no_warning(seeded_legacy_db):
     from scripts.migrate_split_security_master import dry_run_report
     report = dry_run_report(db)
     assert not any("broad_index" in w for w in report["warnings"])
+
+
+def test_rename_security_master_to_legacy(in_memory_db):
+    """rename 后 security_master 不应存在, security_master_legacy 应存在。"""
+    from sqlalchemy import text
+    db = in_memory_db
+    db.execute(text("CREATE TABLE security_master (x INTEGER)"))
+    db.commit()
+
+    from scripts.migrate_split_security_master import rename_security_master_to_legacy
+    rename_security_master_to_legacy(db)
+
+    names = [r[0] for r in db.execute(text(
+        "SELECT name FROM sqlite_master WHERE type='table'"
+    )).fetchall()]
+    assert "security_master" not in names
+    assert "security_master_legacy" in names

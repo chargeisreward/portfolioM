@@ -15,7 +15,7 @@ def in_memory_db():
 
     - StaticPool 确保 :memory: 在多连接下共享同一数据库
     - check_same_thread=False 让 pytest 在不同线程也能用
-    - FK 约束由调用方按需启用 (in_memory_db.execute("PRAGMA foreign_keys=ON"))
+    - FK 在每个 connect 上自动开启 (无需调用方再 PRAGMA)
     """
     engine = create_engine(
         "sqlite:///:memory:",

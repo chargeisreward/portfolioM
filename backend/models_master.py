@@ -14,12 +14,11 @@ from __future__ import annotations
 from datetime import datetime
 
 from sqlalchemy import (
-    BigInteger, Boolean, Column, DateTime, ForeignKey, Index,
+    Boolean, Column, DateTime, ForeignKey, Index,
     Integer, String, UniqueConstraint,
 )
-from sqlalchemy.orm import declarative_base
 
-Base = declarative_base()
+from database import Base
 
 
 class StockMaster(Base):
@@ -106,7 +105,7 @@ class ClassificationAssign(Base):
     """分类维度多对多关联。一个实体可同时有多个维度多条记录。"""
     __tablename__ = "classification_assign"
 
-    id = Column(BigInteger, primary_key=True, autoincrement=True)
+    id = Column(Integer, primary_key=True, autoincrement=True)
     entity_type = Column(String(20), nullable=False)  # "stock" / "fund" / "index"
     entity_code = Column(String(20), nullable=False)
     classification_id = Column(

@@ -1,5 +1,4 @@
 """验证 models_master.py 的 5 张新表可被 SQLAlchemy 正常 import + create。"""
-from sqlalchemy import text
 
 
 def test_models_master_imports():
@@ -18,7 +17,6 @@ def test_models_master_imports():
 def test_create_all_tables(in_memory_db):
     """5 张新表应能在内存 SQLite 上成功 create。"""
     from models_master import Base as MasterBase
-    in_memory_db.execute(text("PRAGMA foreign_keys=ON"))
     MasterBase.metadata.create_all(bind=in_memory_db.get_bind())
     # 验证表存在
     tables = MasterBase.metadata.tables.keys()

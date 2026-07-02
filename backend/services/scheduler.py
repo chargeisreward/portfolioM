@@ -1405,6 +1405,19 @@ def start_scheduler():
         misfire_grace_time=1800,
     )
 
+    # 任务14.5：指数主数据轮询 (2026-07-02) — 每日 21:23 akshare 增量拉
+    # Spec: docs/superpowers/specs/2026-07-02-master-data-overhaul-design.md §5
+    scheduler.add_job(
+        job_poll_index_master,
+        "cron",
+        hour=21,
+        minute=23,
+        id="job_poll_index_master",
+        name="指数主数据轮询 (akshare)",
+        max_instances=1,
+        misfire_grace_time=1800,
+    )
+
     # 任务15：海外财务数据 hourly v2（spec 2026-06-29）— 每小时整点后 23 分错峰
     # 三源（腾讯/US+港 + Naver/KR + yfinance/其他 + LLM 兜底）持续刷新所有用户持有的海外证券
     # 限流温和退化 + 个股级当日跳过；sub-project 3 的 07:00/19:00 cron 作为兜底保留
@@ -1612,6 +1625,8 @@ JOB_DISPATCH: dict[str, dict] = {
     "drill_snapshot": {"name": "公共下钻截面生成", "func": job_generate_drill_snapshot},
     "intraday_change_pct": {"name": "盘中实时涨跌幅抓取", "func": job_fetch_intraday_change_pct},
     "pull_fund_nav": {"name": ".OF基金净值拉取", "func": job_pull_fund_nav},
+    # 注: job_poll_index_master 不在 JOB_DISPATCH 中,因为 manual trigger
+    # 走 POST /api/admin/index-master/refresh 端点,不通过 JOB_DISPATCH 路径。
 }
 
 
@@ -1713,6 +1728,23 @@ def job_refresh_overseas_financials_hourly():
     except Exception as e:
         logger.error("overseas_financials_hourly_v2 任务异常: %s", e, exc_info=True)
         return {"status": "error", "error": str(e)}
+    finally:
+        try:
+            db.close()
+        except Exception:
+            pass
+
+
+# ============================================================================
+# Task 14.5 (2026-07-02): job_poll_index_master — 指数主数据轮询
+# ============================================================================
+
+def job_poll_index_master() -> dict:
+    """每天 21:23 跑 — akshare 指数主数据增量轮询。"""
+    from services.akshare_index_poller import poll_index_master
+    db = SessionLocal()
+    try:
+        return poll_index_master(db)
     finally:
         try:
             db.close()

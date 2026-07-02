@@ -5621,6 +5621,27 @@ def admin_refresh_index_master(db: Session = Depends(get_db)):
         raise HTTPException(503, "akshare_index_poller service not yet available")
 
 
+@app.post("/api/admin/index-master/seed-qqq")
+def admin_seed_qqq(db: Session = Depends(get_db)):
+    """QQQ 手动 seed (不走 akshare 轮询)。"""
+    from models_master import IndexMaster
+    existing = db.query(IndexMaster).filter_by(index_code="QQQ").first()
+    if existing:
+        return {"status": "ok", "created": False, "id": existing.id}
+    db.add(IndexMaster(
+        index_code="QQQ",
+        index_name="纳斯达克100",
+        exchange="US", currency="USD",
+        category="宽基", source="manual_qqq_seed",
+        is_active=True,
+        first_pulled_at=datetime.utcnow(),
+        last_pulled_at=datetime.utcnow(),
+        last_verified_at=datetime.utcnow(),
+    ))
+    db.commit()
+    return {"status": "ok", "created": True}
+
+
 # ========== Admin: 基金-指数映射 (双向 selective) ==========
 
 @app.post("/api/admin/fund-index-map/selective")

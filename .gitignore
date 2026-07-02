@@ -53,6 +53,8 @@ frontend/.env*
 backend/_*.py
 backend/backup_*.sql
 backend/scripts/_*.py
+!backend/scripts/_seed_qqq.py
+!backend/scripts/__init__.py
 backend/scripts/verify_*.py
 backend/scripts/check_*.py
 backend/scripts/regenerate_*.py

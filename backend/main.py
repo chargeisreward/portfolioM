@@ -5502,6 +5502,49 @@ def admin_init_security_master(db: Session = Depends(get_db)):
     return {"status": "ok", "initialized": count}
 
 
+# ============================================================================
+# Admin: 股票主数据 (2026-07-02) — 替代旧 security-master (stock 部分)
+# ============================================================================
+
+@app.get("/api/admin/stock-master")
+def admin_list_stocks(
+    asset_type: str | None = None,
+    search: str | None = None,
+    page: int = 1, page_size: int = 50,
+    db: Session = Depends(get_db),
+):
+    from services.stock_master_service import list_stocks
+    return list_stocks(db, asset_type=asset_type, search=search,
+                       page=page, page_size=page_size)
+
+
+@app.post("/api/admin/stock-master")
+def admin_create_stock(body: dict = Body(...), db: Session = Depends(get_db)):
+    from services.stock_master_service import create_stock
+    return create_stock(db, body)
+
+
+@app.put("/api/admin/stock-master/{code}")
+def admin_update_stock(code: str, body: dict = Body(...), db: Session = Depends(get_db)):
+    from services.stock_master_service import update_stock
+    result = update_stock(db, code, body)
+    if not result:
+        raise HTTPException(404, "股票不存在")
+    return result
+
+
+@app.delete("/api/admin/stock-master/{code}")
+def admin_delete_stock(code: str, db: Session = Depends(get_db)):
+    from services.stock_master_service import delete_stock
+    try:
+        ok = delete_stock(db, code)
+        if not ok:
+            raise HTTPException(404, "股票不存在")
+        return {"status": "ok"}
+    except ValueError as e:
+        raise HTTPException(400, str(e))
+
+
 # ========== Admin: 基金-指数映射 ==========
 
 @app.get("/api/admin/fund-index-map")

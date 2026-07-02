@@ -1165,3 +1165,13 @@ class TradingSession(Base):
     last_rebuild_date = Column(Date, nullable=True)         # 最后重算到的日期
     created_at = Column(DateTime, default=datetime.utcnow)
     updated_at = Column(DateTime, default=datetime.utcnow, onupdate=datetime.utcnow)
+
+
+# ============================================================================
+# 公共数据主数据重构 (2026-07-02) — 新表引用
+# 注意: 这只是为了 SQLAlchemy metadata 注册;旧 SecurityMaster 仍保留,后续迁移脚本再改名
+# ============================================================================
+from models_master import (  # noqa: F401
+    StockMaster, FundMaster, IndexMaster,
+    Classification, ClassificationAssign,
+)

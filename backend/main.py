@@ -5589,6 +5589,84 @@ def admin_delete_fund(code: str, db: Session = Depends(get_db)):
         raise HTTPException(400, str(e))
 
 
+@app.get("/api/admin/fund-master/lookup")
+def admin_fund_master_lookup(
+    q: str = Query("", description="模糊搜索"),
+    page: int = Query(1, ge=1),
+    page_size: int = Query(30, ge=1, le=100),
+    db: Session = Depends(get_db),
+):
+    from services.fund_master_service import list_funds
+    return list_funds(db, search=q or None, page=page, page_size=page_size)
+
+
+@app.get("/api/admin/index-master/lookup")
+def admin_index_master_lookup(
+    q: str = Query("", description="模糊搜索"),
+    page: int = Query(1, ge=1),
+    page_size: int = Query(30, ge=1, le=100),
+    db: Session = Depends(get_db),
+):
+    from services.index_master_service import list_indices
+    return list_indices(db, search=q or None, page=page, page_size=page_size)
+
+
+@app.post("/api/admin/index-master/refresh")
+def admin_refresh_index_master(db: Session = Depends(get_db)):
+    """手动触发指数轮询 (admin 看到失败时一键重跑)。"""
+    try:
+        from services.akshare_index_poller import poll_index_master
+        return poll_index_master(db)
+    except ImportError:
+        raise HTTPException(503, "akshare_index_poller service not yet available")
+
+
+# ========== Admin: 基金-指数映射 (双向 selective) ==========
+
+@app.post("/api/admin/fund-index-map/selective")
+def admin_create_fund_index_map_selective(
+    body: dict = Body(...),
+    db: Session = Depends(get_db),
+):
+    """双向选择式新增 fund-index 映射。
+
+    body: {fund_code, index_code, benchmark_formula?, as_of_date?}
+    fund_code 必须在 fund_master;index_code 必须在 index_master。
+    """
+    from models_master import FundMaster, IndexMaster
+    fund_code = body.get("fund_code")
+    index_code = body.get("index_code")
+    if not fund_code or not index_code:
+        raise HTTPException(400, "fund_code 和 index_code 必填")
+
+    fund = db.query(FundMaster).filter_by(fund_code=fund_code).first()
+    if not fund:
+        raise HTTPException(400, f"基金 {fund_code} 不在 fund_master 中")
+    idx = db.query(IndexMaster).filter_by(index_code=index_code).first()
+    if not idx:
+        raise HTTPException(400, f"指数 {index_code} 不在 index_master 中")
+
+    raw_date = body.get("as_of_date")
+    if raw_date:
+        if isinstance(raw_date, str):
+            raw_date = date.fromisoformat(raw_date)
+    else:
+        raw_date = date.today()
+
+    fm = FundIndexMap(
+        fund_code=fund_code,
+        fund_name=fund.fund_name,
+        index_code=index_code,
+        index_name=idx.index_name,
+        benchmark_formula=body.get("benchmark_formula"),
+        as_of_date=raw_date,
+        source="manual_selective",
+    )
+    db.add(fm)
+    db.commit()
+    return {"status": "ok", "fund_code": fm.fund_code, "index_code": fm.index_code}
+
+
 # ============================================================================
 # Admin: 指数主数据 (2026-07-02)
 # ============================================================================

@@ -40,9 +40,11 @@ logger = logging.getLogger(__name__)
 # type2 英文 → 中文 映射 (迁移期用,后续 admin 可在 classification 表里编辑)
 # ============================================================================
 _TYPE2_CODE_TO_LABEL = {
-    "emerging": "新兴产业",
-    "dividend": "红利",
-    "gold":     "黄金",
+    "emerging":     "新兴产业",
+    "dividend":     "红利",
+    "gold":         "黄金",
+    "us_tech":      "美股科技",
+    "broad_index":  "宽基",
 }
 
 
@@ -53,6 +55,23 @@ def _normalize_type2(raw: str | None) -> tuple[str, str] | None:
     code = raw.lower()
     label = _TYPE2_CODE_TO_LABEL.get(code, raw)
     return (code, label)
+
+
+def _infer_security_type(asset_type: str | None, security_code: str) -> str:
+    """Fallback when security_type is None/empty in legacy data."""
+    if not asset_type:
+        return "unknown"
+    if asset_type in ("bond", "qdii_bond"):
+        return "bond"
+    if "etf" in asset_type:
+        return "fund"
+    if asset_type in ("a_share_equity", "qdii_equity", "hk_equity"):
+        return "fund"
+    if asset_type in ("us_etf",):
+        return "fund"
+    if asset_type in ("us_stock", "gold", "commodity"):
+        return "stock"
+    return "unknown"
 
 
 def _resolve_source_table(db: Session) -> str:
@@ -149,25 +168,33 @@ def dry_run_report(db: Session) -> dict:
     report["legacy_total"] = len(rows)
 
     for security_code, asset_type, security_type, type2, index_code, _ in rows:
-        if security_type == "stock":
+        sec_type = (security_type or "").strip() or None
+        if not sec_type:
+            sec_type = _infer_security_type(asset_type, security_code)
+            report["warnings"].append(
+                f"security_type is empty for {security_code} "
+                f"(asset_type={asset_type}); inferred via _infer_security_type -> {sec_type}"
+            )
+        if sec_type == "stock":
             report["to_stock_master"] += 1
-        elif security_type == "fund":
+        elif sec_type == "fund":
             report["to_fund_master"] += 1
-        elif security_type == "bond":
+        elif sec_type == "bond":
             if _is_bond_to_fund(asset_type, security_code):
                 report["to_fund_master"] += 1
             else:
                 report["to_stock_master"] += 1
         else:
             report["warnings"].append(
-                f"security_type='{security_type}' 未知: {security_code}"
+                f"security_type '{security_type}' unknown for {security_code} "
+                f"(asset_type={asset_type})"
             )
 
         if type2:
             code, label = (_normalize_type2(type2) or (None, None))
             if code and code not in _TYPE2_CODE_TO_LABEL:
                 report["warnings"].append(
-                    f"type2 未知值: {security_code} → {type2!r}"
+                    f"type2 unknown: {security_code} -> {type2!r}"
                 )
 
     return report
@@ -187,7 +214,8 @@ def commit_migration(db: Session) -> dict:
         st_row = db.execute(text(
             f"SELECT security_type FROM {src} WHERE security_code=:c"
         ), {"c": code}).first()
-        sec_type = st_row[0] if st_row else None
+        raw_st = (st_row[0] if st_row else None) or ""
+        sec_type = raw_st.strip() or _infer_security_type(at, code)
         if sec_type == "fund" or (sec_type == "bond" and _is_bond_to_fund(at, code)):
             continue
         existing = db.query(StockMaster).filter_by(stock_code=code).first()
@@ -205,7 +233,8 @@ def commit_migration(db: Session) -> dict:
         ), {"c": code}).first()
         if not st_row:
             continue
-        sec_type, fund_type, bench = st_row
+        raw_st, fund_type, bench = st_row
+        sec_type = (raw_st or "").strip() or _infer_security_type(at, code)
         if sec_type == "fund" or (sec_type == "bond" and _is_bond_to_fund(at, code)):
             existing = db.query(FundMaster).filter_by(fund_code=code).first()
             if existing:

@@ -85,3 +85,84 @@ def test_dry_run_warns_on_unknown_type2(seeded_legacy_db):
     from scripts.migrate_split_security_master import dry_run_report
     report = dry_run_report(db)
     assert any("balanced" in w for w in report["warnings"])
+
+
+def test_infer_fund_when_security_type_empty(seeded_legacy_db):
+    """security_type=None + asset_type=a_share_etf → 应去 fund_master,且发 warning。"""
+    from sqlalchemy import text
+    db = seeded_legacy_db
+    db.execute(
+        text(
+            "INSERT INTO security_master_legacy "
+            "(security_code, security_name, asset_type, security_type) "
+            "VALUES (:code, :name, :at, :st)"
+        ),
+        {"code": "510500.OF", "name": "中证500联接",
+         "at": "a_share_etf", "st": None},
+    )
+    db.commit()
+    from scripts.migrate_split_security_master import dry_run_report
+    report = dry_run_report(db)
+    assert report["to_fund_master"] == 5  # +1 vs base 4
+    assert any("510500.OF" in w and "inferred" in w
+               for w in report["warnings"])
+
+
+def test_infer_stock_when_security_type_empty(seeded_legacy_db):
+    """security_type=None + asset_type=us_stock → 应去 stock_master,且发 warning。"""
+    from sqlalchemy import text
+    db = seeded_legacy_db
+    db.execute(
+        text(
+            "INSERT INTO security_master_legacy "
+            "(security_code, security_name, asset_type, security_type) "
+            "VALUES (:code, :name, :at, :st)"
+        ),
+        {"code": "AAPL", "name": "Apple Inc",
+         "at": "us_stock", "st": None},
+    )
+    db.commit()
+    from scripts.migrate_split_security_master import dry_run_report
+    report = dry_run_report(db)
+    # base: 3 stocks (600519.SH, 000001.SZ, 019547.SH) + 1 from AAPL = 4
+    assert report["to_stock_master"] == 4
+    assert any("AAPL" in w and "inferred" in w
+               for w in report["warnings"])
+
+
+def test_type2_us_tech_no_warning(seeded_legacy_db):
+    """type2='us_tech' 现在已在映射表里 → 不应 warning。"""
+    from sqlalchemy import text
+    db = seeded_legacy_db
+    db.execute(
+        text(
+            "INSERT INTO security_master_legacy "
+            "(security_code, security_name, asset_type, type2, security_type) "
+            "VALUES (:code, :name, :at, :t2, :st)"
+        ),
+        {"code": "513500.SH", "name": "标普500ETF",
+         "at": "us_etf", "t2": "us_tech", "st": "fund"},
+    )
+    db.commit()
+    from scripts.migrate_split_security_master import dry_run_report
+    report = dry_run_report(db)
+    assert not any("us_tech" in w for w in report["warnings"])
+
+
+def test_type2_broad_index_no_warning(seeded_legacy_db):
+    """type2='broad_index' 现在已在映射表里 → 不应 warning。"""
+    from sqlalchemy import text
+    db = seeded_legacy_db
+    db.execute(
+        text(
+            "INSERT INTO security_master_legacy "
+            "(security_code, security_name, asset_type, type2, security_type) "
+            "VALUES (:code, :name, :at, :t2, :st)"
+        ),
+        {"code": "510300.SH2", "name": "沪深300ETF-test",
+         "at": "a_share_etf", "t2": "broad_index", "st": "fund"},
+    )
+    db.commit()
+    from scripts.migrate_split_security_master import dry_run_report
+    report = dry_run_report(db)
+    assert not any("broad_index" in w for w in report["warnings"])

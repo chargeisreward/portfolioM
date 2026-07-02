@@ -243,3 +243,18 @@ export const adminRefreshAnalysisPrices = (asOfDate, days = 5, maxCodes = 200) =
     params: { as_of_date: asOfDate, days, max_codes: maxCodes },
     timeout: 120000,
   }).then(r => r.data)
+
+// ---------- 公共数据主数据重构 (2026-07-02) ----------
+export const stockMasterList = (params) => rawApi.get('/admin/stock-master', { params }).then(r => r.data)
+export const fundMasterList = (params) => rawApi.get('/admin/fund-master', { params }).then(r => r.data)
+export const indexMasterList = (params) => rawApi.get('/admin/index-master', { params }).then(r => r.data)
+export const indexMasterRefresh = () => rawApi.post('/admin/index-master/refresh').then(r => r.data)
+export const fundMasterLookup = (q, page = 1) => rawApi.get('/admin/fund-master/lookup', { params: { q, page } }).then(r => r.data)
+export const indexMasterLookup = (q, page = 1) => rawApi.get('/admin/index-master/lookup', { params: { q, page } }).then(r => r.data)
+export const classificationList = (dimension) => rawApi.get('/admin/classification', { params: { dimension } }).then(r => r.data)
+export const classificationAssign = (entity_type, entity_code, classification_id) =>
+  rawApi.post('/admin/classification/assign', { entity_type, entity_code, classification_id }).then(r => r.data)
+export const classificationUnassign = (entity_type, entity_code, classification_id) =>
+  rawApi.post('/admin/classification/unassign', { entity_type, entity_code, classification_id }).then(r => r.data)
+export const fundIndexMapSelective = (body) =>
+  rawApi.post('/admin/fund-index-map/selective', body).then(r => r.data)

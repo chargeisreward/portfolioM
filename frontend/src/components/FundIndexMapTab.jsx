@@ -1,5 +1,6 @@
 import React, { useState, useEffect, useCallback, useMemo } from 'react'
 import { rawApi as api } from '../api'
+import SelectiveFundIndexDialog from './SelectiveFundIndexDialog'
 
 /**
  * 基金-指数映射 tab — 基于当前用户持仓 + SecurityMaster 的视图（2026-06-28 重构）。
@@ -16,6 +17,7 @@ export default function FundIndexMapTab() {
   const [search, setSearch] = useState('')
   const [editing, setEditing] = useState(null)
   const [error, setError] = useState('')
+  const [showSelective, setShowSelective] = useState(false)
 
   /** 拉取持仓基金 + SecurityMaster 映射视图。 */
   const load = useCallback(async () => {
@@ -76,6 +78,8 @@ export default function FundIndexMapTab() {
           style={{ width: 240 }}
         />
         <button className="btn-ghost" onClick={load}>刷新</button>
+        <button className="btn-ghost" style={{ marginLeft: 8 }}
+                onClick={() => setShowSelective(true)}>+ 新增映射</button>
         <span style={{ fontSize: 11, color: 'var(--text-muted)', marginLeft: 'auto' }}>
           共 {items.length} 只基金，{items.filter(it => it.is_drillable).length} 只可下钻
         </span>

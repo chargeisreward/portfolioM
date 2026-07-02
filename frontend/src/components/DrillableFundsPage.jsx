@@ -50,17 +50,20 @@ export default function DrillableFundsPage() {
     })
   }, [today])
 
-  const toggle = (idxCode) => {
-    if (expanded === idxCode) {
+  const toggle = (card) => {
+    // v3 重构后，cardKey 用 fund_code（per-fund 唯一），drill API 必须用 index_code
+    const cardKey = card.fund_code || card.index_code
+    const drillCode = card.index_code
+    if (expanded === cardKey) {
       setExpanded(null)
       setDetail(null)
       return
     }
-    setExpanded(idxCode)
+    setExpanded(cardKey)
     setDetail(null)
     setDetailLoading(true)
     import('../api').then(api => {
-      api.getIndexDrill(idxCode, today)
+      api.getIndexDrill(drillCode, today)
         .then(d => { setDetail(d); setDetailLoading(false); })
         .catch(e => { setErr(e?.message); setDetailLoading(false); })
     })
@@ -152,7 +155,7 @@ export default function DrillableFundsPage() {
           const devColor = dev > 0 ? 'var(--chart-up)' : dev < 0 ? 'var(--chart-down)' : 'var(--text-secondary)'
           return (
             <div key={cardKey} className={`drill-card ${isOpen ? 'drill-card-open' : ''}`}>
-              <div className="drill-card-header" onClick={() => toggle(cardKey)}>
+              <div className="drill-card-header" onClick={() => toggle(card)}>
                 <div className="drill-card-title-row">
                   <span className="drill-fund-code">{card.fund_code || card.index_code}</span>
                   <span className="drill-fund-name">{card.fund_name || card.index_name || cardKey}</span>
@@ -258,7 +261,7 @@ export default function DrillableFundsPage() {
                     </>
                   ) : null}
                   <div style={{ marginTop: 8, textAlign: 'right' }}>
-                    <button className="btn-ghost" onClick={() => toggle(card.index_code)} style={{ fontSize: 11 }}>折叠</button>
+                    <button className="btn-ghost" onClick={() => toggle(card)} style={{ fontSize: 11 }}>折叠</button>
                   </div>
                 </div>
               )}

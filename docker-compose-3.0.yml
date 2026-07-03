@@ -1,0 +1,52 @@
+# PortfolioM 3.0 — 主数据重构版 (feature/master-data-overhaul 分支)
+#
+# 与 portfoliom2.0 (docker-compose-2.0.yml) 并行部署,共享 portfoliom2-pg 数据库。
+# 部署步骤:
+#   1. 本地 PG 全量 dump → scp 到云端 → 在云端恢复至 portfoliom2-pg 容器
+#   2. 切换 nginx 路由:https://chargeye133.duckdns.org/portfoliom3.0/ → portfoliom3-frontend:80
+#   3. 启动本 compose:docker compose -f docker-compose-3.0.yml up -d --build
+#   4. 旧 portfoliom2.0 不下线 — 作为快速回滚路径
+#
+# 启动:
+#   docker compose -f docker-compose-3.0.yml up -d --build backend frontend
+
+services:
+  # ─── Backend (FastAPI) ───────────────────────────────────────────
+  backend:
+    build: ./backend
+    container_name: portfoliom3-backend
+    restart: unless-stopped
+    environment:
+      # 共用 portfoliom2-pg 容器 (Local 已是新表结构,prod 同源 — 一致)
+      DATABASE_URL: "postgresql+psycopg://portfoliom:${PG_PASSWORD:-portfoliom2_prod}@portfoliom2-pg:5432/portfoliom"
+      LLM_API_KEY: ${LLM_API_KEY}
+      LLM_API_BASE: ${LLM_API_BASE}
+      # CORS — 允许 portfoliom3.0 子路径 (用逗号分割追加到 _ALLOWED_ORIGINS)
+      CORS_ALLOW_ORIGINS: "http://localhost:3002,http://127.0.0.1:3002,http://localhost,http://127.0.0.1"
+      LLM_MODEL: ${LLM_MODEL}
+    ports:
+      # 本地直连:127.0.0.1:8012:8000
+      # 云端:通过 nginx 反代,容器端口 8000 对内可见,无需暴露 host 端口
+      - "127.0.0.1:8012:8000"
+    volumes:
+      - ./backend/data:/app/data
+      - ./sourceData:/app/sourceData
+
+  # ─── Frontend (Vite build → Nginx serve) ─────────────────────────
+  frontend:
+    build:
+      context: ./frontend
+      args:
+        # 子路径部署 — nginx 会把 /portfoliom3.0/ 反代到本容器 80 端口
+        VITE_BASE: "/portfoliom3.0/"
+        # VITE_API_URL 必须显式设为空字符串 — 否则 build 时会注入 zeabur 云端 URL
+        # (来自前一个 zeabur 部署 build 的缓存 .env),导致浏览器绕过 localhost 直接调云端
+        VITE_API_URL: ""
+    container_name: portfoliom3-frontend
+    restart: unless-stopped
+    ports:
+      # 本地直连:127.0.0.1:3002:80
+      # 云端:通过 nginx 反代,容器端口 80 对内可见,无需暴露 host 端口
+      - "127.0.0.1:3002:80"
+    depends_on:
+      - backend

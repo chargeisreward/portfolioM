@@ -9,8 +9,10 @@ from sqlalchemy.orm import sessionmaker
 from sqlalchemy.pool import StaticPool
 
 import models  # noqa: F401
+import models_master  # noqa: F401  # 注册新主表到 Base.metadata
 from database import Base
 from models import SecurityMaster, ApiCodeMap
+from models_master import StockMaster, FundMaster, IndexMaster
 from services.security_onboarding_service import (
     onboard_new_security,
     verify_security_for_confirm,
@@ -181,10 +183,10 @@ def test_onboard_new_cn_etf_with_llm(fresh_db, monkeypatch):
     assert result["security_master"]["asset_type"] == "a_share_etf"
     assert result["security_master"]["is_drillable"] is True  # a_share_etf 可下钻
 
-    # SM 已写入 DB
-    sm = fresh_db.query(SecurityMaster).filter_by(security_code="510300.SH").first()
-    assert sm is not None
-    assert sm.security_name == "沪深300ETF"
+    # 已写入 DB (a_share_etf → FundMaster)
+    fm = fresh_db.query(FundMaster).filter_by(fund_code="510300.SH").first()
+    assert fm is not None
+    assert fm.fund_name == "沪深300ETF"
 
 
 def test_onboard_new_hk_security(fresh_db, monkeypatch):
@@ -372,9 +374,9 @@ def test_verify_security_for_confirm_new_onboarded(fresh_db, monkeypatch):
 
     assert result["verified"] is True
     assert result["reason"] == "匹配"
-    # SM 已创建
-    sm = fresh_db.query(SecurityMaster).filter_by(security_code="510300.SH").first()
-    assert sm is not None
+    # 已创建 (a_share_etf → FundMaster)
+    fm = fresh_db.query(FundMaster).filter_by(fund_code="510300.SH").first()
+    assert fm is not None
 
 
 def test_verify_security_for_confirm_new_onboard_failed(fresh_db, monkeypatch):

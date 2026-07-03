@@ -40,6 +40,7 @@ from services.valuation_snapshot_service import (
 from services.llm_service import parse_trades_with_llm
 from services.security_onboarding_service import onboard_new_security, verify_security_for_confirm
 from middleware.auth import require_user, require_advisor, require_admin
+from services.security_lookup import get_security_view, get_security_view_map as _build_sm_view_map
 from services.penetration import PenetrationEngine
 from services.growth_bucketer import GrowthBucketer, IndustryChainAnalyzer
 from services.csi300 import Csi300Analyzer
@@ -872,80 +873,196 @@ def holdings_summary(
     return get_holdings_summary(db, user_id=eff_uid)
 
 
-# ==================== 证券基础表 ====================
+# ==================== 证券基础表 (2026-07-02: 新三表写入,legacy 只读兼容) ====================
 
 @app.get("/api/securities", response_model=list[SecurityMasterOut])
 def list_securities(db: Session = Depends(get_db)):
-    """获取所有证券基础信息"""
-    from models import SecurityMaster
-    return db.query(SecurityMaster).all()
+    """获取所有证券基础信息。
+
+    2026-07-02 迁移后: 读 unified view (stock_master + fund_master + index_master + legacy 兜底)。
+    返回 SecurityMasterOut 兼容旧字段语义 (security_name / asset_type / currency / type2)。
+    """
+    from services.security_lookup import get_security_view
+    codes_seen = set()
+    results = []
+    # 新三表
+    from models_master import StockMaster, FundMaster, IndexMaster
+    for s in db.query(StockMaster).all():
+        if s.stock_code in codes_seen:
+            continue
+        codes_seen.add(s.stock_code)
+        v = get_security_view(db, s.stock_code)
+        if v:
+            results.append(_view_to_security_master_out(v))
+    for f in db.query(FundMaster).all():
+        if f.fund_code in codes_seen:
+            continue
+        codes_seen.add(f.fund_code)
+        v = get_security_view(db, f.fund_code)
+        if v:
+            results.append(_view_to_security_master_out(v))
+    for i in db.query(IndexMaster).all():
+        if i.index_code in codes_seen:
+            continue
+        codes_seen.add(i.index_code)
+        v = get_security_view(db, i.index_code)
+        if v:
+            results.append(_view_to_security_master_out(v))
+    # legacy 兜底
+    try:
+        from models import SecurityMaster
+        for sm in db.query(SecurityMaster).all():
+            if sm.security_code in codes_seen:
+                continue
+            codes_seen.add(sm.security_code)
+            results.append(sm)  # legacy 行直接返回(SecurityMasterOut 兼容)
+    except Exception:
+        pass
+    return results
 
 
 @app.get("/api/securities/{code}", response_model=SecurityMasterOut)
 def get_security(code: str, db: Session = Depends(get_db)):
-    """获取单只证券基础信息"""
-    from models import SecurityMaster
-    row = db.query(SecurityMaster).filter(SecurityMaster.security_code == code).first()
-    if not row:
-        from fastapi import HTTPException
+    """获取单只证券基础信息 (走 unified view)。"""
+    from services.security_lookup import get_security_view
+    from fastapi import HTTPException
+    v = get_security_view(db, code)
+    if not v:
         raise HTTPException(status_code=404, detail=f"Security {code} not found")
-    return row
+    # 优先返回 ORM 对象(若在 legacy 中),其次构造 dict view
+    try:
+        from models import SecurityMaster
+        legacy_row = db.query(SecurityMaster).filter(SecurityMaster.security_code == code).first()
+        if legacy_row:
+            return legacy_row
+    except Exception:
+        pass
+    return _view_to_security_master_out(v)
 
 
 @app.put("/api/securities/{code}", response_model=SecurityMasterOut)
 def upsert_security(code: str, body: SecurityMasterUpsert, db: Session = Depends(get_db)):
-    """新增或更新证券基础信息"""
-    from models import SecurityMaster
-    from datetime import datetime as dt
-    row = db.query(SecurityMaster).filter(SecurityMaster.security_code == code).first()
-    if row:
-        row.security_name = body.security_name or row.security_name
-        row.currency = body.currency
-        row.asset_type = body.asset_type or row.asset_type
-        # type2 允许显式置空：传 "" 表示清空
-        row.type2 = body.type2 if body.type2 is not None else row.type2
-        if body.type2 == "":
-            row.type2 = None
-        row.exchange = body.exchange or row.exchange
-        row.updated_at = dt.utcnow()
+    """新增或更新证券基础信息 (写入新主表,legacy 不再写)。"""
+    from services.security_lookup import (
+        get_security_view, _derive_target_table, _to_target_kwargs,
+    )
+    from models_master import StockMaster, FundMaster, IndexMaster
+
+    asset_type = body.asset_type or "a_share_equity"
+    model, code_field = _derive_target_table(asset_type)
+
+    existing = db.query(model).filter(getattr(model, code_field) == code).first()
+    if existing:
+        # 更新 (按表字段名映射)
+        if model is StockMaster:
+            if body.security_name:
+                existing.stock_name = body.security_name
+            if body.currency:
+                existing.currency = body.currency
+            if body.asset_type:
+                existing.asset_type = body.asset_type
+            if body.exchange:
+                existing.exchange = body.exchange
+        elif model is FundMaster:
+            if body.security_name:
+                existing.fund_name = body.security_name
+            if body.currency:
+                existing.currency = body.currency
+            if body.asset_type:
+                existing.asset_type = body.asset_type
+        else:  # IndexMaster
+            if body.security_name:
+                existing.index_name = body.security_name
+            if body.currency:
+                existing.currency = body.currency
+            if body.exchange:
+                existing.exchange = body.exchange
+        row = existing
     else:
-        row = SecurityMaster(
-            security_code=code,
-            security_name=body.security_name,
-            currency=body.currency,
-            asset_type=body.asset_type,
-            type2=body.type2 or None,
-            exchange=body.exchange,
-        )
+        # 新建
+        view = {
+            "security_code": code,
+            "security_name": body.security_name or code,
+            "asset_type": asset_type,
+            "currency": body.currency or "CNY",
+            "exchange": body.exchange,
+            "fund_type": None,
+            "is_drillable": False,
+            "benchmark_formula": None,
+            "category": None,
+            "source": "manual",
+            "is_active": True,
+            "is_listed": True,
+            "note": None,
+        }
+        _, kwargs = _to_target_kwargs(asset_type, view)
+        row = model(**kwargs)
         db.add(row)
+
     db.commit()
     db.refresh(row)
-    return row
+
+    # 返回 view (走 unified,构造 SecurityMasterOut)
+    v = get_security_view(db, code)
+    return _view_to_security_master_out(v)
 
 
 @app.post("/api/securities/sync-from-holdings", response_model=CrawlResponse)
 def sync_securities_from_holdings(db: Session = Depends(get_db)):
-    """从持仓表同步证券基础信息（仅新增，不覆盖已有）"""
-    from models import Holding, SecurityMaster
+    """从持仓表同步证券基础信息 (写入新主表:us_stock → StockMaster,其余 → FundMaster)。"""
+    from models import Holding
+    from services.security_lookup import (
+        _derive_target_table, _to_target_kwargs, exists_in_new_tables,
+    )
     from services.importer import guess_asset_type
     from crawlers.exchange_rates import guess_currency_from_code
-    from datetime import datetime as dt
+
     holdings = db.query(Holding).all()
     added = 0
     for h in holdings:
-        exists = db.query(SecurityMaster).filter(SecurityMaster.security_code == h.security_code).first()
-        if not exists:
-            sm = SecurityMaster(
-                security_code=h.security_code,
-                security_name=h.security_name,
-                currency=guess_currency_from_code(h.security_code),
-                asset_type=h.asset_type or guess_asset_type(h.security_code),
-            )
-            db.add(sm)
-            added += 1
-            db.flush()  # flush per row to avoid duplicate key in batch
+        code = h.security_code
+        if not code or exists_in_new_tables(db, code):
+            continue
+        asset_type = h.asset_type or guess_asset_type(code)
+        model, code_field = _derive_target_table(asset_type)
+        view = {
+            "security_code": code,
+            "security_name": h.security_name or code,
+            "asset_type": asset_type,
+            "currency": guess_currency_from_code(code),
+            "exchange": None,
+            "fund_type": None,
+            "is_drillable": False,
+            "benchmark_formula": None,
+            "category": None,
+            "source": "sync-from-holdings",
+            "is_active": True,
+            "is_listed": True,
+            "note": "auto-synced from holdings",
+        }
+        _, kwargs = _to_target_kwargs(asset_type, view)
+        row = model(**kwargs)
+        db.add(row)
+        added += 1
+        try:
+            db.flush()  # flush per row to avoid duplicate key
+        except Exception:
+            db.rollback()
+            continue
     db.commit()
     return CrawlResponse(status="ok", message=f"Synced {added} new securities", count=added)
+
+
+def _view_to_security_master_out(view: dict) -> SecurityMasterOut:
+    """把 SecurityView dict → SecurityMasterOut 兼容对象。"""
+    return SecurityMasterOut(
+        security_code=view.get("security_code"),
+        security_name=view.get("security_name") or view.get("security_code"),
+        currency=view.get("currency") or "CNY",
+        asset_type=view.get("asset_type"),
+        type2=view.get("type2"),
+        exchange=view.get("exchange"),
+    )
 
 
 # ==================== 证券类型配置 ====================
@@ -1060,7 +1177,8 @@ def holdings_converted(target: str = Query("CNY"), request: Request = None, db: 
     Joins with security_master for currency and asset_type.
     Joins with security_type_config for price_precision.
     多用户隔离：仅返回 effective user 的 holdings（view_as 已在前置依赖里解析）。"""
-    from models import Holding as HoldingModel, SecurityMaster, SecurityTypeConfig
+    from models import Holding as HoldingModel, SecurityTypeConfig
+    from services.security_lookup import get_security_view
     from crawlers.exchange_rates import get_rate
     from middleware.auth import _resolve_eff_from_request
     _u, eff_uid = _resolve_eff_from_request(request, db)
@@ -1068,10 +1186,13 @@ def holdings_converted(target: str = Query("CNY"), request: Request = None, db: 
     if eff_uid is not None:
         q = q.filter(HoldingModel.user_id == eff_uid)
     rows = q.all()
-    # Build lookup from security_master
+    # Build lookup from new master tables (stock_master + fund_master + index_master + legacy fallback)
     sm_map = {}
-    for sm in db.query(SecurityMaster).all():
-        sm_map[sm.security_code] = sm
+    holding_codes = {h.security_code for h in rows if h.security_code}
+    for code in holding_codes:
+        v = get_security_view(db, code)
+        if v:
+            sm_map[code] = v
     # Build lookup from security_type_config
     stc_map = {}
     for stc in db.query(SecurityTypeConfig).all():
@@ -1083,11 +1204,11 @@ def holdings_converted(target: str = Query("CNY"), request: Request = None, db: 
     from services.price_cache import get_latest_price
     result = []
     for h in rows:
-        sm = sm_map.get(h.security_code)
-        # Priority: security_master > holding field > guess
-        orig_currency = sm.currency if sm else (h.currency or 'CNY')
-        asset_type = sm.asset_type if sm else h.asset_type
-        security_name = sm.security_name if sm else h.security_name
+        view = sm_map.get(h.security_code)
+        # Priority: master view > holding field > guess
+        orig_currency = view.get("currency") if view else (h.currency or 'CNY')
+        asset_type = view.get("asset_type") if view else h.asset_type
+        security_name = view.get("security_name") if view else h.security_name
         # Price precision from type config
         stc = stc_map.get(asset_type)
         price_precision = stc.price_precision if stc else 2
@@ -1129,7 +1250,7 @@ def holdings_converted(target: str = Query("CNY"), request: Request = None, db: 
             "amount_original": amount_original,
             "amount_local": converted,
             "asset_type": asset_type,
-            "type2": sm.type2 if sm else None,
+            "type2": view.get("type2") if view else None,
         })
     return result
 
@@ -4375,7 +4496,8 @@ def get_kpi(
         实时计算 fund_drill_snapshot 公共数据，与「分析→全持仓→全部下钻证券」4 口径卡片完全同算法、
         同数值；旧实现读 AggregationCache 预聚合表，算法不同导致 Overview 与 Analysis 页面 PE 不一致。
     """
-    from models import FullHoldingSnapshot, Holding, SecurityMaster, PriceCache, ExchangeRate
+    from models import FullHoldingSnapshot, Holding, PriceCache, ExchangeRate
+    from services.security_lookup import get_security_view
     from sqlalchemy import func as _func
     from middleware.auth import _resolve_eff_from_request
     _u, eff_uid = _resolve_eff_from_request(request, db)
@@ -4416,7 +4538,13 @@ def get_kpi(
             fx_to_cny[fc] = r.rate
 
     holdings = db.query(Holding).filter(Holding.user_id == eff_uid).all()
-    sm_map = {m.security_code: m for m in db.query(SecurityMaster).all()}
+    # Build unified view map from new master tables (legacy fallback handled inside)
+    sm_map = {}
+    for h in holdings:
+        if h.security_code:
+            v = get_security_view(db, h.security_code)
+            if v:
+                sm_map[h.security_code] = v
     # latest_td_row：所有 code 统一用的「最近已确认交易日」（≤ confirmed_as_of）
     latest_td_row = (db.query(_func.max(PriceCache.trade_date))
                      .filter(PriceCache.trade_date <= confirmed_as_of).scalar()
@@ -6381,10 +6509,10 @@ def parse_trades_endpoint(
 
     流程：
     1. 调 parse_trades_with_llm 解析文本
-    2. 对每条交易的 security_code 查 SecurityMaster；不存在则调 onboard_new_security
+    2. 对每条交易的 security_code 查 新三表 (via security_lookup);不存在则调 onboard_new_security
     3. 返回解析结果 + 每条交易的证券状态
     """
-    from models import SecurityMaster
+    from services.security_lookup import get_security_view
     write_uid = user.id  # POST 写入用 user.id（不支持 view_as 写入）
 
     parsed = parse_trades_with_llm(req.text)
@@ -6406,9 +6534,9 @@ def parse_trades_endpoint(
         elif (code_upper.endswith(".SZ") or code_upper.endswith(".SH")) and "联接" in name_upper:
             message = "场内ETF代码与场外基金名称不符，已按代码后缀处理"
 
-        # 查 SecurityMaster，不存在则 onboard
-        sm = db.query(SecurityMaster).filter_by(security_code=code).first() if code else None
-        if code and not sm:
+        # 查新三表 (via unified view),不存在则 onboard
+        view = get_security_view(db, code) if code else None
+        if code and not view:
             try:
                 result = onboard_new_security(db, code, name, context="trades/parse")
                 status = "new_verified" if result.get("security_verified") else "new_unverified"
@@ -6799,7 +6927,8 @@ def get_valuation_kpi_endpoint(
     KPI 5 当日涨跌幅 = as_of_date 总资产 / prev_date 总资产 - 1
     两日都锁定 → 准确；任一未锁定 → 不准确但下次跑批会重算
     """
-    from models import ValuationDailySnapshot, SecurityMaster
+    from models import ValuationDailySnapshot
+    from services.security_lookup import get_security_view
     from sqlalchemy import func as _func
     from middleware.auth import _resolve_eff_from_request
     from services.drill_orchestration_service import (
@@ -6934,19 +7063,20 @@ def get_valuation_kpi_endpoint(
     except Exception as e:
         _logger.warning("valuation/kpi 涨跌幅计算失败: %s", e, exc_info=True)
 
-    # 6. 科技占比：ValuationDailySnapshot.amount_cny × SecurityMaster.type2（当前主数据）
+    # 6. 科技占比：ValuationDailySnapshot.amount_cny × classification.theme（当前主数据）
+    # 2026-07-02: classification_assign 是新的多对多关联,theme 维度替代旧 SecurityMaster.type2
     _EMERGING_KEYS = {"emerging", "新兴产业"}
     _US_TECH_KEYS = {"us_tech", "美股科技"}
     tech_weight_pct = None
     tech_weight_breakdown = {"emerging_cny": 0.0, "us_tech_cny": 0.0, "total_cny": 0.0}
     try:
-        sm_map = {m.security_code: m for m in db.query(SecurityMaster).all()}
+        sm_map = _build_sm_view_map(db)
         emerging_cny = us_tech_cny = total_cny = 0.0
         for h in holdings:
             v = h.amount_cny or 0
             total_cny += v
-            sm = sm_map.get(h.security_code)
-            t2 = sm.type2 if sm else None
+            view = sm_map.get(h.security_code)
+            t2 = view.get("type2") if view else None
             if t2 in _EMERGING_KEYS:
                 emerging_cny += v
             elif t2 in _US_TECH_KEYS:
@@ -6961,14 +7091,14 @@ def get_valuation_kpi_endpoint(
     except Exception as e:
         _logger.warning("valuation/kpi 科技占比计算失败: %s", e, exc_info=True)
 
-    # 7. fund_count：估值表中可下钻基金数（SecurityMaster.is_drillable=True）
+    # 7. fund_count：估值表中可下钻基金数（master view.is_drillable=True）
     fund_count = 0
     try:
         if not sm_map:
-            sm_map = {m.security_code: m for m in db.query(SecurityMaster).all()}
+            sm_map = _build_sm_view_map(db)
         fund_count = sum(
             1 for h in holdings
-            if sm_map.get(h.security_code) and sm_map[h.security_code].is_drillable
+            if sm_map.get(h.security_code) and sm_map[h.security_code].get("is_drillable")
         )
     except Exception:
         pass
